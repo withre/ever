@@ -1,0 +1,13 @@
+.{
+    .name = .ever,
+    .version = "0.1.0",
+    .fingerprint = 0xdb41433d9d4ef7d3,
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
