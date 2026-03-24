@@ -1,0 +1,93 @@
+---
+title: CLI Interface
+state: complete
+tags: [cli, orchestrator]
+---
+
+# Summary
+Implement the `ever` command-line interface for starting the store, managing topics, publishing events, and subscribing to event streams.
+
+# Motivation
+A CLI provides the primary human interface for operating Ever. It should be simple to use for quick experimentation and powerful enough for operational tasks.
+
+## Goals
+- `ever store start` — Start the storage server
+- `ever topic create/list/delete` — Manage topics
+- `ever pub <topic> <data>` — Publish events
+- `ever sub <topic>` — Subscribe to events
+- `--json` output flag for machine-readable output
+- `ever version` — Show version information
+- Clear error messages with suggestions
+
+## Non-Goals
+- Full orchestrator process management (v0.2)
+- Configuration file management via CLI
+- Transformer setup via CLI
+
+# Proposal
+
+## Command Structure
+```
+ever store start [--address <addr>] [--port <port>] [--data-dir <path>]
+ever store stop
+ever topic create <name>
+ever topic list
+ever topic delete <name>
+ever pub <topic> <data>
+ever pub <topic> --stdin
+ever sub <topic> [--from <offset>] [--max <count>] [--follow]
+ever version
+ever help [command]
+```
+
+## Argument Parsing
+Use a simple hand-written argument parser in Zig:
+- Parse positional arguments and flags from `std.process.args()`
+- Support `--flag value` and `--flag=value` forms
+- Print help text on `--help` or invalid usage
+
+## Output Format
+- Default: human-readable text to stdout
+- `--json`: JSON output to stdout
+- Errors to stderr
+- Exit codes: 0 success, 1 error, 2 usage error
+
+## Example Sessions
+```bash
+# Start the store
+$ ever store start --data-dir ./mydata
+Ever store listening on 127.0.0.1:4222
+
+# Create a topic
+$ ever topic create agent.tasks
+Created topic: agent.tasks
+
+# Publish events
+$ ever pub agent.tasks '{"task":"build","status":"complete"}'
+Published to agent.tasks at offset 0
+
+# Subscribe
+$ ever sub agent.tasks --from 0
+[0] 2026-03-23T10:00:00Z key=null {"task":"build","status":"complete"}
+
+# List topics
+$ ever topic list
+agent.tasks  (1 event, 1 segment)
+```
+
+# Design Details
+
+## Implementation in main.zig
+- Parse args to determine command
+- For `store start`: initialize TopicManager, create Server, call `server.run()`
+- For client commands (topic/pub/sub): create Publisher or Subscriber client, execute operation, print result
+- Keep the main.zig dispatcher thin — delegate to library code
+
+## Store Start as Foreground Process
+- `ever store start` runs the server in the foreground
+- Ctrl-C triggers graceful shutdown via signal handling
+- Logs to stderr
+- This is the simplest correct approach; daemonization is future work
+
+# History
+- 2026-03-23: CLI implemented with ever store start, topic create/list/delete, pub, sub, version, help. Uses std.process.Init for v0.16 compatibility.

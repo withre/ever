@@ -1,0 +1,120 @@
+---
+title: Append-Only Event Log
+state: complete
+tags: [store, core]
+---
+
+# Summary
+Implement the core append-only event log — the fundamental storage primitive of Ever. Events are sequentially written to segment files with offset-based addressing.
+
+# Motivation
+The append-only log is the heart of any event storage system. All other components (publisher, subscriber, topics) build on top of this primitive. Getting the log right — correct, durable, and fast — is the foundation for everything.
+
+## Goals
+- Append events to a log with monotonically increasing offsets
+- Read events by offset (point lookup) and by range (batch fetch)
+- Segment-based storage: split log into fixed-size segment files
+- Durable writes with configurable fsync behavior
+- Memory-safe with no leaks (verified by `std.testing.allocator`)
+
+## Non-Goals
+- Topic management (separate spec)
+- Index files (separate spec — sequential scan is fine for v0.1)
+- Compression
+- Retention/cleanup policies
+
+# Proposal
+
+## Event Record Format
+Each event stored as a sequential record in a segment file:
+
+```
+┌──────────┬───────────┬──────────┬──────────┬─────────────────┐
+│ offset   │ timestamp │ key_len  │ val_len  │ key | value     │
+│ u64 LE   │ i64 LE    │ u32 LE   │ u32 LE   │ variable bytes  │
+└──────────┴───────────┴──────────┴──────────┴─────────────────┘
+```
+
+- **offset**: Global monotonic offset (first event = 0, increments by 1)
+- **timestamp**: Unix timestamp in milliseconds (`std.time.milliTimestamp()`)
+- **key_len**: Length of the key bytes (0 if no key)
+- **val_len**: Length of the value bytes
+- **key**: Optional key bytes
+- **value**: Event payload bytes (JSON string initially)
+
+Total header size: 8 + 8 + 4 + 4 = 24 bytes per event.
+
+## Segment Management
+- Each segment file holds events up to a configurable max size (default: 64MB)
+- Segment files named by their base offset: `00000000000000000000.log`
+- When a segment exceeds max size, a new segment is created
+- Active segment is the only one open for writes
+- Older segments are read-only
+
+## Core API
+
+```zig
+pub const Log = struct {
+    pub fn init(allocator: Allocator, dir_path: []const u8, config: Config) !Log
+    pub fn deinit(self: *Log) void
+
+    /// Append an event, returns the assigned offset
+    pub fn append(self: *Log, key: ?[]const u8, value: []const u8) !u64
+
+    /// Read a single event by offset
+    pub fn read(self: *Log, offset: u64) !?Event
+
+    /// Read a batch of events starting from offset
+    pub fn readBatch(self: *Log, start_offset: u64, max_count: u32) ![]Event
+
+    /// Current next offset (number of events written)
+    pub fn nextOffset(self: *const Log) u64
+};
+
+pub const Event = struct {
+    offset: u64,
+    timestamp: i64,
+    key: ?[]const u8,
+    value: []const u8,
+};
+
+pub const Config = struct {
+    max_segment_size: u64 = 64 * 1024 * 1024, // 64MB
+    sync_on_append: bool = true,
+};
+```
+
+## File I/O Strategy
+- Use `std.fs.Dir.createFile` / `std.fs.Dir.openFile` for segment files
+- Write with `file.writeAll()` for the event record
+- Read with `file.preadAll()` for offset-based reads (no seeking, thread-safe)
+- `fsync` after each append when `sync_on_append` is true
+- Use `defer file.close()` for all file handles
+
+# Design Details
+
+## Offset Tracking
+- The log maintains `next_offset: u64` in memory
+- On startup, the log scans the active segment to recover the next offset
+- This is the simplest correct approach; an index will optimize this later
+
+## Segment Rotation
+- Before each append, check if current segment size + new record size > max_segment_size
+- If so, close current segment and create a new one with base_offset = next_offset
+- Maintain a list of segment metadata (base_offset, file_path) for reads
+
+## Read Path
+- To read offset N: find the segment where base_offset ≤ N
+- Scan forward from segment start to find the exact offset
+- For batch reads, continue scanning across segment boundaries
+- Return `null` if offset not found (not yet written or already purged)
+
+## Error Handling
+- `StorageError.SegmentFull` — segment exceeded max size (triggers rotation)
+- `StorageError.CorruptRecord` — record header validation failed
+- `StorageError.OffsetNotFound` — requested offset doesn't exist
+- `StorageError.DiskFull` — write failed due to disk space
+- Propagate underlying `std.posix` errors for I/O failures
+
+# History
+- 2026-03-23: Append-only log with segment rotation implemented. Encode/decode, append, read, readBatch, recovery all working. Tests pass with std.testing.allocator leak detection.

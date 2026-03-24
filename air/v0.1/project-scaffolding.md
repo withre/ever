@@ -1,0 +1,61 @@
+---
+title: Project Scaffolding
+state: complete
+tags: [core]
+---
+
+# Summary
+Set up the initial Zig project structure with build system, Nix development environment, and foundational module layout.
+
+# Motivation
+Before any feature work can begin, the project needs a working build system, reproducible development environment, and a clear module structure that reflects the architecture.
+
+## Goals
+- Working `zig build` and `zig build test` commands
+- Nix flake for reproducible development environment
+- Module layout matching the architecture (src/store/, src/protocol/, src/net/)
+- Basic `main.zig` entry point
+- `build.zig.zon` package manifest
+
+## Non-Goals
+- No actual feature implementation — just the skeleton
+- No CI/CD setup (future work)
+
+# Proposal
+
+## build.zig
+- Define main executable target (`ever`)
+- Define test step that discovers all test files
+- Support debug and release optimization modes
+
+## build.zig.zon
+- Package name: `ever`
+- Version: `0.1.0`
+- No external dependencies initially
+
+## flake.nix
+- Zig v0.16 RC from nixpkgs or overlay
+- Development shell with Zig and supporting tools
+
+## Source Layout
+```
+src/
+├── main.zig              # Entry point — parse CLI args, dispatch
+├── root.zig              # Library root — re-exports public API
+├── store/
+│   └── store.zig         # Placeholder
+├── protocol/
+│   └── message.zig       # Placeholder
+└── net/
+    └── server.zig        # Placeholder
+```
+
+Each placeholder file should have a minimal public function and a passing test block.
+
+# Design Details
+- Use `@import` to wire up the module tree from `root.zig`
+- `main.zig` imports from `root.zig` for the library API
+- Test step in build.zig should compile and test all source files
+
+# History
+- 2026-03-23: Project scaffolding complete. build.zig, build.zig.zon, flake.nix, module layout (src/store/, src/protocol/, src/net/), main.zig with CLI dispatch, root.zig with module re-exports. All tests pass.

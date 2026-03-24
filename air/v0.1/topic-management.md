@@ -1,0 +1,103 @@
+---
+title: Topic Management
+state: complete
+tags: [store, core]
+---
+
+# Summary
+Implement topic management — the organizational layer above the event log. Topics are named streams of events, each backed by its own append-only log.
+
+# Motivation
+Events need to be organized into logical streams. A "topic" provides this grouping, similar to Kafka topics or NATS subjects. Each topic has its own independent log, offsets, and lifecycle.
+
+## Goals
+- Create, delete, and list topics
+- Each topic owns an independent `Log` instance
+- Topic names validated (alphanumeric, dots, hyphens, underscores)
+- Persistent topic registry survives restarts
+- Thread-safe access to topic operations
+
+## Non-Goals
+- Partitioning within a topic (single partition per topic for v0.1)
+- Topic-level configuration overrides (use global defaults)
+- Consumer group / offset tracking (separate spec)
+
+# Proposal
+
+## Topic Registry
+A simple JSON file (`topics.json`) in the data directory tracks known topics:
+
+```json
+{
+  "topics": [
+    { "name": "agent.tasks", "created_at": 1711234567890 },
+    { "name": "file.changes", "created_at": 1711234568000 }
+  ]
+}
+```
+
+On startup, the store reads this file and opens logs for each topic.
+
+## Directory Layout
+```
+data/
+├── topics.json
+└── topics/
+    ├── agent.tasks/
+    │   ├── 00000000000000000000.log
+    │   └── ...
+    └── file.changes/
+        ├── 00000000000000000000.log
+        └── ...
+```
+
+## Core API
+
+```zig
+pub const TopicManager = struct {
+    pub fn init(allocator: Allocator, data_dir: []const u8, config: Config) !TopicManager
+    pub fn deinit(self: *TopicManager) void
+
+    /// Create a new topic. Returns error if already exists.
+    pub fn createTopic(self: *TopicManager, name: []const u8) !void
+
+    /// Delete a topic and its data.
+    pub fn deleteTopic(self: *TopicManager, name: []const u8) !void
+
+    /// Get a topic's log for reading/writing.
+    pub fn getTopic(self: *TopicManager, name: []const u8) !*Log
+
+    /// List all topic names.
+    pub fn listTopics(self: *TopicManager) ![]const []const u8
+
+    /// Publish an event to a topic (convenience wrapper).
+    pub fn publish(self: *TopicManager, topic: []const u8, key: ?[]const u8, value: []const u8) !u64
+};
+```
+
+## Topic Name Validation
+- Allowed characters: `[a-zA-Z0-9._-]`
+- Minimum length: 1 character
+- Maximum length: 255 characters
+- Cannot start or end with `.`
+- No consecutive dots (`..`)
+
+# Design Details
+
+## Startup Recovery
+1. Read `topics.json` — if missing, create empty registry
+2. For each topic, open its directory and initialize its `Log`
+3. Each `Log.init` recovers its next_offset by scanning the active segment
+
+## Persistence
+- `topics.json` is rewritten atomically (write to temp file, rename) on create/delete
+- Topic data directories are created on `createTopic`, removed recursively on `deleteTopic`
+
+## Error Handling
+- `TopicError.AlreadyExists` — topic name already registered
+- `TopicError.NotFound` — topic name not in registry
+- `TopicError.InvalidName` — name fails validation
+- Propagate storage errors from underlying `Log`
+
+# History
+- 2026-03-23: TopicManager with create, delete, list, publish, and directory-based recovery implemented. Tests pass.

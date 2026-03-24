@@ -1,0 +1,88 @@
+---
+title: Client Library (Publisher & Subscriber)
+state: complete
+tags: [publisher, subscriber, protocol]
+---
+
+# Summary
+Implement the client-side library for publishing events to and subscribing from the Ever store over TCP.
+
+# Motivation
+Publishers and subscribers need a clean API to connect to the store, send events, and fetch events. This client library is the foundation for both the CLI tools and programmatic usage.
+
+## Goals
+- Publisher client: connect, publish single events, batch publish
+- Subscriber client: connect, fetch events by offset and batch
+- Automatic frame encoding/decoding using the wire protocol
+- Connection management (connect, reconnect, close)
+- Clean API following Zig idioms (allocator parameter, error unions, deinit)
+
+## Non-Goals
+- Consumer group offset management (track offsets client-side for now)
+- Push-based streaming (poll with fetch for v0.1)
+- Automatic reconnection with backoff (manual reconnect for v0.1)
+
+# Proposal
+
+## Publisher API
+
+```zig
+pub const Publisher = struct {
+    pub fn connect(allocator: Allocator, address: []const u8, port: u16) !Publisher
+    pub fn deinit(self: *Publisher) void
+
+    /// Publish a single event. Returns the assigned offset.
+    pub fn publish(self: *Publisher, topic: []const u8, key: ?[]const u8, value: []const u8) !u64
+
+    /// Create a topic on the server.
+    pub fn createTopic(self: *Publisher, name: []const u8) !void
+};
+```
+
+## Subscriber API
+
+```zig
+pub const Subscriber = struct {
+    pub fn connect(allocator: Allocator, address: []const u8, port: u16) !Subscriber
+    pub fn deinit(self: *Subscriber) void
+
+    /// Fetch a batch of events starting from offset.
+    pub fn fetch(self: *Subscriber, topic: []const u8, offset: u64, max_count: u32) !FetchResult
+
+    /// List available topics.
+    pub fn listTopics(self: *Subscriber) ![]const []const u8
+};
+
+pub const FetchResult = struct {
+    events: []Event,
+    allocator: Allocator,
+
+    pub fn deinit(self: *FetchResult) void
+};
+```
+
+## Connection Management
+- `connect()` establishes TCP connection to the store
+- Each client holds a single TCP connection
+- `deinit()` closes the connection and frees resources
+- If the connection drops mid-request, return a connection error
+
+# Design Details
+
+## Implementation
+- Both Publisher and Subscriber are thin wrappers around the wire protocol
+- They create request frames, send them, read response frames, and parse results
+- Use `std.net.tcpConnectToHost` for connection establishment
+- Read/write via the socket's stream interface
+
+## Error Handling
+- Connection errors propagated to caller
+- Protocol errors (bad response) returned as specific errors
+- Server-side errors (topic not found, etc.) decoded from error response frames
+
+## Testing
+- Unit tests with mock socket or in-process server
+- Integration test: start server, connect publisher and subscriber, round-trip events
+
+# History
+- 2026-03-23: Unified Client with publish, fetch, createTopic, deleteTopic, listTopics. Uses Io.net for connection, posix fd for protocol I/O.

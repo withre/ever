@@ -1,0 +1,77 @@
+---
+title: Integration Testing
+state: ready
+tags: [testing, core]
+---
+
+# Summary
+Implement end-to-end integration tests that verify the full publish-store-subscribe pipeline works correctly.
+
+# Motivation
+Unit tests verify individual components, but the real value of Ever comes from the interaction between publisher, store, and subscriber. Integration tests ensure the complete flow works.
+
+## Goals
+- Test: publish events → store persists → subscriber reads back
+- Test: multiple topics independently
+- Test: store restart and offset recovery
+- Test: error cases (topic not found, invalid requests)
+- Tests run via `zig build test` alongside unit tests
+
+## Non-Goals
+- Performance/benchmark tests (future work)
+- Stress testing with many connections
+- Chaos testing (crash recovery scenarios)
+
+# Proposal
+
+## Test Architecture
+Integration tests start an in-process server (no TCP needed for basic tests) and exercise the full pipeline through the TopicManager API.
+
+For TCP-level integration tests:
+1. Start server on a random high port in a test thread
+2. Connect publisher and subscriber clients
+3. Execute test scenarios
+4. Shut down server
+5. Verify no memory leaks via `std.testing.allocator`
+
+## Key Test Scenarios
+
+### Basic Publish-Subscribe
+1. Create topic
+2. Publish N events with known data
+3. Fetch all events from offset 0
+4. Verify events match published data (offsets, keys, values)
+
+### Topic Isolation
+1. Create two topics
+2. Publish different events to each
+3. Fetch from each topic independently
+4. Verify no cross-contamination
+
+### Offset Tracking
+1. Publish 100 events
+2. Fetch first 50 (offset 0, max 50)
+3. Fetch next 50 (offset 50, max 50)
+4. Verify complete coverage, no duplicates
+
+### Persistence
+1. Create topic and publish events
+2. Close and reopen the TopicManager
+3. Verify events are still readable
+4. Verify next offset continues from where it left off
+
+### Error Cases
+1. Fetch from non-existent topic → error
+2. Create duplicate topic → error
+3. Publish to non-existent topic → error
+
+## Test File Location
+```
+src/
+└── tests/
+    └── integration.zig    # Integration test suite
+```
+
+Or inline in relevant modules with descriptive test block names.
+
+# History
