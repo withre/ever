@@ -150,8 +150,7 @@ pub const Server = struct {
         };
         defer {
             for (events) |evt| {
-                if (evt.key) |k| self.allocator.free(k);
-                self.allocator.free(evt.value);
+                store.freeEvent(self.allocator, evt);
             }
             self.allocator.free(events);
         }

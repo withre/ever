@@ -1,8 +1,8 @@
 //! Append-only event log — the core storage primitive of Ever.
 //!
 //! Events are sequentially written to segment files with monotonically
-//! increasing offsets. Segments are rotated when they exceed a configurable
-//! maximum size.
+//! increasing offsets. Each segment maintains an in-memory position index
+//! for O(1) offset lookups.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,7 +36,7 @@ pub const Event = struct {
         return buf[0..total];
     }
 
-    /// Decode an event record from bytes.
+    /// Decode an event record from bytes. Returns slices into `data`.
     pub fn decode(data: []const u8) error{CorruptRecord}!Event {
         if (data.len < header_size) return error.CorruptRecord;
 
@@ -66,11 +66,22 @@ pub const Event = struct {
     }
 };
 
-/// Metadata for a single log segment.
+/// Metadata for a single log segment, with in-memory position index.
 const Segment = struct {
     base_offset: u64,
     file: File,
     size: u64,
+    /// Maps (offset - base_offset) → byte position in file. O(1) lookup.
+    positions: std.ArrayList(u64) = .empty,
+
+    fn eventCount(self: *const Segment) u64 {
+        return self.positions.items.len;
+    }
+
+    fn deinit(self: *Segment, allocator: Allocator, io: Io) void {
+        self.file.close(io);
+        self.positions.deinit(allocator);
+    }
 };
 
 /// Configuration for the event log.
@@ -79,7 +90,7 @@ pub const Config = struct {
     sync_on_append: bool = true,
 };
 
-/// Append-only event log with segment rotation.
+/// Append-only event log with segment rotation and O(1) reads.
 pub const Log = struct {
     allocator: Allocator,
     io: Io,
@@ -88,7 +99,6 @@ pub const Log = struct {
     next_offset: u64,
     config: Config,
 
-    /// Initialize a log in the given directory.
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !Log {
         var log = Log{
             .allocator = allocator,
@@ -98,15 +108,13 @@ pub const Log = struct {
             .next_offset = 0,
             .config = config,
         };
-
         try log.recover();
-
         return log;
     }
 
     pub fn deinit(self: *Log) void {
-        for (self.segments.items) |seg| {
-            seg.file.close(self.io);
+        for (self.segments.items) |*seg| {
+            seg.deinit(self.allocator, self.io);
         }
         self.segments.deinit(self.allocator);
     }
@@ -132,7 +140,7 @@ pub const Log = struct {
             try self.createSegment(offset);
         }
 
-        // Encode and write
+        // Encode into stack buffer or heap
         var buf: [4096]u8 = undefined;
         var heap_buf: ?[]u8 = null;
         defer if (heap_buf) |hb| self.allocator.free(hb);
@@ -147,7 +155,13 @@ pub const Log = struct {
         const encoded = try event.encode(write_buf);
 
         const seg = self.activeSegmentMut();
+
+        // Record position in index BEFORE writing
+        try seg.positions.append(self.allocator, seg.size);
+
         seg.file.writePositionalAll(self.io, encoded, seg.size) catch |err| {
+            // Rollback position index on write failure
+            _ = seg.positions.pop();
             return err;
         };
 
@@ -162,60 +176,17 @@ pub const Log = struct {
     }
 
     /// Read a single event by offset. Returns null if not found.
+    /// Caller owns the returned key/value memory.
     pub fn read(self: *Log, allocator: Allocator, offset: u64) !?Event {
         if (offset >= self.next_offset) return null;
 
-        // Find the segment containing this offset
-        const seg_idx = self.findSegment(offset) orelse return null;
-        const seg = &self.segments.items[seg_idx];
+        const seg = self.findSegmentForOffset(offset) orelse return null;
+        const local_idx = offset - seg.base_offset;
+        if (local_idx >= seg.positions.items.len) return null;
 
-        // Scan the segment to find the offset
-        var pos: u64 = 0;
-        var header_buf: [Event.header_size]u8 = undefined;
+        const file_pos = seg.positions.items[@intCast(local_idx)];
 
-        while (pos < seg.size) {
-            const bytes_read = seg.file.readPositionalAll(self.io, &header_buf, pos) catch break;
-            if (bytes_read < Event.header_size) break;
-
-            const event_offset = std.mem.readInt(u64, header_buf[0..8], .little);
-            const key_len: usize = std.mem.readInt(u32, header_buf[16..20], .little);
-            const val_len: usize = std.mem.readInt(u32, header_buf[20..24], .little);
-            const total_size = Event.header_size + key_len + val_len;
-
-            if (event_offset == offset) {
-                // Read the full record
-                const record = try allocator.alloc(u8, total_size);
-                errdefer allocator.free(record);
-                const full_read = seg.file.readPositionalAll(self.io, record, pos) catch {
-                    allocator.free(record);
-                    return error.CorruptRecord;
-                };
-                if (full_read < total_size) {
-                    allocator.free(record);
-                    return error.CorruptRecord;
-                }
-                const decoded = try Event.decode(record);
-                // Make owned copies of key/value
-                const key_copy: ?[]const u8 = if (decoded.key) |k| blk: {
-                    const copy = try allocator.alloc(u8, k.len);
-                    @memcpy(copy, k);
-                    break :blk copy;
-                } else null;
-                const val_copy = try allocator.alloc(u8, decoded.value.len);
-                @memcpy(val_copy, decoded.value);
-                allocator.free(record);
-                return .{
-                    .offset = decoded.offset,
-                    .timestamp = decoded.timestamp,
-                    .key = key_copy,
-                    .value = val_copy,
-                };
-            }
-
-            pos += total_size;
-        }
-
-        return null;
+        return try self.readEventAt(allocator, seg, file_pos);
     }
 
     /// Read a batch of events starting from offset.
@@ -230,15 +201,29 @@ pub const Log = struct {
             events.deinit(allocator);
         }
 
-        var current_offset = start_offset;
-        var count: u32 = 0;
+        var offset = start_offset;
+        var remaining: u32 = max_count;
 
-        while (count < max_count and current_offset < self.next_offset) {
-            if (try self.read(allocator, current_offset)) |event| {
+        while (remaining > 0 and offset < self.next_offset) {
+            const seg = self.findSegmentForOffset(offset) orelse break;
+            const local_start = offset - seg.base_offset;
+            const available = seg.eventCount() - local_start;
+            const to_read: u64 = @min(available, remaining);
+
+            // Read contiguous events from this segment
+            for (0..to_read) |i| {
+                const local_idx = local_start + i;
+                const file_pos = seg.positions.items[@intCast(local_idx)];
+                const event = try self.readEventAt(allocator, seg, file_pos);
+                errdefer {
+                    if (event.key) |k| allocator.free(k);
+                    allocator.free(event.value);
+                }
                 try events.append(allocator, event);
-                count += 1;
             }
-            current_offset += 1;
+
+            offset += to_read;
+            remaining -= @intCast(to_read);
         }
 
         return events.toOwnedSlice(allocator);
@@ -249,7 +234,7 @@ pub const Log = struct {
         return self.next_offset;
     }
 
-    // --- Private helpers ---
+    // ── Private helpers ─────────────────────────────────────────────────
 
     fn activeSegment(self: *Log) *const Segment {
         return &self.segments.items[self.segments.items.len - 1];
@@ -259,14 +244,68 @@ pub const Log = struct {
         return &self.segments.items[self.segments.items.len - 1];
     }
 
-    fn findSegment(self: *Log, offset: u64) ?usize {
-        var result: ?usize = null;
-        for (self.segments.items, 0..) |seg, i| {
-            if (seg.base_offset <= offset) {
-                result = i;
+    /// Binary search for the segment containing `offset`.
+    fn findSegmentForOffset(self: *Log, offset: u64) ?*Segment {
+        const items = self.segments.items;
+        if (items.len == 0) return null;
+
+        // Binary search: find the last segment with base_offset <= offset
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].base_offset <= offset) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        return result;
+        if (lo == 0) return null;
+        return &self.segments.items[lo - 1];
+    }
+
+    /// Read and decode a single event at a known file position.
+    fn readEventAt(self: *Log, allocator: Allocator, seg: *const Segment, file_pos: u64) !Event {
+        // Read header first
+        var header_buf: [Event.header_size]u8 = undefined;
+        const hdr_read = seg.file.readPositionalAll(self.io, &header_buf, file_pos) catch
+            return error.CorruptRecord;
+        if (hdr_read < Event.header_size) return error.CorruptRecord;
+
+        const key_len: usize = std.mem.readInt(u32, header_buf[16..20], .little);
+        const val_len: usize = std.mem.readInt(u32, header_buf[20..24], .little);
+        const payload_size = key_len + val_len;
+
+        // Read payload (key + value)
+        const payload = try allocator.alloc(u8, payload_size);
+        errdefer allocator.free(payload);
+
+        if (payload_size > 0) {
+            const payload_read = seg.file.readPositionalAll(self.io, payload, file_pos + Event.header_size) catch {
+                allocator.free(payload);
+                return error.CorruptRecord;
+            };
+            if (payload_read < payload_size) {
+                allocator.free(payload);
+                return error.CorruptRecord;
+            }
+        }
+
+        const offset_val = std.mem.readInt(u64, header_buf[0..8], .little);
+        const timestamp = std.mem.readInt(i64, header_buf[8..16], .little);
+
+        // Return event with slices into the payload buffer.
+        // Caller frees event.value which is the full payload allocation.
+        // We pack key and value contiguously so one free covers both.
+        const key: ?[]const u8 = if (key_len > 0) payload[0..key_len] else null;
+        const value = payload[key_len..];
+
+        return .{
+            .offset = offset_val,
+            .timestamp = timestamp,
+            .key = key,
+            .value = value,
+        };
     }
 
     fn createSegment(self: *Log, base_offset: u64) !void {
@@ -293,7 +332,7 @@ pub const Log = struct {
     }
 
     fn recover(self: *Log) !void {
-        // Collect existing segment files
+        // Collect existing segment file names
         var seg_names: std.ArrayList([]u8) = .empty;
         defer {
             for (seg_names.items) |name| self.allocator.free(name);
@@ -309,16 +348,14 @@ pub const Log = struct {
             try seg_names.append(self.allocator, name_copy);
         }
 
-        // Sort by name (sorts by base offset due to zero-padding)
         std.mem.sort([]u8, seg_names.items, {}, struct {
             fn lessThan(_: void, a: []u8, b: []u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
             }
         }.lessThan);
 
-        // Open each segment
         for (seg_names.items) |name| {
-            const stem = name[0 .. name.len - 4]; // strip ".log"
+            const stem = name[0 .. name.len - 4];
             const base_offset = std.fmt.parseInt(u64, stem, 10) catch continue;
 
             const file = self.dir.openFile(self.io, name, .{ .mode = .read_write }) catch continue;
@@ -327,33 +364,43 @@ pub const Log = struct {
                 continue;
             };
 
-            try self.segments.append(self.allocator, .{
+            var seg = Segment{
                 .base_offset = base_offset,
                 .file = file,
                 .size = stat.size,
-            });
-        }
+            };
 
-        // Recover next_offset by scanning the last segment
-        if (self.segments.items.len > 0) {
-            const last_seg = &self.segments.items[self.segments.items.len - 1];
-            var pos: u64 = 0;
-            var header_buf: [Event.header_size]u8 = undefined;
+            // Build position index by scanning the segment once
+            self.buildPositionIndex(&seg) catch {
+                seg.deinit(self.allocator, self.io);
+                continue;
+            };
 
-            while (pos < last_seg.size) {
-                const bytes_read = last_seg.file.readPositionalAll(self.io, &header_buf, pos) catch break;
-                if (bytes_read < Event.header_size) break;
-
-                const key_len: usize = std.mem.readInt(u32, header_buf[16..20], .little);
-                const val_len: usize = std.mem.readInt(u32, header_buf[20..24], .little);
-                const total_size = Event.header_size + key_len + val_len;
-
-                if (pos + total_size > last_seg.size) break;
-
-                const event_offset = std.mem.readInt(u64, header_buf[0..8], .little);
-                self.next_offset = event_offset + 1;
-                pos += total_size;
+            if (seg.eventCount() > 0) {
+                self.next_offset = base_offset + seg.eventCount();
             }
+
+            try self.segments.append(self.allocator, seg);
+        }
+    }
+
+    /// Scan a segment file once to build the in-memory position index.
+    fn buildPositionIndex(self: *Log, seg: *Segment) !void {
+        var pos: u64 = 0;
+        var header_buf: [Event.header_size]u8 = undefined;
+
+        while (pos < seg.size) {
+            const bytes_read = seg.file.readPositionalAll(self.io, &header_buf, pos) catch break;
+            if (bytes_read < Event.header_size) break;
+
+            const key_len: usize = std.mem.readInt(u32, header_buf[16..20], .little);
+            const val_len: usize = std.mem.readInt(u32, header_buf[20..24], .little);
+            const total_size = Event.header_size + key_len + val_len;
+
+            if (pos + total_size > seg.size) break;
+
+            try seg.positions.append(self.allocator, pos);
+            pos += total_size;
         }
     }
 };
@@ -364,7 +411,7 @@ fn getMilliTimestamp() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
-// --- Tests ---
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 test "Event encode and decode round-trip" {
     const event = Event{
@@ -416,8 +463,8 @@ test "Log append and read single event" {
 
     const event = (try log.read(std.testing.allocator, 0)).?;
     defer {
-        if (event.key) |k| std.testing.allocator.free(k);
-        std.testing.allocator.free(event.value);
+        // value allocation covers both key and value (contiguous payload)
+        std.testing.allocator.free(event.value.ptr[0 .. (if (event.key) |k| k.len else 0) + event.value.len]);
     }
     try std.testing.expectEqual(@as(u64, 0), event.offset);
     try std.testing.expectEqualStrings("key1", event.key.?);
@@ -442,8 +489,7 @@ test "Log append multiple events and readBatch" {
     const events = try log.readBatch(std.testing.allocator, 0, 10);
     defer {
         for (events) |evt| {
-            if (evt.key) |k| std.testing.allocator.free(k);
-            std.testing.allocator.free(evt.value);
+            freeEvent(std.testing.allocator, evt);
         }
         std.testing.allocator.free(events);
     }
@@ -459,9 +505,8 @@ test "Log segment rotation" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Small segment size to force rotation
     var log = try Log.init(std.testing.allocator, io, tmp.dir, .{
-        .max_segment_size = 60, // ~2 small events per segment
+        .max_segment_size = 60,
         .sync_on_append = false,
     });
     defer log.deinit();
@@ -470,16 +515,11 @@ test "Log segment rotation" {
     _ = try log.append(null, "b");
     _ = try log.append(null, "c");
 
-    // Should have multiple segments
     try std.testing.expect(log.segments.items.len >= 2);
 
-    // All events should still be readable
     const events = try log.readBatch(std.testing.allocator, 0, 10);
     defer {
-        for (events) |evt| {
-            if (evt.key) |k| std.testing.allocator.free(k);
-            std.testing.allocator.free(evt.value);
-        }
+        for (events) |evt| freeEvent(std.testing.allocator, evt);
         std.testing.allocator.free(events);
     }
     try std.testing.expectEqual(@as(usize, 3), events.len);
@@ -490,7 +530,6 @@ test "Log recovery after reopen" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // Write some events
     {
         var log = try Log.init(std.testing.allocator, io, tmp.dir, .{
             .max_segment_size = 4096,
@@ -503,7 +542,6 @@ test "Log recovery after reopen" {
         _ = try log.append(null, "v3");
     }
 
-    // Reopen and verify recovery
     {
         var log = try Log.init(std.testing.allocator, io, tmp.dir, .{
             .max_segment_size = 4096,
@@ -514,14 +552,10 @@ test "Log recovery after reopen" {
         try std.testing.expectEqual(@as(u64, 3), log.nextOffset());
 
         const event = (try log.read(std.testing.allocator, 1)).?;
-        defer {
-            if (event.key) |k| std.testing.allocator.free(k);
-            std.testing.allocator.free(event.value);
-        }
+        defer freeEvent(std.testing.allocator, event);
         try std.testing.expectEqualStrings("k2", event.key.?);
         try std.testing.expectEqualStrings("v2", event.value);
 
-        // New appends should continue from recovered offset
         const new_offset = try log.append(null, "v4");
         try std.testing.expectEqual(@as(u64, 3), new_offset);
     }
@@ -540,4 +574,16 @@ test "Log read non-existent offset returns null" {
 
     const result = try log.read(std.testing.allocator, 0);
     try std.testing.expectEqual(@as(?Event, null), result);
+}
+
+/// Helper to free an event returned by read/readBatch.
+/// The payload (key + value) is a single contiguous allocation.
+pub fn freeEvent(allocator: Allocator, event: Event) void {
+    const key_len = if (event.key) |k| k.len else 0;
+    const total_len = key_len + event.value.len;
+    if (total_len > 0) {
+        // The payload starts at key (or value if no key)
+        const ptr = if (event.key) |k| k.ptr else event.value.ptr;
+        allocator.free(ptr[0..total_len]);
+    }
 }

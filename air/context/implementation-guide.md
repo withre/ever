@@ -173,6 +173,11 @@ zig build test -Doptimize=ReleaseSafe
 - **Main signature**: Use `pub fn main(init: std.process.Init) !void` to get allocator, io, and args.
 - **Args iteration**: Use `std.process.Args.Iterator.init(init.minimal.args)` then `.next()`.
 
+### Event Memory Ownership
+- `Log.read()` and `Log.readBatch()` return events with key+value in a single contiguous allocation
+- Always use `store.freeEvent(allocator, event)` to free — never free key and value separately
+- This reduces allocator pressure from 2-3 allocs per read to 1
+
 ### Debugging
 - Use `std.debug.print` for quick debugging (remove before commit)
 - Use `std.log` for structured logging that stays in production code

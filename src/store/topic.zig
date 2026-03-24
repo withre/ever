@@ -222,10 +222,7 @@ test "TopicManager create and publish" {
     // Read back
     const log = try manager.getTopic("test-topic");
     const event = (try log.read(std.testing.allocator, 0)).?;
-    defer {
-        if (event.key) |k| std.testing.allocator.free(k);
-        std.testing.allocator.free(event.value);
-    }
+    defer store.freeEvent(std.testing.allocator, event);
     try std.testing.expectEqualStrings("value", event.value);
 }
 
@@ -309,7 +306,7 @@ test "TopicManager recovery after reopen" {
         try std.testing.expectEqual(@as(u64, 1), log.nextOffset());
 
         const event = (try log.read(std.testing.allocator, 0)).?;
-        defer std.testing.allocator.free(event.value);
+        defer store.freeEvent(std.testing.allocator, event);
         try std.testing.expectEqualStrings("hello", event.value);
     }
 }
