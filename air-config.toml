@@ -2,12 +2,12 @@ main-directory = "./air/"
 template-directory = "./air/templates/"
 archive-directory = "./air/archive/"
 context-directory = "./air/context/"
-supported-file-types = ["org"]
-default-file-type = "org"
-tags = []
+supported-file-types = ["md"]
+default-file-type = "md"
+tags = ["core", "store", "protocol", "publisher", "subscriber", "orchestrator", "transformer", "cli", "testing"]
 built-in-templates = ["air-standard"]
 
 [airctl-status]
 show-date = false
-show-tag = false
+show-tag = true
 hide-unknown = false

@@ -1,145 +1,163 @@
 # Interface Design
 
-<!-- TODO: Customize this guide for your project's interface design patterns -->
+## Overview
 
-## User Interface Design
+Ever has two primary interfaces:
+1. **Wire Protocol** — Binary/JSON protocol for inter-process communication (publisher ↔ store ↔ subscriber)
+2. **CLI** — Command-line interface for operational management via the orchestrator
 
-<!-- TODO: Define your project's interface design principles -->
-<!-- Example patterns that work well for most projects:
+Both interfaces prioritize clarity, consistency, and programmatic usability.
 
-### Visual Hierarchy and Structure
-- Maintain visual hierarchy with headers, sections, and proper indentation
-- Show items in consistent order across related commands
-- Use strategic spacing between different types of information
-- Group related information together with clear visual separation
+## Wire Protocol Design
 
-### Typography and Styling
-- Use consistent styling system with fallbacks for different environments
-- Apply visual distinction for different types of information (success/error/info)
-- Consistent styling for similar content types across all interfaces
-- Show exact information rather than generic descriptions
+### Message Design Principles
+- Every message has a fixed-size header followed by a variable-size body
+- Message types are explicitly enumerated — no stringly-typed dispatch
+- All multi-byte integers use little-endian encoding (Zig native)
+- Messages are self-describing: header contains body length for framing
+- Version field in handshake for protocol evolution
 
-### Content Organization
-- Separate different types of information logically
-- Align related information dynamically based on actual content
-- Use complete sentences with proper punctuation for user-facing messages
-- Strategic use of compact vs expanded display for information hierarchy
--->
+### Request-Response Pattern
+- Publish → Ack (with assigned offset) or Error
+- Fetch → Events (batch) or Error
+- Subscribe → Stream of Events until unsubscribe or disconnect
+- CreateTopic → Success or Error
 
-## Interface Components
+### Error Responses
+- Structured error with numeric code and human-readable message
+- Error codes are stable across versions — clients can match on them
+- Include enough context to diagnose without server logs
 
-<!-- TODO: Define your project's interface component patterns -->
-<!-- Example component design principles:
+### Framing
+- Length-prefixed framing for TCP streams
+- No delimiter-based parsing — avoids escaping issues
+- Maximum message size enforced (configurable, default 16MB)
+- Partial message buffering handled by connection layer
 
-### Reusable Components
-- Extract common interface logic into reusable components
-- Use configuration objects to centralize interface decisions
-- Create component libraries that encapsulate complex logic
-- Define consistent naming and sizing standards
+## CLI Design
 
-### Dynamic Layout
-- Calculate dimensions from actual data, not hardcoded values
-- Handle responsive design based on available space
-- Separate layout logic from content logic
-- Ensure consistent behavior across different view modes
+### Command Structure
+```
+ever <command> [subcommand] [options]
+```
 
-### Hierarchical Display
-- Use consistent patterns for nested information
-- Maintain clear visual hierarchy
-- Provide clear indicators for different levels
-- Handle large datasets with pagination or truncation
--->
+### Core Commands
+```
+ever store start          # Start the storage server
+ever store status         # Show store health and statistics
+ever store stop           # Gracefully stop the store
 
-## Interactive Interface Patterns
+ever topic create <name>  # Create a new topic
+ever topic list           # List all topics with stats
+ever topic delete <name>  # Delete a topic
+ever topic describe <name> # Show topic details (segments, offsets, size)
 
-<!-- TODO: Define your project's interaction patterns -->
+ever pub <topic> <data>   # Publish a single event
+ever pub <topic> --file <path>  # Publish events from file (one per line)
+ever pub <topic> --stdin  # Publish events from stdin
 
-### User Interaction Design
-- Provide clear summaries before performing important operations
-- Always validate user input with helpful, actionable error messages
-- Use confirmation steps for operations that create or modify files
-- Structure prompts to guide users through complex workflows step-by-step
+ever sub <topic>          # Subscribe and print events
+ever sub <topic> --from <offset>  # Start from specific offset
+ever sub <topic> --group <name>   # Join consumer group
+ever sub <topic> --follow         # Keep listening for new events
 
-### Contextual Help and Guidance
-- Provide contextual help and explanations for each decision point
-- Handle system environment detection gracefully with sensible fallbacks
-- Keep interface logic separate from business logic for maintainability
-- Design extensible prompts that can accommodate future options
+ever status               # Overall system status
+ever version              # Version information
+```
 
-### Progressive Disclosure
-- Show essential information by default
-- Provide verbose modes for detailed information
-- Use flags like `--all` to show complete information without truncation
-- Implement filtering options to focus on relevant subsets
+### Output Design
+- Default output is human-readable with aligned columns
+- `--json` flag for machine-readable JSON output
+- `--quiet` flag for minimal output (just data, no decoration)
+- Error messages go to stderr, data goes to stdout
+- Exit codes: 0 for success, 1 for errors, 2 for usage errors
 
-## Accessibility and Compatibility
+### Interactive Patterns
+- `ever sub --follow` streams continuously until Ctrl-C
+- `ever pub --stdin` reads from stdin until EOF
+- Progress indicators for long operations (topic deletion, compaction)
 
-### Cross-Platform Compatibility
-- Maintain broad compatibility by testing UI elements across different environments
-- Provide text fallbacks for emoji/unicode in terminals that don't support them
-- Handle different terminal widths and capabilities gracefully
-- Test on various operating systems and terminal emulators
+## Library API Design
 
-### User Experience Levels
-- Design for both novice and expert users
-- Provide clear default behaviors that work for most users
-- Offer advanced options for power users without cluttering the basic interface
-- Include helpful examples and guidance in help text
+### Publisher API
+```zig
+const publisher = try ever.Publisher.connect(allocator, address);
+defer publisher.deinit();
 
-### Error Communication
-- Clear error messages with suggested solutions
-- Show exactly what failed and why
-- Provide actionable next steps for resolution
-- Use consistent error formatting and terminology
+// Single publish
+try publisher.publish("agent.tasks", key, value);
 
-## Information Display Patterns
+// Batch publish
+var batch = publisher.batch("agent.tasks");
+try batch.add(key1, value1);
+try batch.add(key2, value2);
+const offsets = try batch.flush();
+```
 
-<!-- TODO: Define how your project displays information and status -->
+### Subscriber API
+```zig
+const subscriber = try ever.Subscriber.connect(allocator, address);
+defer subscriber.deinit();
 
-## Configuration and Customization
+// Pull-based
+const events = try subscriber.fetch("agent.tasks", .{ .max_events = 100 });
+defer events.deinit();
+for (events.items) |event| {
+    processEvent(event);
+}
+try subscriber.ack("agent.tasks", events.last_offset);
 
-<!-- TODO: Define your project's customization options -->
+// Push-based (callback)
+try subscriber.subscribe("agent.tasks", .{ .from = .earliest }, struct {
+    fn handler(event: Event) !void {
+        // process event
+    }
+}.handler);
+```
 
-### Display Preferences
-- Support multiple output formats (tree, list, JSON)
-- Allow customization of display elements through configuration
-- Provide sensible defaults that work for most users
-- Enable/disable optional display elements based on user preference
+### Design Principles for Library API
+- Allocator always passed explicitly
+- Connection resources cleaned up with `deinit()` pattern
+- Error unions for all fallible operations
+- Options structs with sensible defaults for configurability
+- Batch APIs for throughput-sensitive use cases
 
-### Responsive Design
-- Adapt display format based on terminal width
-- Handle narrow terminals gracefully
-- Scale information density based on available space
-- Maintain readability across different screen sizes
+## Error Communication
 
-### Output Format Flexibility
-- Support machine-readable formats (JSON) for programmatic use
-- Human-readable formats optimized for direct consumption
-- Consistent data representation across different output formats
-- Clear documentation of output format schemas
+### User-Facing Error Messages
+- Clear, actionable error messages with suggested fixes
+- Include relevant context (topic name, offset, connection address)
+- Distinguish between user errors (bad input) and system errors (disk full)
+- Consistent format: `error: <what happened>. <suggestion>`
 
-## Future Interface Considerations
+### Examples
+```
+error: topic "agent.tasks" not found. Create it with: ever topic create agent.tasks
+error: connection refused at localhost:4222. Is the store running? Start with: ever store start
+error: offset 1500 is beyond the end of topic "events" (current max: 1234)
+```
 
-<!-- TODO: Plan for future interface enhancements -->
+## Configuration
 
-## Implementation Guidelines
+### Store Configuration
+- TOML configuration file (`ever.toml`) for store settings
+- Environment variable overrides with `EVER_` prefix
+- Sensible defaults — zero configuration to get started
+- Configuration validation on startup with clear error messages
 
-<!-- TODO: Add your project's interface implementation guidelines -->
+### Default Configuration
+```toml
+[store]
+data_dir = "./data"
+listen = "127.0.0.1:4222"
+max_segment_size = "64MB"
+max_message_size = "16MB"
 
-### Code Organization
-- Keep interface logic separate from business logic
-- Use dependency injection for testability
-- Create clear boundaries between display components
-- Design for extensibility and customization
+[retention]
+max_age = "7d"
+max_size = "1GB"
 
-### Testing Interface Components
-- Test display formatting with various data sets
-- Verify alignment and spacing calculations
-- Test edge cases (empty data, very long content, special characters)
-- Validate cross-platform rendering consistency
-
-### Performance Considerations
-- Lazy rendering for large data sets
-- Efficient string formatting and memory usage
-- Minimize expensive formatting operations
-- Cache calculated layout information when appropriate
+[logging]
+level = "info"
+format = "text"  # or "json"
+```
