@@ -55,4 +55,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_main_tests.step);
+
+    // Benchmark executable (always ReleaseFast for realistic numbers)
+    const bench_exe = b.addExecutable(.{
+        .name = "ever-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_exe.root_module.addImport("ever", ever_module);
+
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        bench_run.addArgs(args);
+    }
+
+    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
 }
