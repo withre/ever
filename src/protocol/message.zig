@@ -121,10 +121,7 @@ pub fn writeFrame(fd: std.posix.fd_t, msg_type: MessageType, body: []const u8) !
 /// Caller owns the returned body slice.
 pub fn readFrame(allocator: Allocator, fd: std.posix.fd_t) !?Frame {
     var header: [HEADER_SIZE]u8 = undefined;
-    const header_read = readAll(fd, &header) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe => return null,
-        else => return err,
-    };
+    const header_read = readAll(fd, &header) catch return null;
     if (header_read == 0) return null; // Clean EOF
     if (header_read < HEADER_SIZE) return error.IncompleteHeader;
 
@@ -138,12 +135,9 @@ pub fn readFrame(allocator: Allocator, fd: std.posix.fd_t) !?Frame {
     const body = try allocator.alloc(u8, body_len);
     errdefer allocator.free(body);
 
-    const body_read = readAll(fd, body) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe => {
-            allocator.free(body);
-            return null;
-        },
-        else => return err,
+    const body_read = readAll(fd, body) catch {
+        allocator.free(body);
+        return null;
     };
     if (body_read < body_len) {
         allocator.free(body);

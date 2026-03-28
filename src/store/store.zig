@@ -407,8 +407,10 @@ pub const Log = struct {
 
 /// Get current time in milliseconds since Unix epoch.
 fn getMilliTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
