@@ -8,6 +8,8 @@ const protocol = @import("../protocol/message.zig");
 const topic_mod = @import("../store/topic.zig");
 const TopicManager = topic_mod.TopicManager;
 const store = @import("../store/store.zig");
+const hooks_mod = @import("../store/hooks.zig");
+const HookTable = hooks_mod.HookTable;
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
@@ -19,6 +21,7 @@ pub const Server = struct {
     allocator: Allocator,
     io: Io,
     topic_manager: *TopicManager,
+    hook_table: ?*HookTable,
     config: Config,
     net_server: ?net.Server,
     shutdown_requested: std.atomic.Value(bool),
@@ -28,10 +31,15 @@ pub const Server = struct {
             .allocator = allocator,
             .io = io,
             .topic_manager = topic_manager,
+            .hook_table = null,
             .config = config,
             .net_server = null,
             .shutdown_requested = std.atomic.Value(bool).init(false),
         };
+    }
+
+    pub fn setHookTable(self: *Server, ht: *HookTable) void {
+        self.hook_table = ht;
     }
 
     pub fn deinit(self: *Server) void {
@@ -80,6 +88,9 @@ pub const Server = struct {
             .delete_topic => try self.handleDeleteTopic(frame.body, fd),
             .list_topics => try self.handleListTopics(fd),
             .ack => try protocol.writeFrame(fd, .ack_ok, "{}"),
+            .register_hook => try self.handleRegisterHook(frame.body, fd),
+            .unregister_hook => try self.handleUnregisterHook(frame.body, fd),
+            .list_hooks => try self.handleListHooks(fd),
             else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
         }
     }
@@ -106,39 +117,61 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
-        // Resolve events — either by pattern or single topic
-        const events = if (req.pattern) |pattern|
-            self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
-                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed")
-        else if (req.topic) |topic_name|
-            self.topic_manager.fetch(self.allocator, topic_name, req.offset, req.max_count) catch |err| return switch (err) {
-                error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
-                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"),
+        // Blocking fetch: retry until events found or timeout
+        const block_ms = req.block_ms;
+        var elapsed_ms: u32 = 0;
+        const sleep_interval_ms: u32 = 100; // 100ms poll interval
+
+        while (true) {
+            // Resolve events — either by pattern or single topic
+            const events = if (req.pattern) |pattern|
+                self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
+                    return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed")
+            else if (req.topic) |topic_name|
+                self.topic_manager.fetch(self.allocator, topic_name, req.offset, req.max_count) catch |err| return switch (err) {
+                    error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
+                    else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"),
+                }
+            else
+                return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
+
+            // If we have events or not blocking, send response
+            if (events.len > 0 or block_ms == 0 or elapsed_ms >= block_ms or self.shutdown_requested.load(.acquire)) {
+                defer {
+                    for (events) |evt| store.freeEvent(self.allocator, evt);
+                    self.allocator.free(events);
+                }
+
+                // Convert to protocol format
+                const event_data = try self.allocator.alloc(protocol.EventData, events.len);
+                defer self.allocator.free(event_data);
+                for (events, 0..) |evt, i| {
+                    event_data[i] = .{
+                        .offset = evt.offset,
+                        .timestamp = evt.timestamp,
+                        .key = evt.key,
+                        .value = evt.value,
+                        .topic = evt.topic,
+                    };
+                }
+
+                const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data });
+                defer self.allocator.free(resp_body);
+                try protocol.writeFrame(fd, .fetch_ok, resp_body);
+                return;
             }
-        else
-            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
 
-        defer {
-            for (events) |evt| store.freeEvent(self.allocator, evt);
-            self.allocator.free(events);
-        }
+            // No events yet, free and sleep
+            self.allocator.free(events); // empty slice
 
-        // Convert to protocol format
-        const event_data = try self.allocator.alloc(protocol.EventData, events.len);
-        defer self.allocator.free(event_data);
-        for (events, 0..) |evt, i| {
-            event_data[i] = .{
-                .offset = evt.offset,
-                .timestamp = evt.timestamp,
-                .key = evt.key,
-                .value = evt.value,
-                .topic = evt.topic,
+            // Sleep using linux nanosleep
+            const ts = std.os.linux.timespec{
+                .sec = 0,
+                .nsec = @as(i64, sleep_interval_ms) * 1_000_000,
             };
+            _ = std.os.linux.nanosleep(&ts, null);
+            elapsed_ms += sleep_interval_ms;
         }
-
-        const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data });
-        defer self.allocator.free(resp_body);
-        try protocol.writeFrame(fd, .fetch_ok, resp_body);
     }
 
     fn handleCreateTopic(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
@@ -171,6 +204,61 @@ pub const Server = struct {
         const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTopicsResponse{ .topics = topics });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .list_topics_ok, resp_body);
+    }
+
+    fn handleRegisterHook(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        const ht = self.hook_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        const parsed = protocol.decodeBody(protocol.RegisterHookRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid register hook request");
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        const id = ht.add(req.pattern, req.command, req.cwd) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook");
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.RegisterHookResponse{ .id = id });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .register_hook_ok, resp_body);
+    }
+
+    fn handleUnregisterHook(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        const ht = self.hook_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        const parsed = protocol.decodeBody(protocol.UnregisterHookRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid unregister hook request");
+        defer parsed.deinit();
+
+        ht.remove(parsed.value.id) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "hook not found");
+
+        try protocol.writeFrame(fd, .unregister_hook_ok, "{}");
+    }
+
+    fn handleListHooks(self: *Server, fd: std.posix.fd_t) !void {
+        const ht = self.hook_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        const hooks = ht.list();
+
+        const hook_infos = try self.allocator.alloc(protocol.HookInfo, hooks.len);
+        defer self.allocator.free(hook_infos);
+
+        for (hooks, 0..) |hook, i| {
+            hook_infos[i] = .{
+                .id = hook.id,
+                .pattern = hook.pattern,
+                .command = hook.command,
+                .cwd = hook.cwd,
+                .cursor = hook.cursor,
+            };
+        }
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.ListHooksResponse{ .hooks = hook_infos });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .list_hooks_ok, resp_body);
     }
 };
 

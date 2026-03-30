@@ -23,6 +23,9 @@ pub const MessageType = enum(u8) {
     delete_topic = 0x04,
     list_topics = 0x05,
     ack = 0x06,
+    register_hook = 0x07,
+    unregister_hook = 0x08,
+    list_hooks = 0x09,
 
     // Responses
     publish_ok = 0x81,
@@ -31,6 +34,9 @@ pub const MessageType = enum(u8) {
     delete_topic_ok = 0x84,
     list_topics_ok = 0x85,
     ack_ok = 0x86,
+    register_hook_ok = 0x87,
+    unregister_hook_ok = 0x88,
+    list_hooks_ok = 0x89,
 
     // Error
     error_response = 0xFF,
@@ -59,6 +65,7 @@ pub const FetchRequest = struct {
     pattern: ?[]const u8 = null,
     offset: u64 = 0,
     max_count: u32 = 100,
+    block_ms: u32 = 0,
 };
 
 pub const EventData = struct {
@@ -90,6 +97,34 @@ pub const AckRequest = struct {
 pub const ErrorResponse = struct {
     code: u16,
     message: []const u8,
+};
+
+// --- Hook request/response types ---
+
+pub const RegisterHookRequest = struct {
+    pattern: []const u8,
+    command: []const []const u8,
+    cwd: []const u8,
+};
+
+pub const RegisterHookResponse = struct {
+    id: u64,
+};
+
+pub const UnregisterHookRequest = struct {
+    id: u64,
+};
+
+pub const HookInfo = struct {
+    id: u64,
+    pattern: []const u8,
+    command: []const []const u8,
+    cwd: []const u8,
+    cursor: u64,
+};
+
+pub const ListHooksResponse = struct {
+    hooks: []const HookInfo,
 };
 
 // --- Encoding/Decoding ---

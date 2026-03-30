@@ -31,6 +31,31 @@ pub const Event = struct {
     topic: ?[]const u8 = null,
 };
 
+pub const HookInfoOwned = struct {
+    id: u64,
+    pattern: []const u8,
+    command: []const []const u8,
+    cwd: []const u8,
+    cursor: u64,
+
+    pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
+        allocator.free(self.pattern);
+        for (self.command) |arg| allocator.free(arg);
+        allocator.free(self.command);
+        allocator.free(self.cwd);
+    }
+};
+
+pub const ListHooksResult = struct {
+    hooks: []HookInfoOwned,
+    allocator: Allocator,
+
+    pub fn deinit(self: *ListHooksResult) void {
+        for (self.hooks) |h| h.deinit(self.allocator);
+        self.allocator.free(self.hooks);
+    }
+};
+
 /// Unified client for publishing and subscribing to the Ever store.
 pub const Client = struct {
     allocator: Allocator,
@@ -92,6 +117,17 @@ pub const Client = struct {
     /// Fetch events from all topics matching a pattern (trailing dot, *, or .).
     pub fn fetchPattern(self: *Client, pattern: []const u8, offset: u64, max_count: u32) !FetchResult {
         return self.doFetch(.{ .pattern = pattern, .offset = offset, .max_count = max_count });
+    }
+
+    /// Fetch with blocking — server holds until events arrive or timeout.
+    pub fn fetchBlocking(self: *Client, topic_name: ?[]const u8, pattern: ?[]const u8, offset: u64, max_count: u32, block_ms: u32) !FetchResult {
+        return self.doFetch(.{
+            .topic = topic_name,
+            .pattern = pattern,
+            .offset = offset,
+            .max_count = max_count,
+            .block_ms = block_ms,
+        });
     }
 
     fn doFetch(self: *Client, req: protocol.FetchRequest) !FetchResult {
@@ -178,6 +214,92 @@ pub const Client = struct {
 
         if (frame.msg_type == .error_response) return error.ServerError;
         if (frame.msg_type != .delete_topic_ok) return error.UnexpectedResponse;
+    }
+
+    /// Register a hook on the server.
+    pub fn registerHook(self: *Client, pattern: []const u8, command: []const []const u8, cwd: []const u8) !u64 {
+        const req = protocol.RegisterHookRequest{
+            .pattern = pattern,
+            .command = command,
+            .cwd = cwd,
+        };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .register_hook, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .register_hook_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.RegisterHookResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+        return parsed.value.id;
+    }
+
+    /// Unregister a hook by ID on the server.
+    pub fn removeHook(self: *Client, id: u64) !void {
+        const req = protocol.UnregisterHookRequest{ .id = id };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .unregister_hook, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .unregister_hook_ok) return error.UnexpectedResponse;
+    }
+
+    /// List all hooks on the server.
+    pub fn listHooks(self: *Client) !ListHooksResult {
+        try protocol.writeFrame(self.fd(), .list_hooks, "{}");
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .list_hooks_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.ListHooksResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        // Deep copy the hooks
+        const hooks = try self.allocator.alloc(HookInfoOwned, parsed.value.hooks.len);
+        errdefer self.allocator.free(hooks);
+
+        var initialized: usize = 0;
+        errdefer {
+            for (hooks[0..initialized]) |h| h.deinit(self.allocator);
+        }
+
+        for (parsed.value.hooks, 0..) |h, i| {
+            const cmd_copy = try self.allocator.alloc([]const u8, h.command.len);
+            var cmd_copied: usize = 0;
+            errdefer {
+                for (cmd_copy[0..cmd_copied]) |c| self.allocator.free(c);
+                self.allocator.free(cmd_copy);
+            }
+            for (h.command, 0..) |arg, j| {
+                cmd_copy[j] = try self.allocator.dupe(u8, arg);
+                cmd_copied = j + 1;
+            }
+
+            hooks[i] = .{
+                .id = h.id,
+                .pattern = try self.allocator.dupe(u8, h.pattern),
+                .command = cmd_copy,
+                .cwd = try self.allocator.dupe(u8, h.cwd),
+                .cursor = h.cursor,
+            };
+            initialized = i + 1;
+        }
+
+        return .{ .hooks = hooks, .allocator = self.allocator };
     }
 
     /// List all topics on the server.

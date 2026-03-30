@@ -1,0 +1,196 @@
+#+title: Server-Side Hooks
+#+state: complete
+#+FILETAGS: :subscriber:orchestrator:
+
+* Summary
+Add a hook daemon that runs alongside the Ever store. Users register hooks persistently (=ever hook add <pattern> -- <cmd>=) and the daemon executes commands when matching events arrive. No client process to keep alive.
+
+* Motivation
+Client-side triggers (=ever on=) require the user to keep a process running. If it crashes, events are missed. If the machine reboots, the trigger is gone. Users want "register and forget" — define what should happen, and Ever handles execution.
+
+The key insight from the debate: the original objection to server-side was about the *store process* running shell commands. But a separate daemon thread — tightly coupled to the store but not inside it — avoids that concern.
+
+** Goals
+- =ever hook add <pattern> -- <cmd>= to register a persistent hook
+- =ever hook list= / =ever hook rm <id>= to manage hooks
+- Hook daemon starts automatically with =ever store start=
+- Hooks persist across restarts (stored in data directory)
+- Each hook tracks its cursor (last processed offset)
+- Commands run with the permissions of whoever started the store
+
+** Non-Goals
+- User-level permission isolation (all hooks run as the store's user)
+- Distributed hook execution
+- Complex scheduling (retry policies, cron-like timing)
+
+* Research: How Other Systems Do This
+
+| System           | Model                         | Registration    | Execution          | Persistence |
+|------------------+-------------------------------+-----------------+--------------------+-------------|
+| systemd .path    | Separate unit files           | Config files    | Child process      | Filesystem  |
+| incron           | Daemon + incrontab            | Tab file        | fork/exec          | Filesystem  |
+| PostgreSQL       | LISTEN/NOTIFY + triggers      | SQL DDL         | In-process         | Database    |
+| K8s controllers  | Control loop in separate pod  | CRD / RBAC      | Reconciler process | etcd        |
+| NATS JetStream   | Push consumer config          | API call        | Delivery to client | Server-side |
+| SQLite hooks     | C callback registration       | API call        | In-process         | None        |
+| Temporal         | Workflow triggers             | API call        | Worker process     | Server DB   |
+
+** The incron model is the closest fit
+
+incron is a daemon that watches filesystem events (via inotify) and runs commands. It has:
+- A table file (like crontab) listing =<path> <event> <command>=
+- A daemon (=incrond=) that reads the table and watches
+- Commands run as fork/exec from the daemon
+- The table persists on disk
+
+Ever's hook daemon would be the same idea applied to event streams instead of filesystem paths.
+
+** The systemd model shows the right separation
+
+systemd .path units watch for file changes and activate a .service unit. The key architecture: the *watcher* (systemd) is separate from the *executor* (the service), but tightly coupled through unit file naming. For Ever:
+- The *watcher* is the hook daemon (reads events from the shared log)
+- The *executor* is fork/exec of the user's command
+- The coupling is through the hook table (stored in the data directory)
+
+* Proposal
+
+** Architecture
+
+#+begin_src
+┌──────────────────────────────┐
+│ ever store start             │
+│                              │
+│  ┌────────────────────────┐  │
+│  │ Storage Engine (Log)   │  │
+│  └────────┬───────────────┘  │
+│           │ shared log       │
+│  ┌────────┴───────────────┐  │
+│  │ TCP Server             │  │
+│  └────────────────────────┘  │
+│                              │
+│  ┌────────────────────────┐  │
+│  │ Hook Daemon            │  │  ← new
+│  │  reads shared log      │  │
+│  │  fork/exec commands    │  │
+│  │  tracks cursors        │  │
+│  └────────────────────────┘  │
+└──────────────────────────────┘
+#+end_src
+
+The hook daemon runs in the same process as the store (a separate thread), sharing the same =TopicManager=. This avoids TCP overhead — the daemon reads directly from the in-memory log.
+
+** Registration
+
+#+begin_src bash
+# Register a hook (persisted immediately)
+ever hook add agent.build.complete -- ./deploy.sh
+# Output: Hook #1 registered: agent.build.complete → ./deploy.sh
+
+# Register with pattern
+ever hook add agent. -- ./log-agent.sh
+# Output: Hook #2 registered: agent. → ./log-agent.sh
+
+# List hooks
+ever hook list
+# ID  Pattern                Command              Last Offset
+# 1   agent.build.complete   ./deploy.sh          42
+# 2   agent.                 ./log-agent.sh       45
+
+# Remove a hook
+ever hook rm 1
+# Output: Hook #1 removed.
+#+end_src
+
+** Hook Table
+
+Stored in =<data-dir>/hooks.json=:
+
+#+begin_src json
+{
+  "hooks": [
+    {
+      "id": 1,
+      "pattern": "agent.build.complete",
+      "command": ["./deploy.sh"],
+      "cwd": "/home/user/project",
+      "cursor": 42,
+      "created_at": 1711234567890
+    }
+  ],
+  "next_id": 2
+}
+#+end_src
+
+Written atomically (write to temp, rename) on every hook add/remove/cursor update.
+
+** Execution Model
+
+The hook daemon:
+1. On startup: read =hooks.json=, start watching from each hook's cursor
+2. Poll the shared log for new events (using =TopicManager.fetch= / =fetchPattern=)
+3. For each new event matching a hook's pattern: fork/exec the command
+4. On command completion: update cursor in =hooks.json=
+5. Sequential per hook (same as =ever on=)
+6. On command failure: log to stderr, advance cursor (don't retry)
+
+** How =ever hook add= works
+
+=ever hook add= is a client command (like =ever topic create=). It sends a new protocol message to the store:
+
+#+begin_src
+RegisterHook → { pattern, command, cwd }
+UnregisterHook → { id }
+ListHooks → {}
+#+end_src
+
+The store receives the registration, writes to =hooks.json=, and signals the hook daemon thread to reload.
+
+** Why in-process daemon, not a separate process
+
+A separate daemon would need its own connection to the store (TCP overhead), its own Io setup, and coordination for startup/shutdown. An in-process thread shares:
+- The =TopicManager= directly (no TCP serialization for reads)
+- The same =Io= instance
+- The same lifecycle (starts/stops with the store)
+- The same data directory
+
+The cost: one more thread in the store process. But the store already spawns threads for connections, so this is no additional complexity.
+
+** Comparison with =ever on= (client-side)
+
+| Aspect          | =ever on=                    | =ever hook add=                 |
+|-----------------+------------------------------+---------------------------------|
+| Persistence     | Dies with process            | Survives restart                |
+| Registration    | Command-line process         | API call, stored in data dir    |
+| Execution env   | User's terminal/cwd/env      | Store's cwd + hook's cwd       |
+| Management      | Kill the process             | =ever hook list/rm=             |
+| Overhead        | TCP client polling           | Direct log access (in-process)  |
+| Use case        | Ad-hoc, development          | Production, long-lived hooks    |
+
+Both coexist — =ever on= for quick ad-hoc triggers, =ever hook add= for persistent ones.
+
+** What to avoid
+
+- *PostgreSQL trigger pitfall*: Triggers running in the database transaction. Ever's daemon runs AFTER events are committed to the log, never during. A slow hook can't block event publishing.
+- *Jenkins config drift*: Hooks stored in XML that nobody audits. =ever hook list= makes all hooks visible and =ever hook rm= makes cleanup explicit.
+- *Lambda parallel explosion*: Keep sequential execution per hook as default. Each hook has its own cursor and runs independently of other hooks.
+
+* Implementation Complexity
+
+| Component              | Estimate | Notes                                        |
+|------------------------+----------+----------------------------------------------|
+| Hook table (JSON)      | ~100 LOC | Read/write/atomic update                     |
+| Protocol messages      | ~30 LOC  | Register/Unregister/List                     |
+| Server handlers        | ~50 LOC  | Handle new message types                     |
+| Hook daemon thread     | ~150 LOC | Poll loop, fork/exec, cursor tracking        |
+| CLI commands           | ~60 LOC  | =ever hook add/list/rm=                      |
+| *Total*                | *~390 LOC* |                                            |
+
+* History
+** 2026-04-04 — Implementation complete
+- Added =src/store/hooks.zig=: HookTable (JSON persistence, atomic writes) + HookDaemon (poll thread, fork/exec)
+- Extended =src/protocol/message.zig=: register_hook (0x07), unregister_hook (0x08), list_hooks (0x09) + OK responses
+- Extended =src/net/server.zig=: handlers for hook messages, optional HookTable reference
+- Extended =src/net/client.zig=: registerHook, removeHook, listHooks methods
+- Extended =src/main.zig=: =ever hook add/list/rm= CLI commands, hook daemon startup in =ever store start=
+- Updated =src/root.zig=: exported hooks module
+- All tests pass, end-to-end verified

@@ -37,6 +37,7 @@ pub const TopicManager = struct {
     allocator: Allocator,
     log: Log,
     topics: std.StringArrayHashMap(TopicIndex),
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !TopicManager {
         const log = try Log.init(allocator, io, dir, .{
@@ -66,8 +67,14 @@ pub const TopicManager = struct {
         self.log.deinit();
     }
 
+    fn lock(self: *TopicManager) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
     /// Register a new topic. No I/O — just adds to the index.
     pub fn createTopic(self: *TopicManager, name: []const u8) !void {
+        self.lock();
+        defer self.mutex.unlock();
         try validateTopicName(name);
         if (self.topics.contains(name)) return TopicError.AlreadyExists;
         const owned = try self.allocator.dupe(u8, name);
@@ -77,6 +84,8 @@ pub const TopicManager = struct {
 
     /// Remove a topic from the index. Log data stays (no compaction yet).
     pub fn deleteTopic(self: *TopicManager, name: []const u8) !void {
+        self.lock();
+        defer self.mutex.unlock();
         const entry = self.topics.fetchSwapRemove(name) orelse return TopicError.NotFound;
         var idx = entry.value;
         idx.deinit(self.allocator);
@@ -85,11 +94,15 @@ pub const TopicManager = struct {
 
     /// Check if a topic exists.
     pub fn hasTopic(self: *TopicManager, name: []const u8) bool {
+        self.lock();
+        defer self.mutex.unlock();
         return self.topics.contains(name);
     }
 
     /// List all topic names. Caller owns the returned slice and strings.
     pub fn listTopics(self: *TopicManager, allocator: Allocator) ![][]const u8 {
+        self.lock();
+        defer self.mutex.unlock();
         const keys = self.topics.keys();
         const result = try allocator.alloc([]const u8, keys.len);
         errdefer allocator.free(result);
@@ -99,6 +112,8 @@ pub const TopicManager = struct {
 
     /// Return all topic names matching a subscription pattern.
     pub fn matchTopics(self: *TopicManager, allocator: Allocator, input: []const u8) ![][]const u8 {
+        self.lock();
+        defer self.mutex.unlock();
         var matched: std.ArrayList([]const u8) = .empty;
         errdefer { for (matched.items) |m| allocator.free(m); matched.deinit(allocator); }
         for (self.topics.keys()) |key| {
@@ -110,6 +125,8 @@ pub const TopicManager = struct {
 
     /// Publish an event to a topic. Returns the global offset.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
+        self.lock();
+        defer self.mutex.unlock();
         const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
         const offset = try self.log.append(topic_name, key, value);
         try idx.offsets.append(self.allocator, offset);
@@ -118,6 +135,8 @@ pub const TopicManager = struct {
 
     /// Fetch events for a single topic by topic-local offset range.
     pub fn fetch(self: *TopicManager, allocator: Allocator, topic_name: []const u8, start: u64, max_count: u32) ![]Event {
+        self.lock();
+        defer self.mutex.unlock();
         const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
         const offsets = idx.offsets.items;
 
@@ -135,8 +154,10 @@ pub const TopicManager = struct {
         return events.toOwnedSlice(allocator);
     }
 
-    /// Fetch events across all topics matching a pattern, merged by timestamp.
+    /// Fetch events across all topics matching a pattern.
     pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
+        self.lock();
+        defer self.mutex.unlock();
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 

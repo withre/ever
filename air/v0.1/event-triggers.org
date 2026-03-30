@@ -1,0 +1,249 @@
+#+title: Event Triggers
+#+state: complete
+#+FILETAGS: :subscriber:cli:
+
+* Summary
+Add =ever on= — a command that watches for events matching a pattern and runs a shell command for each one. The event data is piped to the command's stdin with metadata in environment variables.
+
+* Motivation
+The current subscription model is pull-based: run =ever sub=, read the output, parse it yourself. For the common "when X happens, do Y" pattern, users need a wrapper script. =ever on= makes this a one-liner.
+
+** Goals
+- =ever on <pattern> -- <command> [args...]= watches and runs command per event
+- Event JSON piped to command's stdin, metadata in environment variables
+- Cursor persistence — track last-processed offset, resume after restart
+- Blocking fetch — server holds connection until event arrives (no polling)
+- Sequential by default, =--concurrency N= for parallel when needed
+- Clean shutdown on Ctrl-C / SIGTERM
+
+** Non-Goals
+- Server-side triggers (store stays a storage engine)
+- Persistent trigger registry in the store
+- Payload filtering (use topic design, pipe through jq for edge cases)
+
+* Design Decisions
+
+Each decision was debated against counterarguments from real systems. The following captures what was decided, why, and which counterarguments didn't hold up.
+
+** 1. Client-side, not server-side
+
+=ever on= runs as a client process in the user's environment — their working directory, their PATH, their permissions, their SSH keys.
+
+*Why not server-side:* Server-side triggers mean the store process runs arbitrary shell commands. PostgreSQL triggers demonstrate the problem: functions running inside the database server share its privileges, can crash it, and operate in the server's environment, not the caller's. AWS EventBridge chose server-side dispatch, but EventBridge targets are managed AWS services (Lambda, SQS), not arbitrary shell commands on a user's laptop. Ever's use case — agents running local scripts in local directories — is fundamentally client-side.
+
+*Rejected counterargument: "add a server-side trigger registry for offset tracking."* This conflates two concerns. Offset tracking doesn't need the server — a client-side cursor file solves it (see decision #6). Adding a registry to the store creates trigger CRUD APIs, cleanup for stale triggers, and migration complexity. The store should know nothing about triggers.
+
+** 2. Sequential by default, =--concurrency N= for parallel
+
+Events are processed one at a time, in order. Each command runs to completion before the next event is dispatched.
+
+This matches Kafka's single-partition consumer model and 50 years of Unix pipe processing. The deploy race condition is the canonical problem: two =./deploy.sh= running simultaneously from two build-complete events corrupt each other.
+
+*=--concurrency N= flag* (default 1): for use cases like independent validations where ordering doesn't matter and parallelism helps throughput. Events are still dispatched in order but up to N can execute simultaneously. This mirrors NATS JetStream's =MaxAckPending=.
+
+*Why not parallel by default:* AWS Lambda's default parallel invocation causes well-documented problems: out-of-order processing, thundering herd on event bursts, and race conditions. AWS had to retrofit reserved concurrency, FIFO queues, and DynamoDB locks to work around parallel-by-default. Starting sequential and opting into parallelism is safer than the reverse.
+
+** 3. Blocking fetch, not polling
+
+=ever on= uses a blocking fetch: the client sends a fetch request and the server holds the connection until a matching event arrives (with a timeout).
+
+*Why not polling:* 10 triggers at 100ms intervals = 100 idle requests/second perpetually. Multiply by 5 agents = 500 wasted requests/second. Kubernetes uses long-poll (HTTP watch), Redis uses =XREAD BLOCK= — both hold the connection server-side until data arrives.
+
+*Protocol change:* extend =FetchRequest= with a =block_ms= field (0 = don't block, default). Server delays response until new data or timeout. This is a small wire protocol change with large impact on idle CPU and latency.
+
+*Rejected counterargument: "polling is fine because Kubernetes does it."* Kubernetes controllers use a *watch* protocol (long-poll with chunked transfer), not naive polling. The Kubernetes reconciliation loop re-lists periodically as a *safety net*, not as the primary event delivery mechanism. The advocate cited Kubernetes as validating polling, but it actually validates long-poll — which is what blocking fetch is.
+
+** 4. Cursor persistence, not purely ephemeral
+
+=ever on= stores a cursor file (e.g. =~/.local/share/ever/cursors/<trigger-name>=) recording the last successfully processed offset. On restart, it resumes from cursor + 1. On first run with no cursor, starts from latest.
+
+*Why not purely ephemeral:* the crash gap — if the process dies and restarts, events published during the downtime are missed with start-from-latest. Kafka solves this with committed offsets per consumer group. =ever on= solves it with a file. No server involvement, no protocol change.
+
+=--name <name>= flag identifies the trigger for cursor persistence. Without =--name=, no cursor is written (ephemeral, backward-compatible).
+
+#+begin_src bash
+# Named trigger with cursor persistence
+ever on --name deploy agent.build.complete -- ./deploy.sh
+# Restart picks up where it left off
+
+# Ephemeral (no --name, no cursor)
+ever on agent. -- ./log.sh
+#+end_src
+
+*Rejected counterargument: "add persistent trigger definitions to the store."* This makes the store a scheduler. Cursor files are pure client-side state. Process persistence belongs to process managers (chronoa, systemd), not the event store. Jenkins's persistent trigger configuration is the cautionary tale: configuration drift, orphaned triggers, triggers pointing to deleted jobs.
+
+** 5. Stdin + env vars for event data
+
+Event JSON on stdin, metadata in environment variables (=EVER_TOPIC=, =EVER_OFFSET=, =EVER_KEY=, =EVER_TIMESTAMP=).
+
+This follows the CGI model (1993, still works) and the Unix filter model (grep, jq, sed all read stdin). Env vars for metadata follows 12-factor conventions.
+
+*Why not arguments:* JSON with quotes, newlines, and special characters breaks shell argument parsing. ={"msg":"can't connect","path":"/tmp/foo bar"}= is an escaping nightmare as an argument, but trivially safe on stdin.
+
+*Why not temp files:* an extra file to create, read, and clean up per event. Stdin is zero-overhead and composes with pipes. Temp file cleanup on crash is a known pain point.
+
+*Rejected counterargument: "deserialize the nested value field."* The critic pointed out that =value= is a JSON string inside JSON (double-encoded). This is a valid concern but it's about the event format, not the delivery mechanism. The handler uses =jq -r .value | jq .status= or =JSON.parse(event.value)=. Automatic deserialization would require Ever to know the value's content type, which breaks the "value is opaque bytes" contract.
+
+** 6. Start from latest (or cursor), not beginning
+
+Without =--name=, starts from latest offset — react to future events, not replay history. With =--name=, resumes from the cursor (last processed + 1).
+
+*Why not replay from beginning:* =ever on agent.build.complete -- ./deploy.sh= replaying from offset 0 would re-deploy every build ever completed. 500 historical events = 500 deploys on startup. This is a well-known event sourcing footgun.
+
+A =--from earliest= flag allows explicit replay for migration or backfill use cases.
+
+*Rejected counterargument: "at-least-once requires starting from beginning."* At-least-once requires resuming from the last committed position, not from the beginning. That's what cursor persistence provides. Starting from the beginning on every restart is at-least-N-times, which is worse.
+
+** 7. Topic-only matching, no payload filtering
+
+Match on topic pattern only (exact, prefix with trailing dot, or =*= wildcard). No JSON field filtering.
+
+*Why:* topic design is the filtering mechanism. Instead of filtering =agent.build= for =status=failed=, publish to =agent.build.failed=. This is how NATS and Kafka work — the broker routes by subject/topic, consumers handle content semantics.
+
+*Rejected counterargument: "add --filter with jq-like syntax."* The critic proposed =--filter '.value.status == "failed"'=. This means: Ever now has a JSON query language to document, maintain, and debug. Filter expressions that don't match due to type mismatches or path errors are silent failures. AWS EventBridge's content-based filtering is a frequent source of support tickets precisely because of these silent mismatches.
+
+For edge cases where topic design can't help, the command itself filters: =ever on agent.build -- sh -c 'jq -e .value.status==\"failed\" && ./alert.sh'=. The fork cost of a no-op jq is microseconds — not worth adding a query language to avoid.
+
+** 8. =ever on= as the command name
+
+"on" reads as English: "ever on [this event], [do this]." Matches the JavaScript =emitter.on('event', handler)= pattern that every developer knows.
+
+*Why not =watch=:* "watch" implies passive observation. =kubectl get --watch= prints output but doesn't execute commands. =watch -n1 ls= re-runs periodically, which is a different concept. "on" implies reaction — something happens in response.
+
+*Why not =trigger=:* "trigger" is a noun. =ever trigger agent.build -- ./deploy.sh= reads like "trigger agent.build" (fire the event), not "when agent.build fires, do this." The verb sense is ambiguous.
+
+*Why not =subscribe --exec=:* verbose, splits the concept across a flag, and =subscribe= already means something in Ever (=ever sub=).
+
+* Proposal
+
+** CLI
+
+#+begin_src bash
+# Basic — watch and react
+ever on agent.build.complete -- ./deploy.sh
+
+# With cursor persistence (survives restart)
+ever on --name deploy agent.build.complete -- ./deploy.sh
+
+# Prefix (no quoting)
+ever on agent. -- ./log-agent-events.sh
+
+# All events
+ever on . -- ./audit-log.sh
+
+# Wildcard (quoting needed)
+ever on '*.error' -- ./alert.sh
+
+# One-shot
+ever on --once task.assigned -- ./process-task.sh
+
+# Parallel execution
+ever on --concurrency 4 pipeline.task.complete -- ./validate.sh
+
+# Explicit replay from beginning
+ever on --from earliest agent. -- ./backfill.sh
+
+# Working directory override
+ever on --cwd /path/to/project agent. -- ./handler.sh
+#+end_src
+
+** What the command receives
+
+*stdin*: One JSON object per invocation:
+#+begin_src json
+{
+  "topic": "agent.build.complete",
+  "offset": 42,
+  "timestamp": 1711234567890,
+  "key": "build-01",
+  "value": "{\"status\":\"done\",\"duration_ms\":1234}"
+}
+#+end_src
+
+*Environment variables* (inherited env + these):
+| Variable         | Example                        |
+|------------------+--------------------------------|
+| =EVER_TOPIC=     | =agent.build.complete=         |
+| =EVER_OFFSET=    | =42=                           |
+| =EVER_TIMESTAMP= | =1711234567890=                |
+| =EVER_KEY=       | =build-01= (empty if no key)   |
+
+*Working directory*: Where =ever on= was invoked, or =--cwd= override.
+
+** Execution model
+
+Sequential by default: event → fork command → wait for exit → next event.
+- Predictable ordering
+- No resource explosion
+- Natural back-pressure
+- On non-zero exit: log to stderr, continue to next event
+
+With =--concurrency N=: up to N child processes run simultaneously. Events dispatched in order but execution overlaps. On each child exit, dispatch the next queued event.
+
+** Blocking fetch protocol
+
+Extend =FetchRequest= with =block_ms: u32 = 0=. When non-zero, server delays response until:
+- A new event matching the request arrives, OR
+- =block_ms= milliseconds elapse (return empty)
+
+=ever on= uses =block_ms = 5000= (5s) in a loop. On timeout, re-send. Zero idle CPU, ~0ms delivery latency for new events.
+
+** Cursor persistence
+
+=--name <name>= enables cursor tracking:
+- Cursor file: =~/.local/share/ever/cursors/<name>.offset=
+- Written after each successful command execution (not before)
+- Contains: topic-local offset for exact topics, or global offset for patterns
+- On startup with existing cursor: resume from cursor + 1
+- On startup without cursor: start from latest (or =--from= override)
+- Without =--name=: no cursor, purely ephemeral
+
+** Composability with chronoa
+
+#+begin_src bash
+# Run trigger under chronoa for terminal persistence
+chronoa new --daemon deploy-trigger -- ever on --name deploy agent.build.complete -- ./deploy.sh
+
+# Chain agents
+ever on agent-a.complete -- sh -c 'chronoa send agent-b "Agent A done. Start work.\n"'
+
+# Monitor a trigger
+chronoa output deploy-trigger --lines 10
+#+end_src
+
+** Examples
+
+#+begin_src bash
+# Log all agent events to a file
+ever on agent. -- sh -c 'cat >> /tmp/agent-events.jsonl'
+
+# Desktop notification on errors
+ever on '*.error' -- sh -c 'notify-send "Ever: $EVER_TOPIC" "$(cat)"'
+
+# Pipeline stage trigger
+ever on pipeline.stage1.complete -- ./run-stage2.sh
+
+# Parallel validation
+ever on --concurrency 4 task.validate -- ./validate.sh
+
+# Persistent deploy trigger (survives restart)
+ever on --name prod-deploy agent.build.complete -- ./deploy-production.sh
+#+end_src
+
+* Implementation Approach
+
+1. *Blocking fetch* — extend protocol with =block_ms= field. Server holds connection using poll/sleep loop until new data or timeout. Small change, big impact.
+
+2. *=ever on= command* — new subcommand in main.zig. Connect → fetch with block → fork/exec → update cursor → loop.
+
+3. *Cursor files* — simple text file with one number (the offset). Write after each successful command. Read on startup.
+
+4. *Concurrency* — spawn up to N children, track with a pid set. On SIGCHLD or child exit, dispatch next queued event.
+
+* History
+- 2026-04-01: Implemented blocking fetch (protocol + server), ever on command (fork/exec with stdin pipe via temp file, env vars), --once flag. Added mutex to TopicManager for thread safety. Cursor persistence and --concurrency deferred to follow-up.
+
+** Design Divergence
+- Stdin delivery uses temp file + shell redirect instead of pipe+fork (simpler, avoids grandchild process). The Air spec proposed pipes.
+- Cursor persistence (--name) and --concurrency not yet implemented — the core trigger loop and blocking fetch are in place.
+- --cwd and --from flags not yet implemented.

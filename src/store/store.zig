@@ -128,7 +128,7 @@ pub const Log = struct {
 
     /// Append an event. Thread-safe. Returns the global offset.
     pub fn append(self: *Log, topic: []const u8, key: ?[]const u8, value: []const u8) !u64 {
-        while (!self.mutex.tryLock()) {}
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
         const offset = self.next_offset;
@@ -173,6 +173,8 @@ pub const Log = struct {
     }
 
     /// Read a single event by global offset. Returns null if not found.
+    /// NOT thread-safe on its own — caller must serialize with appends
+    /// (e.g., via TopicManager's mutex).
     pub fn read(self: *Log, allocator: Allocator, offset: u64) !?Event {
         if (offset >= self.next_offset) return null;
         const seg = self.findSegmentForOffset(offset) orelse return null;
@@ -182,6 +184,8 @@ pub const Log = struct {
     }
 
     /// Read a batch of events by global offset range.
+    /// NOT thread-safe on its own — caller must serialize with appends
+    /// (e.g., via TopicManager's mutex).
     pub fn readBatch(self: *Log, allocator: Allocator, start_offset: u64, max_count: u32) ![]Event {
         var events: std.ArrayList(Event) = .empty;
         errdefer {
