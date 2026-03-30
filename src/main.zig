@@ -190,17 +190,35 @@ fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
 
     var client = try ever.client.Client.connect(allocator, io, address, port);
     defer client.deinit();
-    var result = try client.fetch(topic_name, from_offset, max_count);
+
+    // Detect if the input is a pattern (trailing dot, contains *, or is ".")
+    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
+        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
+
+    var result = if (is_pattern)
+        try client.fetchPattern(topic_name, from_offset, max_count)
+    else
+        try client.fetch(topic_name, from_offset, max_count);
     defer result.deinit();
 
     if (result.events.len == 0) {
         std.debug.print("No events.\n", .{});
     } else {
         for (result.events) |event| {
+            const prefix = if (event.topic) |t| t else "";
+            const has_prefix = prefix.len > 0;
             if (event.key) |k| {
-                std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value });
+                if (has_prefix) {
+                    std.debug.print("[{s}:{d}] key={s} {s}\n", .{ prefix, event.offset, k, event.value });
+                } else {
+                    std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value });
+                }
             } else {
-                std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+                if (has_prefix) {
+                    std.debug.print("[{s}:{d}] {s}\n", .{ prefix, event.offset, event.value });
+                } else {
+                    std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+                }
             }
         }
     }

@@ -55,8 +55,9 @@ pub const PublishResponse = struct {
 };
 
 pub const FetchRequest = struct {
-    topic: []const u8,
-    offset: u64,
+    topic: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
+    offset: u64 = 0,
     max_count: u32 = 100,
 };
 
@@ -65,6 +66,7 @@ pub const EventData = struct {
     timestamp: i64,
     key: ?[]const u8 = null,
     value: []const u8,
+    topic: ?[]const u8 = null,
 };
 
 pub const FetchResponse = struct {

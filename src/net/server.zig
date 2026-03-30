@@ -138,7 +138,17 @@ pub const Server = struct {
 
         const req = parsed.value;
 
-        const log = self.topic_manager.getTopic(req.topic) catch |err| {
+        // Pattern-based fetch: resolve matching topics, fetch from each
+        if (req.pattern) |pattern| {
+            return self.handlePatternFetch(pattern, req.offset, req.max_count, fd);
+        }
+
+        // Single-topic fetch
+        const topic_name = req.topic orelse {
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
+        };
+
+        const log = self.topic_manager.getTopic(topic_name) catch |err| {
             return switch (err) {
                 error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
                 else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"),
@@ -149,9 +159,7 @@ pub const Server = struct {
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "read failed");
         };
         defer {
-            for (events) |evt| {
-                store.freeEvent(self.allocator, evt);
-            }
+            for (events) |evt| store.freeEvent(self.allocator, evt);
             self.allocator.free(events);
         }
 
@@ -164,10 +172,56 @@ pub const Server = struct {
                 .timestamp = evt.timestamp,
                 .key = evt.key,
                 .value = evt.value,
+                .topic = topic_name,
             };
         }
 
         const resp = protocol.FetchResponse{ .events = event_data };
+        const resp_body = try protocol.encodeBody(self.allocator, resp);
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .fetch_ok, resp_body);
+    }
+
+    fn handlePatternFetch(self: *Server, pattern: []const u8, offset: u64, max_count: u32, fd: std.posix.fd_t) !void {
+        const matched = self.topic_manager.matchTopics(self.allocator, pattern) catch {
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "pattern match failed");
+        };
+        defer {
+            for (matched) |m| self.allocator.free(m);
+            self.allocator.free(matched);
+        }
+
+        // Collect events from all matching topics
+        var all_events: std.ArrayList(protocol.EventData) = .empty;
+        defer all_events.deinit(self.allocator);
+
+        // Track store events for cleanup
+        var store_events: std.ArrayList([]store.Event) = .empty;
+        defer {
+            for (store_events.items) |events| {
+                for (events) |evt| store.freeEvent(self.allocator, evt);
+                self.allocator.free(events);
+            }
+            store_events.deinit(self.allocator);
+        }
+
+        for (matched) |topic_name| {
+            const log = self.topic_manager.getTopic(topic_name) catch continue;
+            const events = log.readBatch(self.allocator, offset, max_count) catch continue;
+            try store_events.append(self.allocator, events);
+
+            for (events) |evt| {
+                try all_events.append(self.allocator, .{
+                    .offset = evt.offset,
+                    .timestamp = evt.timestamp,
+                    .key = evt.key,
+                    .value = evt.value,
+                    .topic = topic_name,
+                });
+            }
+        }
+
+        const resp = protocol.FetchResponse{ .events = all_events.items };
         const resp_body = try protocol.encodeBody(self.allocator, resp);
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .fetch_ok, resp_body);

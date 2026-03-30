@@ -16,6 +16,7 @@ pub const FetchResult = struct {
     pub fn deinit(self: *FetchResult) void {
         for (self.events) |evt| {
             if (evt.key) |k| self.allocator.free(k);
+            if (evt.topic) |t| self.allocator.free(t);
             self.allocator.free(evt.value);
         }
         self.allocator.free(self.events);
@@ -27,6 +28,7 @@ pub const Event = struct {
     timestamp: i64,
     key: ?[]const u8,
     value: []const u8,
+    topic: ?[]const u8 = null,
 };
 
 /// Unified client for publishing and subscribing to the Ever store.
@@ -82,14 +84,17 @@ pub const Client = struct {
         return parsed.value.offset;
     }
 
-    /// Fetch a batch of events from a topic.
+    /// Fetch a batch of events from a single topic.
     pub fn fetch(self: *Client, topic_name: []const u8, offset: u64, max_count: u32) !FetchResult {
-        const req = protocol.FetchRequest{
-            .topic = topic_name,
-            .offset = offset,
-            .max_count = max_count,
-        };
+        return self.doFetch(.{ .topic = topic_name, .offset = offset, .max_count = max_count });
+    }
 
+    /// Fetch events from all topics matching a pattern (trailing dot, *, or .).
+    pub fn fetchPattern(self: *Client, pattern: []const u8, offset: u64, max_count: u32) !FetchResult {
+        return self.doFetch(.{ .pattern = pattern, .offset = offset, .max_count = max_count });
+    }
+
+    fn doFetch(self: *Client, req: protocol.FetchRequest) !FetchResult {
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
         try protocol.writeFrame(self.fd(), .fetch, body);
@@ -111,16 +116,21 @@ pub const Client = struct {
         errdefer {
             for (events[0..initialized]) |evt| {
                 if (evt.key) |k| self.allocator.free(k);
+                if (evt.topic) |t| self.allocator.free(t);
                 self.allocator.free(evt.value);
             }
         }
 
         for (parsed.value.events, 0..) |evt, i| {
             const key_copy: ?[]const u8 = if (evt.key) |k| blk: {
-                const copy = try self.allocator.dupe(u8, k);
-                break :blk copy;
+                break :blk try self.allocator.dupe(u8, k);
             } else null;
             errdefer if (key_copy) |k| self.allocator.free(k);
+
+            const topic_copy: ?[]const u8 = if (evt.topic) |t| blk: {
+                break :blk try self.allocator.dupe(u8, t);
+            } else null;
+            errdefer if (topic_copy) |t| self.allocator.free(t);
 
             const val_copy = try self.allocator.dupe(u8, evt.value);
 
@@ -129,6 +139,7 @@ pub const Client = struct {
                 .timestamp = evt.timestamp,
                 .key = key_copy,
                 .value = val_copy,
+                .topic = topic_copy,
             };
             initialized = i + 1;
         }

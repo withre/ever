@@ -121,6 +121,24 @@ pub const TopicManager = struct {
         return result;
     }
 
+    /// Return all topic names matching a subscription input.
+    /// Caller owns the returned slice and its strings.
+    pub fn matchTopics(self: *TopicManager, allocator: Allocator, input: []const u8) ![][]const u8 {
+        var matched: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (matched.items) |m| allocator.free(m);
+            matched.deinit(allocator);
+        }
+
+        for (self.topics.keys()) |key| {
+            if (matchTopic(input, key)) {
+                try matched.append(allocator, try allocator.dupe(u8, key));
+            }
+        }
+
+        return matched.toOwnedSlice(allocator);
+    }
+
     /// Publish an event to a topic. Creates the log entry and returns the offset.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
         const log = try self.getTopic(topic_name);
@@ -166,6 +184,52 @@ pub const TopicManager = struct {
     }
 };
 
+/// Match a topic name against a subscription input.
+///
+/// Three modes:
+///   "."              → matches all topics
+///   "prefix."        → prefix match (topics starting with "prefix.")
+///   contains "*"     → segment pattern (* = exactly one segment)
+///   otherwise        → exact match
+pub fn matchTopic(input: []const u8, topic_name: []const u8) bool {
+    if (input.len == 0 or topic_name.len == 0) return false;
+
+    // Mode 1: "." alone matches everything
+    if (input.len == 1 and input[0] == '.') return true;
+
+    // Mode 2: trailing dot = prefix match
+    if (input[input.len - 1] == '.') {
+        // Check if topic starts with the prefix (including the dot)
+        if (topic_name.len <= input.len - 1) return false;
+        return std.mem.startsWith(u8, topic_name, input);
+    }
+
+    // Mode 3: contains * = segment pattern match
+    if (std.mem.indexOfScalar(u8, input, '*') != null) {
+        return matchSegmentPattern(input, topic_name);
+    }
+
+    // Mode 4: exact match
+    return std.mem.eql(u8, input, topic_name);
+}
+
+/// Segment-by-segment pattern matching. * matches exactly one segment.
+fn matchSegmentPattern(pattern: []const u8, name: []const u8) bool {
+    var pat_iter = std.mem.splitScalar(u8, pattern, '.');
+    var name_iter = std.mem.splitScalar(u8, name, '.');
+
+    while (true) {
+        const pat_seg = pat_iter.next();
+        const name_seg = name_iter.next();
+
+        if (pat_seg == null and name_seg == null) return true; // both exhausted
+        if (pat_seg == null or name_seg == null) return false; // length mismatch
+
+        if (std.mem.eql(u8, pat_seg.?, "*")) continue; // * matches any single segment
+        if (!std.mem.eql(u8, pat_seg.?, name_seg.?)) return false; // literal mismatch
+    }
+}
+
 /// Validate a topic name.
 pub fn validateTopicName(name: []const u8) TopicError!void {
     if (name.len == 0 or name.len > 255) return TopicError.InvalidName;
@@ -186,6 +250,109 @@ pub fn validateTopicName(name: []const u8) TopicError!void {
 }
 
 // --- Tests ---
+
+test "matchTopic exact match" {
+    try std.testing.expect(matchTopic("agent.tasks", "agent.tasks"));
+    try std.testing.expect(!matchTopic("agent.tasks", "agent.build"));
+    try std.testing.expect(!matchTopic("agent.tasks", "agent.tasks.x"));
+    try std.testing.expect(matchTopic("agent", "agent"));
+}
+
+test "matchTopic prefix match (trailing dot)" {
+    try std.testing.expect(matchTopic("agent.", "agent.tasks"));
+    try std.testing.expect(matchTopic("agent.", "agent.build"));
+    try std.testing.expect(matchTopic("agent.", "agent.tasks.build"));
+    try std.testing.expect(!matchTopic("agent.", "agent")); // prefix requires more after
+    try std.testing.expect(matchTopic("agent.tasks.", "agent.tasks.build"));
+    try std.testing.expect(!matchTopic("agent.tasks.", "agent.tasks")); // must have more
+    try std.testing.expect(matchTopic(".", "agent")); // dot alone = all
+    try std.testing.expect(matchTopic(".", "a.b.c"));
+}
+
+test "matchTopic segment wildcard (*)" {
+    try std.testing.expect(matchTopic("agent.*", "agent.tasks"));
+    try std.testing.expect(matchTopic("agent.*", "agent.build"));
+    try std.testing.expect(!matchTopic("agent.*", "agent.tasks.build")); // * is one segment
+    try std.testing.expect(!matchTopic("agent.*", "agent")); // * requires a segment
+    try std.testing.expect(matchTopic("*", "agent"));
+    try std.testing.expect(!matchTopic("*", "agent.tasks")); // * is one segment
+    try std.testing.expect(matchTopic("*.*", "agent.tasks"));
+    try std.testing.expect(matchTopic("*.tasks", "agent.tasks"));
+    try std.testing.expect(matchTopic("*.tasks", "build.tasks"));
+    try std.testing.expect(!matchTopic("*.tasks", "tasks")); // * requires a segment
+    try std.testing.expect(matchTopic("agent.*.complete", "agent.build.complete"));
+    try std.testing.expect(!matchTopic("agent.*.complete", "agent.x.y.complete")); // * is one segment
+}
+
+test "matchTopic edge cases" {
+    try std.testing.expect(!matchTopic("", "agent"));
+    try std.testing.expect(!matchTopic("agent", ""));
+    try std.testing.expect(!matchTopic("*", ""));
+    try std.testing.expect(!matchTopic(".", ""));
+}
+
+test "TopicManager matchTopics" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
+        .sync_on_append = false,
+    });
+    defer manager.deinit();
+
+    try manager.createTopic("agent.tasks");
+    try manager.createTopic("agent.build");
+    try manager.createTopic("file.changes");
+
+    // Prefix match
+    {
+        const matched = try manager.matchTopics(std.testing.allocator, "agent.");
+        defer {
+            for (matched) |m| std.testing.allocator.free(m);
+            std.testing.allocator.free(matched);
+        }
+        try std.testing.expectEqual(@as(usize, 2), matched.len);
+    }
+
+    // All
+    {
+        const matched = try manager.matchTopics(std.testing.allocator, ".");
+        defer {
+            for (matched) |m| std.testing.allocator.free(m);
+            std.testing.allocator.free(matched);
+        }
+        try std.testing.expectEqual(@as(usize, 3), matched.len);
+    }
+
+    // Wildcard
+    {
+        const matched = try manager.matchTopics(std.testing.allocator, "*.tasks");
+        defer {
+            for (matched) |m| std.testing.allocator.free(m);
+            std.testing.allocator.free(matched);
+        }
+        try std.testing.expectEqual(@as(usize, 1), matched.len);
+        try std.testing.expectEqualStrings("agent.tasks", matched[0]);
+    }
+
+    // Exact
+    {
+        const matched = try manager.matchTopics(std.testing.allocator, "file.changes");
+        defer {
+            for (matched) |m| std.testing.allocator.free(m);
+            std.testing.allocator.free(matched);
+        }
+        try std.testing.expectEqual(@as(usize, 1), matched.len);
+    }
+
+    // No match
+    {
+        const matched = try manager.matchTopics(std.testing.allocator, "nope.*");
+        defer std.testing.allocator.free(matched);
+        try std.testing.expectEqual(@as(usize, 0), matched.len);
+    }
+}
 
 test "validateTopicName accepts valid names" {
     try validateTopicName("agent-tasks");
