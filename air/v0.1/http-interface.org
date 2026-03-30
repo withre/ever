@@ -1,0 +1,109 @@
+#+title: HTTP Interface
+#+state: work-in-progress
+#+FILETAGS: :protocol:core:
+
+* Summary
+Add an HTTP/JSON API alongside the existing binary TCP protocol, using Zig's =std.http.Server= Io-based types. This makes Ever accessible from any language/tool that can make HTTP requests.
+
+* Motivation
+The binary TCP protocol is efficient but requires a custom client. An HTTP API opens Ever to universal access — curl, wget, Python requests, JavaScript fetch, etc. Since message bodies are already JSON, the HTTP layer is thin.
+
+** Goals
+- REST-style HTTP API on a configurable port (default 4280)
+- JSON request/response bodies (reuse existing message types)
+- Use =std.http.Server= with Io-based Reader/Writer — no hand-rolled HTTP parsing
+- Run alongside the binary TCP server from the same =ever store start= process
+
+** Non-Goals
+- WebSocket support for streaming (future)
+- Authentication / authorization (future)
+- HTTPS/TLS (future — use a reverse proxy)
+
+* Proposal
+
+** API Endpoints
+
+#+begin_src
+POST   /topics                Create topic   {"topic": "name"}
+DELETE /topics/{name}         Delete topic
+GET    /topics                List topics
+
+POST   /topics/{name}/events  Publish     {"key": "...", "value": "..."}
+GET    /topics/{name}/events  Fetch       ?offset=0&limit=100
+#+end_src
+
+** Example Usage
+
+#+begin_src bash
+# Create topic
+curl -X POST localhost:4280/topics -d '{"topic":"agent.tasks"}'
+
+# Publish event
+curl -X POST localhost:4280/topics/agent.tasks/events \
+  -d '{"key":"task-1","value":"{\"status\":\"done\"}"}'
+
+# Fetch events
+curl localhost:4280/topics/agent.tasks/events?offset=0&limit=10
+
+# List topics
+curl localhost:4280/topics
+
+# Delete topic
+curl -X DELETE localhost:4280/topics/agent.tasks
+#+end_src
+
+** HTTP Status Codes
+
+| Operation             | Success | Error Cases                          |
+|-----------------------+---------+--------------------------------------|
+| Create topic          |     201 | 409 (exists), 400 (invalid name)     |
+| Delete topic          |     200 | 404 (not found)                      |
+| List topics           |     200 |                                      |
+| Publish event         |     200 | 404 (topic not found)                |
+| Fetch events          |     200 | 404 (topic not found)                |
+
+* Design Details
+
+** Using =std.http.Server=
+
+Zig v0.16's =std.http.Server= operates on Io-based =Reader= and =Writer= types. The HTTP server accepts a TCP connection via =Io.net.Server.accept()=, creates a =Stream=, then wraps it in buffered Reader/Writer for the HTTP parser.
+
+#+begin_src zig
+const stream = try net_server.accept(io);
+var read_buf: [8192]u8 = undefined;
+var write_buf: [8192]u8 = undefined;
+var reader = stream.reader(io, &read_buf);
+var writer = stream.writer(io, &write_buf);
+var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+
+while (true) {
+    var request = http_server.receiveHead() catch break;
+    // route and handle...
+    try request.respond(body, .{ .status = .ok });
+}
+#+end_src
+
+** Routing
+
+Simple prefix-match routing on method + path:
+- =POST /topics= → createTopic
+- =DELETE /topics/{name}= → deleteTopic
+- =GET /topics= → listTopics
+- =POST /topics/{name}/events= → publish
+- =GET /topics/{name}/events= → fetch (parse query for offset/limit)
+
+Extract topic name from path by splitting on =/=.
+
+** Concurrency Model
+
+Same as the binary TCP server — one thread per connection via =std.Thread.spawn=. The Io instance is passed into each handler. The HTTP server and TCP server share the same =TopicManager=.
+
+** CLI Integration
+
+#+begin_src
+ever store start                       # TCP on 4822 + HTTP on 4280
+ever store start --http-port 4280      # custom HTTP port
+ever store start --no-http             # TCP only
+#+end_src
+
+* History

@@ -2,8 +2,8 @@ main-directory = "./air/"
 template-directory = "./air/templates/"
 archive-directory = "./air/archive/"
 context-directory = "./air/context/"
-supported-file-types = ["md"]
-default-file-type = "md"
+supported-file-types = ["org"]
+default-file-type = "org"
 tags = ["core", "store", "protocol", "publisher", "subscriber", "orchestrator", "transformer", "cli", "testing"]
 built-in-templates = ["air-standard"]
 

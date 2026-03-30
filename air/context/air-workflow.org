@@ -1,89 +1,89 @@
-# Air Workflow Guide
+* Air Workflow Guide
 
-## Overview
+** Overview
 Ever uses Air for planning-first workflow. All features are specified in Air documents before implementation begins. Documents track progress through defined states.
 
-## Core Workflow
+** Core Workflow
 
-### 1. Check Current Status
-```bash
+*** 1. Check Current Status
+#+begin_src bash
 airctl status                          # All documents
 airctl status --state ready            # Ready for implementation
 airctl status --state work-in-progress # Currently active
 airctl status --by-tag                 # Group by feature area
-```
+#+end_src
 
-### 2. Creating New Features
-1. Check for existing specs: `airctl status --state draft,ready`
-2. Create Air document in version directory (e.g., `air/v0.1/feature-name.md`)
-3. Set initial state to `draft` in frontmatter
+*** 2. Creating New Features
+1. Check for existing specs: =airctl status --state draft,ready=
+2. Create Air document in version directory (e.g., =air/v0.1/feature-name.md=)
+3. Set initial state to =draft= in frontmatter
 4. Complete all required sections: Summary, Motivation, Proposal
-5. Move to `ready` when specification is actionable
+5. Move to =ready= when specification is actionable
 
-### 3. Implementing Features
-```bash
+*** 3. Implementing Features
+#+begin_src bash
 # Start work
 airctl update v0.1/feature-name.md --state work-in-progress
-```
+#+end_src
 - Implement from the specification
 - Update History with milestones
 - Document design divergences if implementation differs from spec
-- Run `zig build test` after every change
+- Run =zig build test= after every change
 
-```bash
+#+begin_src bash
 # Complete work
 airctl update v0.1/feature-name.md --state complete
-```
+#+end_src
 
-### 4. State Progression
-```
+*** 4. State Progression
+#+begin_src
 draft → ready → work-in-progress → complete
   │                                    │
   ▼                                    ▼
 dropped                            archive/
-```
+#+end_src
 
-## Document Lifecycle Rules
+** Document Lifecycle Rules
 
-### Draft → Ready Requirements
+*** Draft → Ready Requirements
 - All required sections complete (Summary, Motivation, Proposal)
 - Technical approach confirmed
 - Dependencies identified
 - Specification is actionable — an implementer can work from it
 
-### Ready → Work-in-Progress
+*** Ready → Work-in-Progress
 - Update state immediately when starting
 - Add History entry with start date
 
-### Work-in-Progress → Complete
-- All tests pass (`zig build test`)
+*** Work-in-Progress → Complete
+- All tests pass (=zig build test=)
 - History updated with completion details
 - Design divergences documented if any
 
-### Dropping Documents
+*** Dropping Documents
 - Add History entry explaining why
 - Consider archiving if referenced elsewhere
 
-## Best Practices
+** Best Practices
 
-### Planning
+*** Planning
 - Create Air documents before implementing complex features
 - Each document should be independently implementable
 - If a spec covers multiple features, split it before implementation
 - Identify dependencies between documents
 
-### Implementation
+*** Implementation
 - Only implement from 'ready' documents
 - If something goes wrong, stop and re-plan — update the Air doc first
 - Never mark complete with failing tests
 - Verify beyond tests: run the actual tool, check output
 
-### Corrections and Learnings
+*** Corrections and Learnings
 - When a mistake is corrected, capture the pattern in the relevant context file
 - Write concrete rules, not vague guidelines
 - This prevents the same mistake from recurring
 
-### Maintenance
-- Review document states regularly with `airctl status`
+*** Maintenance
+- Review document states regularly with =airctl status=
 - Archive completed work that's no longer referenced
 - Update context files when conventions change

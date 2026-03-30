@@ -1,48 +1,48 @@
-# Interface Design
+* Interface Design
 
-## Overview
+** Overview
 
 Ever has two primary interfaces:
-1. **Wire Protocol** — Binary/JSON protocol for inter-process communication (publisher ↔ store ↔ subscriber)
-2. **CLI** — Command-line interface for operational management via the orchestrator
+1. *Wire Protocol* — Binary/JSON protocol for inter-process communication (publisher ↔ store ↔ subscriber)
+2. *CLI* — Command-line interface for operational management via the orchestrator
 
 Both interfaces prioritize clarity, consistency, and programmatic usability.
 
-## Wire Protocol Design
+** Wire Protocol Design
 
-### Message Design Principles
+*** Message Design Principles
 - Every message has a fixed-size header followed by a variable-size body
 - Message types are explicitly enumerated — no stringly-typed dispatch
 - All multi-byte integers use little-endian encoding (Zig native)
 - Messages are self-describing: header contains body length for framing
 - Version field in handshake for protocol evolution
 
-### Request-Response Pattern
+*** Request-Response Pattern
 - Publish → Ack (with assigned offset) or Error
 - Fetch → Events (batch) or Error
 - Subscribe → Stream of Events until unsubscribe or disconnect
 - CreateTopic → Success or Error
 
-### Error Responses
+*** Error Responses
 - Structured error with numeric code and human-readable message
 - Error codes are stable across versions — clients can match on them
 - Include enough context to diagnose without server logs
 
-### Framing
+*** Framing
 - Length-prefixed framing for TCP streams
 - No delimiter-based parsing — avoids escaping issues
 - Maximum message size enforced (configurable, default 16MB)
 - Partial message buffering handled by connection layer
 
-## CLI Design
+** CLI Design
 
-### Command Structure
-```
+*** Command Structure
+#+begin_src
 ever <command> [subcommand] [options]
-```
+#+end_src
 
-### Core Commands
-```
+*** Core Commands
+#+begin_src
 ever store start          # Start the storage server
 ever store status         # Show store health and statistics
 ever store stop           # Gracefully stop the store
@@ -63,24 +63,24 @@ ever sub <topic> --follow         # Keep listening for new events
 
 ever status               # Overall system status
 ever version              # Version information
-```
+#+end_src
 
-### Output Design
+*** Output Design
 - Default output is human-readable with aligned columns
-- `--json` flag for machine-readable JSON output
-- `--quiet` flag for minimal output (just data, no decoration)
+- =--json= flag for machine-readable JSON output
+- =--quiet= flag for minimal output (just data, no decoration)
 - Error messages go to stderr, data goes to stdout
 - Exit codes: 0 for success, 1 for errors, 2 for usage errors
 
-### Interactive Patterns
-- `ever sub --follow` streams continuously until Ctrl-C
-- `ever pub --stdin` reads from stdin until EOF
+*** Interactive Patterns
+- =ever sub --follow= streams continuously until Ctrl-C
+- =ever pub --stdin= reads from stdin until EOF
 - Progress indicators for long operations (topic deletion, compaction)
 
-## Library API Design
+** Library API Design
 
-### Publisher API
-```zig
+*** Publisher API
+#+begin_src zig
 const publisher = try ever.Publisher.connect(allocator, address);
 defer publisher.deinit();
 
@@ -92,10 +92,10 @@ var batch = publisher.batch("agent.tasks");
 try batch.add(key1, value1);
 try batch.add(key2, value2);
 const offsets = try batch.flush();
-```
+#+end_src
 
-### Subscriber API
-```zig
+*** Subscriber API
+#+begin_src zig
 const subscriber = try ever.Subscriber.connect(allocator, address);
 defer subscriber.deinit();
 
@@ -113,43 +113,43 @@ try subscriber.subscribe("agent.tasks", .{ .from = .earliest }, struct {
         // process event
     }
 }.handler);
-```
+#+end_src
 
-### Design Principles for Library API
+*** Design Principles for Library API
 - Allocator always passed explicitly
-- Connection resources cleaned up with `deinit()` pattern
+- Connection resources cleaned up with =deinit()= pattern
 - Error unions for all fallible operations
 - Options structs with sensible defaults for configurability
 - Batch APIs for throughput-sensitive use cases
 
-## Error Communication
+** Error Communication
 
-### User-Facing Error Messages
+*** User-Facing Error Messages
 - Clear, actionable error messages with suggested fixes
 - Include relevant context (topic name, offset, connection address)
 - Distinguish between user errors (bad input) and system errors (disk full)
-- Consistent format: `error: <what happened>. <suggestion>`
+- Consistent format: =error: <what happened>. <suggestion>=
 
-### Examples
-```
+*** Examples
+#+begin_src
 error: topic "agent.tasks" not found. Create it with: ever topic create agent.tasks
-error: connection refused at localhost:4222. Is the store running? Start with: ever store start
+error: connection refused at localhost:4822. Is the store running? Start with: ever store start
 error: offset 1500 is beyond the end of topic "events" (current max: 1234)
-```
+#+end_src
 
-## Configuration
+** Configuration
 
-### Store Configuration
-- TOML configuration file (`ever.toml`) for store settings
-- Environment variable overrides with `EVER_` prefix
+*** Store Configuration
+- TOML configuration file (=ever.toml=) for store settings
+- Environment variable overrides with =EVER_= prefix
 - Sensible defaults — zero configuration to get started
 - Configuration validation on startup with clear error messages
 
-### Default Configuration
-```toml
+*** Default Configuration
+#+begin_src toml
 [store]
 data_dir = "./data"
-listen = "127.0.0.1:4222"
+listen = "127.0.0.1:4822"
 max_segment_size = "64MB"
 max_message_size = "16MB"
 
@@ -160,4 +160,4 @@ max_size = "1GB"
 [logging]
 level = "info"
 format = "text"  # or "json"
-```
+#+end_src

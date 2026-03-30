@@ -5,12 +5,12 @@ Please review these context files to understand the project:
 
 ## Essential Context
 Review these files for project understanding:
-- ./air/context/OVERVIEW.md
-- ./air/context/air-conventions.md
-- ./air/context/air-workflow.md
-- ./air/context/architecture.md
-- ./air/context/implementation-guide.md
-- ./air/context/interface-design.md
+- ./air/context/OVERVIEW.org
+- ./air/context/air-conventions.org
+- ./air/context/air-workflow.org
+- ./air/context/architecture.org
+- ./air/context/implementation-guide.org
+- ./air/context/interface-design.org
 
 ## Planning Documents
 For detailed specifications, browse the Air directory structure:
@@ -21,7 +21,7 @@ For detailed specifications, browse the Air directory structure:
 1. Check current status: `airctl status --state work-in-progress,ready`
 2. See all ready work: `airctl status --state ready`
 3. Read the relevant Air document in ./air
-4. Follow conventions in ./air/context/air-conventions.md
+4. Follow conventions in ./air/context/air-conventions.org
 5. Update Implementation History after completing work
 
 ## Getting Current Project Status
@@ -34,7 +34,7 @@ Always use airctl commands for up-to-date information:
 ## Creating New Features
 For features without Air docs:
 1. Create an Air document first if the feature is complex
-2. Use format shown in ./air/context/air-workflow.md
+2. Use org-mode format shown in ./air/context/air-conventions.org
 3. Set initial state to 'draft'
 4. Get approval before moving to 'ready' state
 

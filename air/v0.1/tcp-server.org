@@ -1,38 +1,37 @@
----
-title: TCP Server
-state: complete
-tags: [core, protocol]
----
+#+title: TCP Server
+#+state: complete
+#+FILETAGS: :core:protocol:
 
-# Summary
+
+* Summary
 Implement the TCP server that accepts client connections, reads protocol frames, dispatches them to the store, and sends responses.
 
-# Motivation
+* Motivation
 The TCP server is the entry point for all remote interactions with the store. Publishers and subscribers connect here to send and receive events.
 
-## Goals
+** Goals
 - Accept TCP connections on a configurable address
 - Read and write protocol frames (from wire-protocol spec)
 - Dispatch incoming messages to the TopicManager
 - Handle multiple concurrent connections
 - Graceful shutdown with connection draining
 
-## Non-Goals
+** Non-Goals
 - Unix domain socket support (future enhancement)
 - TLS/encryption
 - Authentication/authorization
 - Connection multiplexing or pipelining
 
-# Proposal
+* Proposal
 
-## Server Lifecycle
-```
+** Server Lifecycle
+#+begin_src
 init → listen → accept loop → handle connections → shutdown
-```
+#+end_src
 
-## Core API
+** Core API
 
-```zig
+#+begin_src zig
 pub const Server = struct {
     pub fn init(allocator: Allocator, topic_manager: *TopicManager, config: Config) !Server
     pub fn deinit(self: *Server) void
@@ -46,13 +45,13 @@ pub const Server = struct {
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
-    port: u16 = 4222,
+    port: u16 = 4822,
     max_connections: u32 = 1024,
     read_timeout_ms: u32 = 30_000,
 };
-```
+#+end_src
 
-## Connection Handling
+** Connection Handling
 Each accepted connection:
 1. Read a frame from the socket
 2. Parse the message type and body
@@ -60,45 +59,45 @@ Each accepted connection:
 4. Encode and send the response frame
 5. Loop back to step 1 until connection closes or errors
 
-## Message Dispatch
+** Message Dispatch
 
 | Message Type | Handler | Description |
 |---|---|---|
-| `publish` | `topicManager.publish(topic, key, value)` | Write event, return offset |
-| `fetch` | `topicManager.getTopic(topic).readBatch(offset, count)` | Return events |
-| `create_topic` | `topicManager.createTopic(name)` | Create topic |
-| `delete_topic` | `topicManager.deleteTopic(name)` | Delete topic |
-| `list_topics` | `topicManager.listTopics()` | Return topic names |
-| `ack` | Store consumer offset (if implemented) | Acknowledge consumption |
+| =publish= | =topicManager.publish(topic, key, value)= | Write event, return offset |
+| =fetch= | =topicManager.getTopic(topic).readBatch(offset, count)= | Return events |
+| =create_topic= | =topicManager.createTopic(name)= | Create topic |
+| =delete_topic= | =topicManager.deleteTopic(name)= | Delete topic |
+| =list_topics= | =topicManager.listTopics()= | Return topic names |
+| =ack= | Store consumer offset (if implemented) | Acknowledge consumption |
 
-# Design Details
+* Design Details
 
-## Concurrency Model
+** Concurrency Model
 For v0.1, use a simple thread-per-connection model:
-- Main thread accepts connections via `std.net.Server`
-- Each connection spawns a new thread via `std.Thread.spawn`
+- Main thread accepts connections via =std.net.Server=
+- Each connection spawns a new thread via =std.Thread.spawn=
 - Thread handles the connection read-dispatch-write loop
 - This is simple and correct; can optimize to poll/epoll later
 
-## Shutdown Sequence
+** Shutdown Sequence
 1. Stop accepting new connections (close listen socket)
 2. Signal all connection threads to finish current request
 3. Wait for all threads to complete (with timeout)
 4. Close remaining connections
 5. Server.run() returns
 
-## Error Handling in Connections
+** Error Handling in Connections
 - Protocol errors → send error response, continue serving
 - I/O errors (broken pipe, timeout) → close connection, log warning
 - Internal errors (store failure) → send error response, continue serving
 - Never crash the server due to a single bad connection
 
-## Buffer Management
+** Buffer Management
 - Per-connection read buffer (configurable, default 64KB)
 - Write responses directly to socket via frame encoding
 - Connection-scoped arena allocator for request processing
 
-# History
+* History
 - 2026-03-23: TCP server using Io.net API with thread-per-connection. Dispatches all message types to TopicManager. Tests pass.
-## Design Divergence
+** Design Divergence
 Used Io.net high-level API instead of raw posix sockets for listen/accept. Protocol read/write still uses raw posix fd for simplicity.

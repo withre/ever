@@ -1,49 +1,48 @@
----
-title: Wire Protocol
-state: complete
-tags: [protocol, core]
----
+#+title: Wire Protocol
+#+state: complete
+#+FILETAGS: :protocol:core:
 
-# Summary
+
+* Summary
 Define and implement the binary wire protocol for communication between Ever processes (publisher ↔ store, subscriber ↔ store).
 
-# Motivation
+* Motivation
 A well-defined protocol is essential for inter-process communication. It needs to be simple enough to implement quickly, efficient enough for high throughput, and extensible enough to evolve.
 
-## Goals
+** Goals
 - Binary frame format with length-prefixed messages
 - Request-response message types for all core operations
 - JSON message bodies initially (binary payloads are just bytes)
 - Serialization and deserialization in Zig
 - Protocol versioning for forward compatibility
 
-## Non-Goals
+** Non-Goals
 - Encryption or authentication (future work)
 - Compression at the protocol level
 - Streaming protocol (use repeated fetch for now)
 
-# Proposal
+* Proposal
 
-## Frame Format
+** Frame Format
 Every message on the wire:
 
-```
+#+begin_src
 ┌───────────┬──────────┬──────────┬──────────────────┐
 │ version   │ msg_type │ body_len │ body             │
 │ u8        │ u8       │ u32 LE   │ [body_len]u8     │
 └───────────┴──────────┴──────────┴──────────────────┘
-```
+#+end_src
 
 Total header size: 6 bytes.
 
-- **version**: Protocol version (starts at 1)
-- **msg_type**: Message type enum
-- **body_len**: Length of body in bytes
-- **body**: JSON-encoded message body
+- *version*: Protocol version (starts at 1)
+- *msg_type*: Message type enum
+- *body_len*: Length of body in bytes
+- *body*: JSON-encoded message body
 
-## Message Types
+** Message Types
 
-```zig
+#+begin_src zig
 pub const MessageType = enum(u8) {
     // Requests
     publish = 0x01,
@@ -64,58 +63,58 @@ pub const MessageType = enum(u8) {
     // Error
     error_response = 0xFF,
 };
-```
+#+end_src
 
-## Message Bodies (JSON)
+** Message Bodies (JSON)
 
-### Publish Request
-```json
+*** Publish Request
+#+begin_src json
 { "topic": "agent.tasks", "key": "task-123", "value": "{\"status\":\"complete\"}" }
-```
+#+end_src
 
-### Publish Response
-```json
+*** Publish Response
+#+begin_src json
 { "offset": 42 }
-```
+#+end_src
 
-### Fetch Request
-```json
+*** Fetch Request
+#+begin_src json
 { "topic": "agent.tasks", "offset": 0, "max_count": 100 }
-```
+#+end_src
 
-### Fetch Response
-```json
+*** Fetch Response
+#+begin_src json
 {
   "events": [
     { "offset": 0, "timestamp": 1711234567890, "key": "task-123", "value": "{...}" },
     { "offset": 1, "timestamp": 1711234567891, "key": null, "value": "{...}" }
   ]
 }
-```
+#+end_src
 
-### Create/Delete Topic Request
-```json
+*** Create/Delete Topic Request
+#+begin_src json
 { "topic": "agent.tasks" }
-```
+#+end_src
 
-### List Topics Response
-```json
+*** List Topics Response
+#+begin_src json
 { "topics": ["agent.tasks", "file.changes"] }
-```
+#+end_src
 
-### Ack Request
-```json
+*** Ack Request
+#+begin_src json
 { "topic": "agent.tasks", "group": "my-consumer", "offset": 42 }
-```
+#+end_src
 
-### Error Response
-```json
+*** Error Response
+#+begin_src json
 { "code": 404, "message": "topic not found: agent.tasks" }
-```
+#+end_src
 
-## Core API
+** Core API
 
-```zig
+#+begin_src zig
 pub const Frame = struct {
     version: u8,
     msg_type: MessageType,
@@ -133,31 +132,31 @@ pub fn encodeBody(allocator: Allocator, comptime T: type, value: T) ![]u8
 
 /// Decode a frame body to a typed message (JSON)
 pub fn decodeBody(comptime T: type, body: []const u8) !T
-```
+#+end_src
 
-# Design Details
+* Design Details
 
-## JSON Encoding
-- Use `std.json.stringify` for encoding
-- Use `std.json.parseFromSlice` for decoding
+** JSON Encoding
+- Use =std.json.stringify= for encoding
+- Use =std.json.parseFromSlice= for decoding
 - Bodies are always valid UTF-8 JSON
 - Event values within JSON are strings (may contain nested JSON)
 
-## Frame Reading
+** Frame Reading
 - Read exactly 6 bytes for the header
 - Validate version (must be 1)
 - Validate msg_type is a known enum value
 - Validate body_len ≤ max_message_size (16MB default)
 - Read exactly body_len bytes for the body
-- Return `ProtocolError.MessageTooLarge` if body_len exceeds limit
-- Return `null` on clean EOF (connection closed)
+- Return =ProtocolError.MessageTooLarge= if body_len exceeds limit
+- Return =null= on clean EOF (connection closed)
 
-## Error Codes
-- `400` — Bad request (malformed JSON, missing fields)
-- `404` — Topic not found
-- `409` — Topic already exists
-- `413` — Message too large
-- `500` — Internal server error
+** Error Codes
+- =400= — Bad request (malformed JSON, missing fields)
+- =404= — Topic not found
+- =409= — Topic already exists
+- =413= — Message too large
+- =500= — Internal server error
 
-# History
+* History
 - 2026-03-23: Binary frame format with JSON bodies. encodeFrame/readFrame/writeFrame, encodeBody/decodeBody for all message types. Tests pass.

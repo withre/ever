@@ -1,17 +1,17 @@
-# Air Conventions
+* Air Conventions
 
 How Air documents are structured, tagged, and organized for the Ever project.
 
-## Document States
-- **draft**: Initial planning phase — document is being written and refined
-- **ready**: Specification complete, ready for implementation
-- **work-in-progress**: Currently being implemented
-- **complete**: Implementation finished and documented
-- **dropped**: No longer needed or abandoned
-- **unknown**: State cannot be determined from document metadata
+** Document States
+- *draft*: Initial planning phase — document is being written and refined
+- *ready*: Specification complete, ready for implementation
+- *work-in-progress*: Currently being implemented
+- *complete*: Implementation finished and documented
+- *dropped*: No longer needed or abandoned
+- *unknown*: State cannot be determined from document metadata
 
-## Document Structure (Markdown)
-```markdown
+** Document Structure (Markdown)
+#+begin_src markdown
 ---
 title: Document Title
 state: draft|ready|work-in-progress|complete|dropped
@@ -38,61 +38,61 @@ Technical implementation details.
 
 # History
 - YYYY-MM-DD: Description of work completed
-```
+#+end_src
 
-## Tags
+** Tags
 
 Tags are broad categories. Avoid single-use niche tags.
 
-### Established Tags
-- `core` — Foundational types, utilities, shared infrastructure
-- `store` — Storage engine, segments, indexing, log management
-- `protocol` — Wire protocol, message types, serialization
-- `publisher` — Event publishing, batching, producer logic
-- `subscriber` — Event consumption, offset tracking, consumer groups
-- `orchestrator` — Process management, lifecycle, configuration
-- `transformer` — Event pipelines, pub+sub transformation
-- `cli` — Command-line interface, user-facing commands
-- `testing` — Test infrastructure, integration tests, benchmarks
+*** Established Tags
+- =core= — Foundational types, utilities, shared infrastructure
+- =store= — Storage engine, segments, indexing, log management
+- =protocol= — Wire protocol, message types, serialization
+- =publisher= — Event publishing, batching, producer logic
+- =subscriber= — Event consumption, offset tracking, consumer groups
+- =orchestrator= — Process management, lifecycle, configuration
+- =transformer= — Event pipelines, pub+sub transformation
+- =cli= — Command-line interface, user-facing commands
+- =testing= — Test infrastructure, integration tests, benchmarks
 
-### Tag Hygiene
-- Check existing tags with `airctl status --by-tag` before creating new ones
+*** Tag Hygiene
+- Check existing tags with =airctl status --by-tag= before creating new ones
 - Every document with a state must have tags
 - If a tag only applies to one document, merge it into a broader category
 
-## File Naming
-- Use lowercase with hyphens: `event-store.md`, `wire-protocol.md`
-- Include component prefix when relevant: `store-segment-management.md`
+** File Naming
+- Use lowercase with hyphens: =event-store.md=, =wire-protocol.md=
+- Include component prefix when relevant: =store-segment-management.md=
 - Descriptive names that match the document title
 - Avoid abbreviations unless widely understood
 
-## Directory Structure
-```
+** Directory Structure
+#+begin_src
 ./air/
 ├── v0.1/                # First milestone — core storage and protocol
 ├── v0.2/                # Second milestone — CLI and orchestrator
 ├── archive/             # Completed or obsolete documents
 ├── templates/           # Document templates
 └── context/             # Generated context files
-```
+#+end_src
 
-## Metadata Conventions
+** Metadata Conventions
 
-### State Updates
-- Always update `state:` in frontmatter when work status changes
+*** State Updates
+- Always update =state:= in frontmatter when work status changes
 - Add entry to History section with date and description
 - Use ISO date format (YYYY-MM-DD)
 
-### History Notes
+*** History Notes
 When marking complete with remaining items:
-```
+#+begin_src
 - 2026-03-23: Marked complete. Remaining: batch publish optimization (future work)
-```
+#+end_src
 
-### Design Divergence
+*** Design Divergence
 When implementation diverges from spec, add a "Design Divergence" subsection under History documenting what actually shipped vs what was planned. Don't rewrite the original spec.
 
-## Archive Management
-- Move documents to `archive/` when implementation is complete and stable
+** Archive Management
+- Move documents to =archive/= when implementation is complete and stable
 - Keep documents in main directories while still being referenced
 - Archived documents excluded from status counts by default
