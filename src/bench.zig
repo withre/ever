@@ -101,16 +101,16 @@ fn benchLogAppend(allocator: Allocator, io: Io, iterations: u64, sync: bool) !Be
     errdefer allocator.free(timings);
 
     var total_bytes: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..iterations) |i| {
-        const lap_start = timer.read();
-        _ = try log.append(sample_key, sample_value);
-        timings[i] = timer.read() - lap_start;
+        const lap_start = clockNs();
+        _ = try log.append("bench", sample_key, sample_value);
+        timings[i] = clockNs() - lap_start;
         total_bytes += ever.store.Event.header_size + sample_key.len + sample_value.len;
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -134,25 +134,25 @@ fn benchLogReadSequential(allocator: Allocator, io: Io, iterations: u64) !BenchR
 
     // Populate
     for (0..iterations) |_| {
-        _ = try log.append(sample_key, sample_value);
+        _ = try log.append("bench", sample_key, sample_value);
     }
 
     const timings = try allocator.alloc(u64, @intCast(iterations));
     errdefer allocator.free(timings);
 
     var total_bytes: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..iterations) |i| {
-        const lap_start = timer.read();
+        const lap_start = clockNs();
         const event = (try log.read(allocator, @intCast(i))).?;
-        const elapsed = timer.read() - lap_start;
+        const elapsed = clockNs() - lap_start;
         timings[i] = elapsed;
         total_bytes += ever.store.Event.header_size + (if (event.key) |k| k.len else 0) + event.value.len;
         ever.store.freeEvent(allocator, event);
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -176,19 +176,19 @@ fn benchLogReadBatch100(allocator: Allocator, io: Io, iterations: u64) !BenchRes
 
     const total_events = iterations * 100;
     for (0..total_events) |_| {
-        _ = try log.append(sample_key, sample_value);
+        _ = try log.append("bench", sample_key, sample_value);
     }
 
     const timings = try allocator.alloc(u64, @intCast(iterations));
     errdefer allocator.free(timings);
 
     var total_bytes: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..iterations) |i| {
-        const lap_start = timer.read();
+        const lap_start = clockNs();
         const events = try log.readBatch(allocator, @as(u64, @intCast(i)) * 100, 100);
-        const elapsed = timer.read() - lap_start;
+        const elapsed = clockNs() - lap_start;
         timings[i] = elapsed;
         for (events) |evt| {
             total_bytes += ever.store.Event.header_size + (if (evt.key) |k| k.len else 0) + evt.value.len;
@@ -197,7 +197,7 @@ fn benchLogReadBatch100(allocator: Allocator, io: Io, iterations: u64) !BenchRes
         allocator.free(events);
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -225,16 +225,16 @@ fn benchTopicPublish(allocator: Allocator, io: Io, iterations: u64) !BenchResult
     errdefer allocator.free(timings);
 
     var total_bytes: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..iterations) |i| {
-        const lap_start = timer.read();
+        const lap_start = clockNs();
         _ = try tm.publish("bench-topic", sample_key, sample_value);
-        timings[i] = timer.read() - lap_start;
+        timings[i] = clockNs() - lap_start;
         total_bytes += ever.store.Event.header_size + sample_key.len + sample_value.len;
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -285,16 +285,16 @@ fn benchTcpPublish(allocator: Allocator, io: Io, iterations: u64) !BenchResult {
     errdefer allocator.free(timings);
 
     var total_bytes: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..iterations) |i| {
-        const lap_start = timer.read();
+        const lap_start = clockNs();
         _ = try client.publish("bench-tcp", sample_key, sample_value);
-        timings[i] = timer.read() - lap_start;
+        timings[i] = clockNs() - lap_start;
         total_bytes += sample_key.len + sample_value.len;
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -357,12 +357,12 @@ fn benchTcpFetch(allocator: Allocator, io: Io, iterations: u64) !BenchResult {
 
     var total_bytes: u64 = 0;
     var total_events: u64 = 0;
-    var timer = try std.time.Timer.start();
+    const timer_start = clockNs();
 
     for (0..actual_iters) |i| {
-        const lap_start = timer.read();
+        const lap_start = clockNs();
         var result = try client.fetch("bench-tcp-fetch", @as(u64, @intCast(i)) * batch_size, batch_size);
-        const elapsed = timer.read() - lap_start;
+        const elapsed = clockNs() - lap_start;
         timings[i] = elapsed;
         total_events += result.events.len;
         for (result.events) |evt| {
@@ -371,7 +371,7 @@ fn benchTcpFetch(allocator: Allocator, io: Io, iterations: u64) !BenchResult {
         result.deinit();
     }
 
-    const total_ns = timer.read();
+    const total_ns = clockNs() - timer_start;
     std.mem.sort(u64, timings, {}, std.sort.asc(u64));
 
     return .{
@@ -542,4 +542,10 @@ pub fn main(init: std.process.Init) !void {
     } else {
         printResultsTable(results.items);
     }
+}
+
+fn clockNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }

@@ -1,7 +1,4 @@
 //! TCP server for the Ever store.
-//!
-//! Accepts client connections, reads protocol frames, dispatches them
-//! to the TopicManager, and sends responses.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -38,61 +35,39 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.net_server) |*s| {
-            s.deinit(self.io);
-            self.net_server = null;
-        }
+        if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
     }
 
-    /// Start listening and accepting connections. Blocks until shutdown.
     pub fn run(self: *Server) !void {
         const ip4 = try net.Ip4Address.parse(self.config.address, self.config.port);
         const address: net.IpAddress = .{ .ip4 = ip4 };
-
-        self.net_server = try address.listen(self.io, .{
-            .reuse_address = true,
-        });
+        self.net_server = try address.listen(self.io, .{ .reuse_address = true });
 
         while (!self.shutdown_requested.load(.acquire)) {
             const stream = self.net_server.?.accept(self.io) catch |err| switch (err) {
                 error.ConnectionAborted => continue,
-                else => {
-                    if (self.shutdown_requested.load(.acquire)) break;
-                    return err;
-                },
+                else => { if (self.shutdown_requested.load(.acquire)) break; return err; },
             };
-
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, stream }) catch {
-                var s = stream;
-                s.close(self.io);
-                continue;
+                var s = stream; s.close(self.io); continue;
             };
             thread.detach();
         }
     }
 
-    /// Signal the server to shut down.
     pub fn shutdown(self: *Server) void {
         self.shutdown_requested.store(true, .release);
-        if (self.net_server) |*s| {
-            s.deinit(self.io);
-            self.net_server = null;
-        }
+        if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
     }
 
     fn handleConnection(self: *Server, stream: net.Stream) void {
         var s = stream;
         defer s.close(self.io);
-
-        // Use the stream's socket handle as a posix fd for our protocol
         const fd = s.socket.handle;
-
         while (!self.shutdown_requested.load(.acquire)) {
             const frame = protocol.readFrame(self.allocator, fd) catch break;
             if (frame == null) break;
-
             defer self.allocator.free(frame.?.body);
-
             self.handleFrame(frame.?, fd) catch break;
         }
     }
@@ -104,185 +79,103 @@ pub const Server = struct {
             .create_topic => try self.handleCreateTopic(frame.body, fd),
             .delete_topic => try self.handleDeleteTopic(frame.body, fd),
             .list_topics => try self.handleListTopics(fd),
-            .ack => try self.handleAck(fd),
+            .ack => try protocol.writeFrame(fd, .ack_ok, "{}"),
             else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
         }
     }
 
     fn handlePublish(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
-        const parsed = protocol.decodeBody(protocol.PublishRequest, self.allocator, body) catch {
+        const parsed = protocol.decodeBody(protocol.PublishRequest, self.allocator, body) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid publish request");
-        };
         defer parsed.deinit();
-
         const req = parsed.value;
 
-        const offset = self.topic_manager.publish(req.topic, req.key, req.value) catch |err| {
-            return switch (err) {
-                error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
-                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "publish failed"),
-            };
+        const offset = self.topic_manager.publish(req.topic, req.key, req.value) catch |err| return switch (err) {
+            error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
+            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "publish failed"),
         };
 
-        const resp = protocol.PublishResponse{ .offset = offset };
-        const resp_body = try protocol.encodeBody(self.allocator, resp);
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.PublishResponse{ .offset = offset });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .publish_ok, resp_body);
     }
 
     fn handleFetch(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
-        const parsed = protocol.decodeBody(protocol.FetchRequest, self.allocator, body) catch {
+        const parsed = protocol.decodeBody(protocol.FetchRequest, self.allocator, body) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid fetch request");
-        };
         defer parsed.deinit();
-
         const req = parsed.value;
 
-        // Pattern-based fetch: resolve matching topics, fetch from each
-        if (req.pattern) |pattern| {
-            return self.handlePatternFetch(pattern, req.offset, req.max_count, fd);
-        }
-
-        // Single-topic fetch
-        const topic_name = req.topic orelse {
-            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
-        };
-
-        const log = self.topic_manager.getTopic(topic_name) catch |err| {
-            return switch (err) {
+        // Resolve events — either by pattern or single topic
+        const events = if (req.pattern) |pattern|
+            self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed")
+        else if (req.topic) |topic_name|
+            self.topic_manager.fetch(self.allocator, topic_name, req.offset, req.max_count) catch |err| return switch (err) {
                 error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
                 else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"),
-            };
-        };
+            }
+        else
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
 
-        const events = log.readBatch(self.allocator, req.offset, req.max_count) catch {
-            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "read failed");
-        };
         defer {
             for (events) |evt| store.freeEvent(self.allocator, evt);
             self.allocator.free(events);
         }
 
+        // Convert to protocol format
         const event_data = try self.allocator.alloc(protocol.EventData, events.len);
         defer self.allocator.free(event_data);
-
         for (events, 0..) |evt, i| {
             event_data[i] = .{
                 .offset = evt.offset,
                 .timestamp = evt.timestamp,
                 .key = evt.key,
                 .value = evt.value,
-                .topic = topic_name,
+                .topic = evt.topic,
             };
         }
 
-        const resp = protocol.FetchResponse{ .events = event_data };
-        const resp_body = try protocol.encodeBody(self.allocator, resp);
-        defer self.allocator.free(resp_body);
-        try protocol.writeFrame(fd, .fetch_ok, resp_body);
-    }
-
-    fn handlePatternFetch(self: *Server, pattern: []const u8, offset: u64, max_count: u32, fd: std.posix.fd_t) !void {
-        const matched = self.topic_manager.matchTopics(self.allocator, pattern) catch {
-            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "pattern match failed");
-        };
-        defer {
-            for (matched) |m| self.allocator.free(m);
-            self.allocator.free(matched);
-        }
-
-        // Collect events from all matching topics
-        var all_events: std.ArrayList(protocol.EventData) = .empty;
-        defer all_events.deinit(self.allocator);
-
-        // Track store events for cleanup
-        var store_events: std.ArrayList([]store.Event) = .empty;
-        defer {
-            for (store_events.items) |events| {
-                for (events) |evt| store.freeEvent(self.allocator, evt);
-                self.allocator.free(events);
-            }
-            store_events.deinit(self.allocator);
-        }
-
-        for (matched) |topic_name| {
-            const log = self.topic_manager.getTopic(topic_name) catch continue;
-            const events = log.readBatch(self.allocator, offset, max_count) catch continue;
-            try store_events.append(self.allocator, events);
-
-            for (events) |evt| {
-                try all_events.append(self.allocator, .{
-                    .offset = evt.offset,
-                    .timestamp = evt.timestamp,
-                    .key = evt.key,
-                    .value = evt.value,
-                    .topic = topic_name,
-                });
-            }
-        }
-
-        const resp = protocol.FetchResponse{ .events = all_events.items };
-        const resp_body = try protocol.encodeBody(self.allocator, resp);
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .fetch_ok, resp_body);
     }
 
     fn handleCreateTopic(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
-        const parsed = protocol.decodeBody(protocol.TopicRequest, self.allocator, body) catch {
-            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid create topic request");
-        };
+        const parsed = protocol.decodeBody(protocol.TopicRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid request");
         defer parsed.deinit();
-
-        self.topic_manager.createTopic(parsed.value.topic) catch |err| {
-            return switch (err) {
-                error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "topic already exists"),
-                error.InvalidName => sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid topic name"),
-                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "create topic failed"),
-            };
+        self.topic_manager.createTopic(parsed.value.topic) catch |err| return switch (err) {
+            error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "topic already exists"),
+            error.InvalidName => sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid topic name"),
+            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "create topic failed"),
         };
-
         try protocol.writeFrame(fd, .create_topic_ok, "{}");
     }
 
     fn handleDeleteTopic(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
-        const parsed = protocol.decodeBody(protocol.TopicRequest, self.allocator, body) catch {
-            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid delete topic request");
-        };
+        const parsed = protocol.decodeBody(protocol.TopicRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid request");
         defer parsed.deinit();
-
-        self.topic_manager.deleteTopic(parsed.value.topic) catch |err| {
-            return switch (err) {
-                error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
-                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "delete topic failed"),
-            };
+        self.topic_manager.deleteTopic(parsed.value.topic) catch |err| return switch (err) {
+            error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
+            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "delete topic failed"),
         };
-
         try protocol.writeFrame(fd, .delete_topic_ok, "{}");
     }
 
     fn handleListTopics(self: *Server, fd: std.posix.fd_t) !void {
-        const topics = self.topic_manager.listTopics(self.allocator) catch {
+        const topics = self.topic_manager.listTopics(self.allocator) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "list topics failed");
-        };
-        defer {
-            for (topics) |t| self.allocator.free(t);
-            self.allocator.free(topics);
-        }
-
-        const resp = protocol.ListTopicsResponse{ .topics = topics };
-        const resp_body = try protocol.encodeBody(self.allocator, resp);
+        defer { for (topics) |t| self.allocator.free(t); self.allocator.free(topics); }
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTopicsResponse{ .topics = topics });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .list_topics_ok, resp_body);
-    }
-
-    fn handleAck(_: *Server, fd: std.posix.fd_t) !void {
-        try protocol.writeFrame(fd, .ack_ok, "{}");
     }
 };
 
 fn sendError(allocator: Allocator, fd: std.posix.fd_t, code: u16, message: []const u8) !void {
-    const resp = protocol.ErrorResponse{ .code = code, .message = message };
-    const body = try protocol.encodeBody(allocator, resp);
+    const body = try protocol.encodeBody(allocator, protocol.ErrorResponse{ .code = code, .message = message });
     defer allocator.free(body);
     try protocol.writeFrame(fd, .error_response, body);
 }
@@ -291,12 +184,9 @@ test "Server init and deinit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-
     var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
     defer tm.deinit();
-
     var server = try Server.init(std.testing.allocator, io, &tm, .{});
     defer server.deinit();
-
     try std.testing.expect(!server.shutdown_requested.load(.acquire));
 }

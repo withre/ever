@@ -6,11 +6,12 @@ Ever is built on the principle that event storage should be *simple, fast, and r
 
 ** Design Principles
 
-*** Append-Only Log as Foundation
-- All events are immutable once written — append-only semantics
-- Sequential disk writes for maximum throughput
-- Segmented log files for efficient space reclamation
-- Offset-based addressing for O(1) random access within segments
+*** Shared Append-Only Log
+- Single shared log for all events from all topics — sequential writes, optimal page cache
+- Topics are a logical index, not separate files — no per-topic I/O overhead
+- Events tagged with topic name in each record (2-byte topic_len header field)
+- Mutex-serialized writes — fixes concurrency, simple and correct
+- Segmented log files with in-memory position index for O(1) reads
 
 *** Explicit Resource Management (Zig-First)
 - No hidden memory allocations — all allocations go through =std.mem.Allocator=

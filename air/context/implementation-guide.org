@@ -167,16 +167,19 @@ zig build test -Doptimize=ReleaseSafe
 - *No =std.posix.write=*: Use =std.os.linux.write= directly with manual errno handling, or use Io.net Stream's writer.
 - *No =std.posix.socket=*: Use =std.Io.net.IpAddress.listen()= / =.connect()= instead.
 - *JSON*: =std.json.Stringify.valueAlloc(allocator, value, .{})= replaces the old =stringify= with writer pattern.
-- *Time*: =std.time.milliTimestamp()= is gone. Use =std.posix.clock_gettime(.REALTIME)= directly.
+- *Time*: =std.time.milliTimestamp()= and =std.time.Timer= are gone. Use =std.os.linux.clock_gettime(.REALTIME, &ts)= for wall clock, =.MONOTONIC= for elapsed time. =std.posix.clock_gettime= is also removed in newer builds.
 - *Enum from int*: =std.meta.intToEnum= is gone. Use =@enumFromInt(value)= builtin.
 - *tmpDir in tests*: Pass =.{ .iterate = true }= if you need to iterate the directory.
 - *Main signature*: Use =pub fn main(init: std.process.Init) !void= to get allocator, io, and args.
 - *Args iteration*: Use =std.process.Args.Iterator.init(init.minimal.args)= then =.next()=.
 
+- *Mutex*: =std.Thread.Mutex= is gone. Use =std.atomic.Mutex= (spinlock enum with =.tryLock()= and =.unlock()=, no blocking =.lock()=).
+- *StringArrayHashMap*: Still managed (stores allocator). =getOrPut= takes only key, not allocator.
+
 *** Event Memory Ownership
-- =Log.read()= and =Log.readBatch()= return events with key+value in a single contiguous allocation
-- Always use =store.freeEvent(allocator, event)= to free — never free key and value separately
-- This reduces allocator pressure from 2-3 allocs per read to 1
+- =Log.read()= and =Log.readBatch()= return events with topic+key+value in a single contiguous allocation
+- Always use =store.freeEvent(allocator, event)= to free — never free fields separately
+- The allocation starts at =event.topic.ptr= and covers topic+key+value contiguously
 
 *** Debugging
 - Use =std.debug.print= for quick debugging (remove before commit)

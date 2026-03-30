@@ -1,0 +1,156 @@
+#+title: Shared Log Architecture
+#+state: complete
+#+FILETAGS: :store:core:
+
+* Summary
+Replace the per-topic log files with a single shared append-only log. All events from all topics are written sequentially to one log. Topics become a logical concept backed by an in-memory index, not separate files.
+
+* Motivation
+The current architecture creates one directory with segment files per topic. This works well for isolated reads but falls apart for cross-topic operations:
+
+- Pattern-based fetch (=ever sub agent.=) does N separate =readBatch= calls, each with independent file I/O
+- Concurrent publishers to the same topic have a data race on =seg.size= and =next_offset= (no synchronization)
+- Many small topics waste file descriptors and directory entries
+
+A shared log solves all three: writes serialize naturally through one append point, cross-topic reads become sequential reads of one file, and the OS page cache works optimally since recent events from all topics are physically adjacent.
+
+** Goals
+- Single append-only log for all events, tagged with topic name
+- In-memory topic index: topic → list of (global_offset, file_position)
+- Serialized writes (mutex or single-writer) — fix the existing concurrency bug
+- Cross-topic fetch reads one file sequentially instead of N files randomly
+- Existing API unchanged: =createTopic=, =publish=, =getTopic=, =matchTopics= keep their signatures
+
+** Non-Goals
+- Distributed log / replication
+- On-disk index (rebuild from log on startup is fine for v0.2 scale)
+- Compaction / topic deletion reclaiming space (future — mark deleted, compact later)
+
+* Current Code Surface
+
+What changes and what doesn't:
+
+** Untouched (no changes needed)
+
+| File                | What                                     | Why unchanged                              |
+|---------------------+------------------------------------------+--------------------------------------------|
+| =protocol/message.zig= | Wire protocol, message types             | Protocol is storage-agnostic               |
+| =net/client.zig=    | Client library                           | Talks protocol, doesn't know about storage |
+| =main.zig=          | CLI dispatch                             | Calls TopicManager, doesn't know Log       |
+| =bench.zig=         | Benchmarks                               | Uses TopicManager API, not Log directly    |
+
+** store.zig — Major rewrite
+
+Current: =Log= owns segments in a directory, one =Log= per topic.
+
+New: =Log= becomes the single shared log. Record format gains a topic name field.
+
+| Current                                | New                                          |
+|----------------------------------------+----------------------------------------------|
+| =Log.append(key, value)=              | =Log.append(topic, key, value)=             |
+| =Log.read(alloc, offset)=             | =Log.read(alloc, offset)= — returns topic too |
+| =Log.readBatch(alloc, off, count)=    | =Log.readBatch(alloc, off, count)=          |
+| Per-topic position index               | Global position index + per-topic offset list|
+| No concurrency control                  | Mutex on append                              |
+| =Segment= per topic dir                | =Segment= in shared dir                     |
+
+Record format change:
+#+begin_src
+Current:  offset(8) + timestamp(8) + key_len(4) + val_len(4) + key + value
+New:      offset(8) + timestamp(8) + topic_len(2) + key_len(4) + val_len(4) + topic + key + value
+#+end_src
+Header grows by 2 bytes (topic_len as u16, max 255 chars). =Event= struct gains a =topic= field.
+
+Estimated: ~250 lines rewritten out of 591 (the core =Log= struct and its methods). =Event= encode/decode changes are mechanical. Tests need updating for new =append= signature.
+
+** topic.zig — Moderate rewrite
+
+Current: =TopicManager= owns a =HashMap(*Log)= — each topic has its own =Log= instance, its own directory.
+
+New: =TopicManager= owns ONE =Log= instance and a =HashMap(TopicIndex)= where =TopicIndex= tracks which offsets in the shared log belong to that topic.
+
+#+begin_src zig
+// Current
+topics: StringArrayHashMap(*Log)
+
+// New
+log: *Log,                              // single shared log
+topic_offsets: StringArrayHashMap(OffsetList),  // topic → [global offsets]
+
+const OffsetList = struct {
+    offsets: std.ArrayList(u64) = .empty,   // global offsets belonging to this topic
+};
+#+end_src
+
+| Current method        | Change                                                        |
+|-----------------------+---------------------------------------------------------------|
+| =createTopic=         | Just register name in map (no directory, no Log creation)     |
+| =deleteTopic=         | Remove from map (log data stays until compaction)             |
+| =getTopic=            | Return topic's offset list (not a *Log)                       |
+| =publish=             | =log.append(topic, key, value)=, record offset in topic index |
+| =listTopics=          | Unchanged                                                     |
+| =matchTopics=         | Unchanged (operates on topic names)                           |
+| =loadRegistry=        | Rebuild topic index by scanning shared log on startup         |
+| =validateTopicName=   | Unchanged                                                     |
+| =matchTopic=          | Unchanged                                                     |
+
+Estimated: ~150 lines rewritten out of 479. =matchTopic=, =validateTopicName=, and all their tests stay. Topic CRUD changes are straightforward. The main complexity is =loadRegistry= rebuilding the index.
+
+** server.zig — Small changes
+
+=handleFetch= currently calls =topic_manager.getTopic(name)= to get a =*Log=, then =log.readBatch()=. With shared log, it calls the TopicManager's fetch method instead (TopicManager translates topic offsets to shared log reads).
+
+=handlePatternFetch= simplifies significantly: instead of N separate =readBatch= calls across N topics, it merges the offset lists and does one sequential read from the shared log.
+
+Estimated: ~30 lines changed out of 302. The handler logic gets simpler.
+
+** Data directory change
+
+#+begin_src
+Current:                        New:
+data/                           data/
+├── topics/                     ├── 00000000000000000000.log
+│   ├── agent.tasks/            ├── 00000000000000001024.log
+│   │   ├── 00000000.log        └── (segment files, shared)
+│   │   └── ...
+│   └── file.changes/
+│       └── ...
+└── ...
+#+end_src
+
+Topic names exist only in the event records and the in-memory index. =createTopic= doesn't create directories.
+
+* Complexity Assessment
+
+| Component       | Lines today | Lines changed | Difficulty | Notes                         |
+|-----------------+-------------+---------------+------------+-------------------------------|
+| =store.zig=     |         591 | ~250          | Medium     | Core rewrite, add topic to record |
+| =topic.zig=     |         479 | ~150          | Medium     | Index structure, loadRegistry rebuild |
+| =server.zig=    |         302 | ~30           | Low        | Thinner handlers              |
+| =client.zig=    |         218 | 0             | None       | Protocol-level, untouched     |
+| =message.zig=   |         266 | 0             | None       | Wire protocol, untouched      |
+| =main.zig=      |         251 | 0             | None       | CLI, untouched                |
+| =bench.zig=     |         545 | ~20           | Low        | Minor API adjustments         |
+| Tests           |         ~400| ~200          | Medium     | Update for new append signature |
+| *Total*         |       *2652*| *~650*        |            | *~25% of codebase*           |
+
+Risk: the migration is not incremental. =Log= and =TopicManager= change together. Tests break until both are updated. This is a "rewrite the storage layer" change, not a refactor.
+
+* Concurrency Model
+
+The shared log needs write serialization. Options:
+
+1. *Mutex on =append=* — simplest. =std.Thread.Mutex= around the encode+write+index-update path. Contention is low because writes are fast (pwrite is ~2µs).
+
+2. *Single writer thread* — all publishes go into a channel, one thread drains and appends. Better throughput under high contention but more complex.
+
+For v0.2: mutex. It's correct, simple, and the write path is dominated by syscall time, not lock overhead. Single writer is a v0.3 optimization if benchmarks show contention.
+
+* Migration Path
+
+No data migration. The shared log is a different format — existing =data/topics/= directories are not compatible. Users start fresh or we provide a one-time migration tool (read all per-topic events, re-append to shared log).
+
+For v0.2 this is acceptable — Ever is pre-1.0 and the data format hasn't been promised as stable.
+
+* History
+- 2026-03-30: Implemented shared log architecture. store.zig rewritten: Event record gains topic field (+2 bytes header), Log.append takes topic parameter, mutex serializes writes. topic.zig rewritten: TopicManager owns single Log, topics are HashMap(TopicIndex) where TopicIndex tracks per-topic offsets, rebuildIndex scans log on startup. server.zig simplified: handlers call TopicManager.fetch/fetchPattern instead of getting Log references. bench.zig updated for new API + clockNs() replacing removed std.time.Timer. All tests pass, benchmarks comparable to per-topic model.

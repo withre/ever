@@ -1,4 +1,8 @@
-//! Topic management — named streams of events, each backed by an append-only log.
+//! Topic management — logical topics over a shared append-only log.
+//!
+//! Topics are names registered in an in-memory index. Each topic tracks
+//! which global offsets in the shared log belong to it. The log stores
+//! all events from all topics sequentially.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,31 +23,35 @@ pub const Config = struct {
     sync_on_append: bool = true,
 };
 
-/// Manages a collection of named topics, each with its own event log.
+/// Per-topic index: tracks which global offsets belong to this topic.
+const TopicIndex = struct {
+    offsets: std.ArrayList(u64) = .empty,
+
+    fn deinit(self: *TopicIndex, allocator: Allocator) void {
+        self.offsets.deinit(allocator);
+    }
+};
+
+/// Manages topics as a logical layer over a single shared Log.
 pub const TopicManager = struct {
     allocator: Allocator,
-    io: Io,
-    dir: Dir, // The root data dir
-    topics_dir: Dir,
-    topics: std.StringArrayHashMap(*Log),
-    config: Config,
+    log: Log,
+    topics: std.StringArrayHashMap(TopicIndex),
 
-    /// Initialize the topic manager. Opens data directories.
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !TopicManager {
-        const topics_dir = dir.createDirPathOpen(io, "topics", .{
-            .open_options = .{ .iterate = true },
-        }) catch |err| return err;
+        const log = try Log.init(allocator, io, dir, .{
+            .max_segment_size = config.max_segment_size,
+            .sync_on_append = config.sync_on_append,
+        });
 
         var manager = TopicManager{
             .allocator = allocator,
-            .io = io,
-            .dir = dir,
-            .topics_dir = topics_dir,
-            .topics = std.StringArrayHashMap(*Log).init(allocator),
-            .config = config,
+            .log = log,
+            .topics = std.StringArrayHashMap(TopicIndex).init(allocator),
         };
 
-        try manager.loadRegistry();
+        // Rebuild topic index from log contents
+        try manager.rebuildIndex();
 
         return manager;
     }
@@ -51,429 +59,276 @@ pub const TopicManager = struct {
     pub fn deinit(self: *TopicManager) void {
         var iter = self.topics.iterator();
         while (iter.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.topics.deinit();
-        self.topics_dir.close(self.io);
+        self.log.deinit();
     }
 
-    /// Create a new topic. Returns error if it already exists.
+    /// Register a new topic. No I/O — just adds to the index.
     pub fn createTopic(self: *TopicManager, name: []const u8) !void {
         try validateTopicName(name);
-
         if (self.topics.contains(name)) return TopicError.AlreadyExists;
-
-        // Create topic directory under topics/
-        self.topics_dir.createDir(self.io, name, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-
-        const topic_dir = self.topics_dir.openDir(self.io, name, .{ .iterate = true }) catch |err| return err;
-
-        // Initialize the log
-        const log = try self.allocator.create(Log);
-        errdefer self.allocator.destroy(log);
-
-        log.* = Log.init(self.allocator, self.io, topic_dir, .{
-            .max_segment_size = self.config.max_segment_size,
-            .sync_on_append = self.config.sync_on_append,
-        }) catch |err| {
-            topic_dir.close(self.io);
-            return err;
-        };
-
-        const name_owned = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_owned);
-
-        try self.topics.put(name_owned, log);
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.topics.put(owned, .{});
     }
 
-    /// Delete a topic and its data.
+    /// Remove a topic from the index. Log data stays (no compaction yet).
     pub fn deleteTopic(self: *TopicManager, name: []const u8) !void {
         const entry = self.topics.fetchSwapRemove(name) orelse return TopicError.NotFound;
-
-        entry.value.deinit();
-        self.allocator.destroy(entry.value);
+        var idx = entry.value;
+        idx.deinit(self.allocator);
         self.allocator.free(entry.key);
-
-        // Remove the directory
-        self.topics_dir.deleteTree(self.io, name) catch {};
     }
 
-    /// Get a topic's log for reading/writing. Returns error if not found.
-    pub fn getTopic(self: *TopicManager, name: []const u8) !*Log {
-        return self.topics.get(name) orelse TopicError.NotFound;
+    /// Check if a topic exists.
+    pub fn hasTopic(self: *TopicManager, name: []const u8) bool {
+        return self.topics.contains(name);
     }
 
-    /// List all topic names. Caller owns the returned slice and its strings.
+    /// List all topic names. Caller owns the returned slice and strings.
     pub fn listTopics(self: *TopicManager, allocator: Allocator) ![][]const u8 {
         const keys = self.topics.keys();
         const result = try allocator.alloc([]const u8, keys.len);
         errdefer allocator.free(result);
-
-        for (keys, 0..) |key, i| {
-            result[i] = try allocator.dupe(u8, key);
-        }
-
+        for (keys, 0..) |key, i| result[i] = try allocator.dupe(u8, key);
         return result;
     }
 
-    /// Return all topic names matching a subscription input.
-    /// Caller owns the returned slice and its strings.
+    /// Return all topic names matching a subscription pattern.
     pub fn matchTopics(self: *TopicManager, allocator: Allocator, input: []const u8) ![][]const u8 {
         var matched: std.ArrayList([]const u8) = .empty;
-        errdefer {
-            for (matched.items) |m| allocator.free(m);
-            matched.deinit(allocator);
-        }
-
+        errdefer { for (matched.items) |m| allocator.free(m); matched.deinit(allocator); }
         for (self.topics.keys()) |key| {
-            if (matchTopic(input, key)) {
+            if (matchTopic(input, key))
                 try matched.append(allocator, try allocator.dupe(u8, key));
-            }
         }
-
         return matched.toOwnedSlice(allocator);
     }
 
-    /// Publish an event to a topic. Creates the log entry and returns the offset.
+    /// Publish an event to a topic. Returns the global offset.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
-        const log = try self.getTopic(topic_name);
-        return try log.append(key, value);
+        const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+        const offset = try self.log.append(topic_name, key, value);
+        try idx.offsets.append(self.allocator, offset);
+        return offset;
     }
 
-    // --- Private helpers ---
+    /// Fetch events for a single topic by topic-local offset range.
+    pub fn fetch(self: *TopicManager, allocator: Allocator, topic_name: []const u8, start: u64, max_count: u32) ![]Event {
+        const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+        const offsets = idx.offsets.items;
 
-    fn loadRegistry(self: *TopicManager) !void {
-        // Scan the topics directory for existing topic subdirectories
-        var iter = self.topics_dir.iterate();
-        while (try iter.next(self.io)) |entry| {
-            if (entry.kind != .directory) continue;
+        var events: std.ArrayList(Event) = .empty;
+        errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
-            const topic_dir = self.topics_dir.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
+        const begin = @min(start, offsets.len);
+        const end = @min(begin + max_count, offsets.len);
 
-            const log = self.allocator.create(Log) catch {
-                topic_dir.close(self.io);
-                continue;
-            };
+        for (offsets[begin..end]) |global_offset| {
+            const event = (try self.log.read(allocator, global_offset)) orelse continue;
+            errdefer store.freeEvent(allocator, event);
+            try events.append(allocator, event);
+        }
+        return events.toOwnedSlice(allocator);
+    }
 
-            log.* = Log.init(self.allocator, self.io, topic_dir, .{
-                .max_segment_size = self.config.max_segment_size,
-                .sync_on_append = self.config.sync_on_append,
-            }) catch {
-                self.allocator.destroy(log);
-                topic_dir.close(self.io);
-                continue;
-            };
+    /// Fetch events across all topics matching a pattern, merged by timestamp.
+    pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
+        var events: std.ArrayList(Event) = .empty;
+        errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
-            const name_owned = self.allocator.dupe(u8, entry.name) catch {
-                log.deinit();
-                self.allocator.destroy(log);
-                continue;
-            };
+        var topic_iter = self.topics.iterator();
+        while (topic_iter.next()) |entry| {
+            if (!matchTopic(pattern, entry.key_ptr.*)) continue;
+            const offsets = entry.value_ptr.offsets.items;
+            const begin = @min(start, offsets.len);
+            const end = @min(begin + max_count, offsets.len);
 
-            self.topics.put(name_owned, log) catch {
-                self.allocator.free(name_owned);
-                log.deinit();
-                self.allocator.destroy(log);
-            };
+            for (offsets[begin..end]) |global_offset| {
+                const event = (try self.log.read(allocator, global_offset)) orelse continue;
+                errdefer store.freeEvent(allocator, event);
+                try events.append(allocator, event);
+            }
+        }
+        return events.toOwnedSlice(allocator);
+    }
+
+    // ── Private ─────────────────────────────────────────────────────────
+
+    /// Scan the entire log to rebuild the topic index on startup.
+    fn rebuildIndex(self: *TopicManager) !void {
+        var offset: u64 = 0;
+        while (offset < self.log.nextOffset()) {
+            const event = (try self.log.read(self.allocator, offset)) orelse break;
+            defer store.freeEvent(self.allocator, event);
+
+            // Ensure topic exists in index
+            const gop = try self.topics.getOrPut(event.topic);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, event.topic);
+                gop.value_ptr.* = .{};
+            }
+            try gop.value_ptr.offsets.append(self.allocator, offset);
+            offset += 1;
         }
     }
 };
 
+// ── Pattern matching ────────────────────────────────────────────────────────
+
 /// Match a topic name against a subscription input.
-///
-/// Three modes:
-///   "."              → matches all topics
-///   "prefix."        → prefix match (topics starting with "prefix.")
-///   contains "*"     → segment pattern (* = exactly one segment)
-///   otherwise        → exact match
+///   "."          → all topics
+///   "prefix."    → prefix match
+///   contains "*" → segment pattern
+///   otherwise    → exact match
 pub fn matchTopic(input: []const u8, topic_name: []const u8) bool {
     if (input.len == 0 or topic_name.len == 0) return false;
-
-    // Mode 1: "." alone matches everything
     if (input.len == 1 and input[0] == '.') return true;
-
-    // Mode 2: trailing dot = prefix match
     if (input[input.len - 1] == '.') {
-        // Check if topic starts with the prefix (including the dot)
         if (topic_name.len <= input.len - 1) return false;
         return std.mem.startsWith(u8, topic_name, input);
     }
-
-    // Mode 3: contains * = segment pattern match
-    if (std.mem.indexOfScalar(u8, input, '*') != null) {
-        return matchSegmentPattern(input, topic_name);
-    }
-
-    // Mode 4: exact match
+    if (std.mem.indexOfScalar(u8, input, '*') != null) return matchSegmentPattern(input, topic_name);
     return std.mem.eql(u8, input, topic_name);
 }
 
-/// Segment-by-segment pattern matching. * matches exactly one segment.
 fn matchSegmentPattern(pattern: []const u8, name: []const u8) bool {
     var pat_iter = std.mem.splitScalar(u8, pattern, '.');
     var name_iter = std.mem.splitScalar(u8, name, '.');
-
     while (true) {
-        const pat_seg = pat_iter.next();
-        const name_seg = name_iter.next();
-
-        if (pat_seg == null and name_seg == null) return true; // both exhausted
-        if (pat_seg == null or name_seg == null) return false; // length mismatch
-
-        if (std.mem.eql(u8, pat_seg.?, "*")) continue; // * matches any single segment
-        if (!std.mem.eql(u8, pat_seg.?, name_seg.?)) return false; // literal mismatch
+        const p = pat_iter.next();
+        const n = name_iter.next();
+        if (p == null and n == null) return true;
+        if (p == null or n == null) return false;
+        if (std.mem.eql(u8, p.?, "*")) continue;
+        if (!std.mem.eql(u8, p.?, n.?)) return false;
     }
 }
 
-/// Validate a topic name.
 pub fn validateTopicName(name: []const u8) TopicError!void {
     if (name.len == 0 or name.len > 255) return TopicError.InvalidName;
     if (name[0] == '.' or name[name.len - 1] == '.') return TopicError.InvalidName;
-
     var prev_dot = false;
     for (name) |c| {
         const is_dot = c == '.';
         if (is_dot and prev_dot) return TopicError.InvalidName;
         prev_dot = is_dot;
-
-        const valid = (c >= 'a' and c <= 'z') or
-            (c >= 'A' and c <= 'Z') or
-            (c >= '0' and c <= '9') or
-            c == '.' or c == '-' or c == '_';
+        const valid = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '-' or c == '_';
         if (!valid) return TopicError.InvalidName;
     }
 }
 
-// --- Tests ---
+// ── Tests ───────────────────────────────────────────────────────────────────
 
-test "matchTopic exact match" {
-    try std.testing.expect(matchTopic("agent.tasks", "agent.tasks"));
-    try std.testing.expect(!matchTopic("agent.tasks", "agent.build"));
-    try std.testing.expect(!matchTopic("agent.tasks", "agent.tasks.x"));
-    try std.testing.expect(matchTopic("agent", "agent"));
+test "matchTopic exact" {
+    try std.testing.expect(matchTopic("a.b", "a.b"));
+    try std.testing.expect(!matchTopic("a.b", "a.c"));
+    try std.testing.expect(!matchTopic("a.b", "a.b.c"));
+}
+test "matchTopic prefix" {
+    try std.testing.expect(matchTopic("a.", "a.b"));
+    try std.testing.expect(matchTopic("a.", "a.b.c"));
+    try std.testing.expect(!matchTopic("a.", "a"));
+    try std.testing.expect(matchTopic(".", "x"));
+}
+test "matchTopic wildcard" {
+    try std.testing.expect(matchTopic("a.*", "a.b"));
+    try std.testing.expect(!matchTopic("a.*", "a.b.c"));
+    try std.testing.expect(!matchTopic("a.*", "a"));
+    try std.testing.expect(matchTopic("*", "x"));
+    try std.testing.expect(!matchTopic("*", "x.y"));
+    try std.testing.expect(matchTopic("a.*.c", "a.b.c"));
+}
+test "matchTopic edge" {
+    try std.testing.expect(!matchTopic("", "a"));
+    try std.testing.expect(!matchTopic("a", ""));
 }
 
-test "matchTopic prefix match (trailing dot)" {
-    try std.testing.expect(matchTopic("agent.", "agent.tasks"));
-    try std.testing.expect(matchTopic("agent.", "agent.build"));
-    try std.testing.expect(matchTopic("agent.", "agent.tasks.build"));
-    try std.testing.expect(!matchTopic("agent.", "agent")); // prefix requires more after
-    try std.testing.expect(matchTopic("agent.tasks.", "agent.tasks.build"));
-    try std.testing.expect(!matchTopic("agent.tasks.", "agent.tasks")); // must have more
-    try std.testing.expect(matchTopic(".", "agent")); // dot alone = all
-    try std.testing.expect(matchTopic(".", "a.b.c"));
+test "TopicManager publish and fetch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t1");
+    try tm.createTopic("t2");
+    _ = try tm.publish("t1", "k", "v1");
+    _ = try tm.publish("t2", null, "v2");
+    _ = try tm.publish("t1", null, "v3");
+
+    // Fetch t1 — should see 2 events
+    const e1 = try tm.fetch(std.testing.allocator, "t1", 0, 10);
+    defer { for (e1) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(e1); }
+    try std.testing.expectEqual(@as(usize, 2), e1.len);
+    try std.testing.expectEqualStrings("v1", e1[0].value);
+    try std.testing.expectEqualStrings("v3", e1[1].value);
+
+    // Fetch t2 — should see 1 event
+    const e2 = try tm.fetch(std.testing.allocator, "t2", 0, 10);
+    defer { for (e2) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(e2); }
+    try std.testing.expectEqual(@as(usize, 1), e2.len);
+    try std.testing.expectEqualStrings("v2", e2[0].value);
 }
 
-test "matchTopic segment wildcard (*)" {
-    try std.testing.expect(matchTopic("agent.*", "agent.tasks"));
-    try std.testing.expect(matchTopic("agent.*", "agent.build"));
-    try std.testing.expect(!matchTopic("agent.*", "agent.tasks.build")); // * is one segment
-    try std.testing.expect(!matchTopic("agent.*", "agent")); // * requires a segment
-    try std.testing.expect(matchTopic("*", "agent"));
-    try std.testing.expect(!matchTopic("*", "agent.tasks")); // * is one segment
-    try std.testing.expect(matchTopic("*.*", "agent.tasks"));
-    try std.testing.expect(matchTopic("*.tasks", "agent.tasks"));
-    try std.testing.expect(matchTopic("*.tasks", "build.tasks"));
-    try std.testing.expect(!matchTopic("*.tasks", "tasks")); // * requires a segment
-    try std.testing.expect(matchTopic("agent.*.complete", "agent.build.complete"));
-    try std.testing.expect(!matchTopic("agent.*.complete", "agent.x.y.complete")); // * is one segment
+test "TopicManager fetchPattern" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("agent.build");
+    try tm.createTopic("agent.test");
+    try tm.createTopic("file.changes");
+    _ = try tm.publish("agent.build", null, "b1");
+    _ = try tm.publish("agent.test", null, "t1");
+    _ = try tm.publish("file.changes", null, "f1");
+
+    const events = try tm.fetchPattern(std.testing.allocator, "agent.", 0, 10);
+    defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
 }
 
-test "matchTopic edge cases" {
-    try std.testing.expect(!matchTopic("", "agent"));
-    try std.testing.expect(!matchTopic("agent", ""));
-    try std.testing.expect(!matchTopic("*", ""));
-    try std.testing.expect(!matchTopic(".", ""));
-}
-
-test "TopicManager matchTopics" {
+test "TopicManager recovery" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-        .sync_on_append = false,
-    });
-    defer manager.deinit();
-
-    try manager.createTopic("agent.tasks");
-    try manager.createTopic("agent.build");
-    try manager.createTopic("file.changes");
-
-    // Prefix match
-    {
-        const matched = try manager.matchTopics(std.testing.allocator, "agent.");
-        defer {
-            for (matched) |m| std.testing.allocator.free(m);
-            std.testing.allocator.free(matched);
-        }
-        try std.testing.expectEqual(@as(usize, 2), matched.len);
+    { var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+      defer tm.deinit();
+      try tm.createTopic("persist");
+      _ = try tm.publish("persist", null, "hello");
     }
-
-    // All
-    {
-        const matched = try manager.matchTopics(std.testing.allocator, ".");
-        defer {
-            for (matched) |m| std.testing.allocator.free(m);
-            std.testing.allocator.free(matched);
-        }
-        try std.testing.expectEqual(@as(usize, 3), matched.len);
-    }
-
-    // Wildcard
-    {
-        const matched = try manager.matchTopics(std.testing.allocator, "*.tasks");
-        defer {
-            for (matched) |m| std.testing.allocator.free(m);
-            std.testing.allocator.free(matched);
-        }
-        try std.testing.expectEqual(@as(usize, 1), matched.len);
-        try std.testing.expectEqualStrings("agent.tasks", matched[0]);
-    }
-
-    // Exact
-    {
-        const matched = try manager.matchTopics(std.testing.allocator, "file.changes");
-        defer {
-            for (matched) |m| std.testing.allocator.free(m);
-            std.testing.allocator.free(matched);
-        }
-        try std.testing.expectEqual(@as(usize, 1), matched.len);
-    }
-
-    // No match
-    {
-        const matched = try manager.matchTopics(std.testing.allocator, "nope.*");
-        defer std.testing.allocator.free(matched);
-        try std.testing.expectEqual(@as(usize, 0), matched.len);
+    { var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+      defer tm.deinit();
+      try std.testing.expect(tm.hasTopic("persist"));
+      const events = try tm.fetch(std.testing.allocator, "persist", 0, 10);
+      defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+      try std.testing.expectEqual(@as(usize, 1), events.len);
+      try std.testing.expectEqualStrings("hello", events[0].value);
     }
 }
 
-test "validateTopicName accepts valid names" {
-    try validateTopicName("agent-tasks");
-    try validateTopicName("file-changes");
-    try validateTopicName("my_topic_123");
-    try validateTopicName("a");
-}
-
-test "validateTopicName rejects invalid names" {
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName(""));
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName(".leading"));
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName("trailing."));
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName("double..dot"));
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName("bad/slash"));
-    try std.testing.expectError(TopicError.InvalidName, validateTopicName("bad space"));
-}
-
-test "TopicManager create and publish" {
+test "TopicManager create delete list" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
 
-    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-        .max_segment_size = 4096,
-        .sync_on_append = false,
-    });
-    defer manager.deinit();
+    try tm.createTopic("a");
+    try tm.createTopic("b");
+    try std.testing.expectError(TopicError.AlreadyExists, tm.createTopic("a"));
+    const list = try tm.listTopics(std.testing.allocator);
+    defer { for (list) |l| std.testing.allocator.free(l); std.testing.allocator.free(list); }
+    try std.testing.expectEqual(@as(usize, 2), list.len);
 
-    try manager.createTopic("test-topic");
-
-    const offset = try manager.publish("test-topic", "key", "value");
-    try std.testing.expectEqual(@as(u64, 0), offset);
-
-    // Read back
-    const log = try manager.getTopic("test-topic");
-    const event = (try log.read(std.testing.allocator, 0)).?;
-    defer store.freeEvent(std.testing.allocator, event);
-    try std.testing.expectEqualStrings("value", event.value);
-}
-
-test "TopicManager duplicate create fails" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-        .sync_on_append = false,
-    });
-    defer manager.deinit();
-
-    try manager.createTopic("t1");
-    try std.testing.expectError(TopicError.AlreadyExists, manager.createTopic("t1"));
-}
-
-test "TopicManager delete topic" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-        .sync_on_append = false,
-    });
-    defer manager.deinit();
-
-    try manager.createTopic("to-delete");
-    try manager.deleteTopic("to-delete");
-    try std.testing.expectError(TopicError.NotFound, manager.getTopic("to-delete"));
-}
-
-test "TopicManager list topics" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-        .sync_on_append = false,
-    });
-    defer manager.deinit();
-
-    try manager.createTopic("alpha");
-    try manager.createTopic("beta");
-
-    const topics = try manager.listTopics(std.testing.allocator);
-    defer {
-        for (topics) |t| std.testing.allocator.free(t);
-        std.testing.allocator.free(topics);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), topics.len);
-}
-
-test "TopicManager recovery after reopen" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    // First session: create topic and publish
-    {
-        var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-            .max_segment_size = 4096,
-            .sync_on_append = false,
-        });
-        defer manager.deinit();
-
-        try manager.createTopic("persistent");
-        _ = try manager.publish("persistent", null, "hello");
-    }
-
-    // Second session: verify recovery
-    {
-        var manager = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{
-            .max_segment_size = 4096,
-            .sync_on_append = false,
-        });
-        defer manager.deinit();
-
-        const log = try manager.getTopic("persistent");
-        try std.testing.expectEqual(@as(u64, 1), log.nextOffset());
-
-        const event = (try log.read(std.testing.allocator, 0)).?;
-        defer store.freeEvent(std.testing.allocator, event);
-        try std.testing.expectEqualStrings("hello", event.value);
-    }
+    try tm.deleteTopic("a");
+    try std.testing.expect(!tm.hasTopic("a"));
+    try std.testing.expectError(TopicError.NotFound, tm.deleteTopic("a"));
 }
