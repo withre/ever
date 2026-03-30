@@ -1,0 +1,237 @@
+#+title: Wildcard Subscription
+#+state: complete
+#+FILETAGS: :subscriber:core:
+
+* Summary
+Add pattern-based subscription so consumers can match multiple topics at once. Designed around what users actually type, optimizing the common cases for zero friction.
+
+* Motivation
+Users need to say "give me all agent events" without listing every topic. The design should make the common cases trivially easy and the rare cases merely possible.
+
+** Goals
+- The two most common wildcard operations (prefix match, match all) should need no shell quoting
+- Pattern matching for the rare middle-wildcard case
+- Pure matching function with comprehensive tests
+- CLI, protocol, and TopicManager integration
+
+** Non-Goals
+- Regex (error-prone, ReDoS risk, overkill)
+- Negative patterns / exclusions (future)
+- Push-based streaming subscriptions (future)
+
+* Design: Starting from What Users Type
+
+** Frequency of subscription operations
+
+| Rank | Operation                    | Frequency | Example                          |
+|------+------------------------------+-----------+----------------------------------|
+|    1 | Exact topic                  | Very high | =ever sub agent.tasks=           |
+|    2 | Everything under a prefix    | High      | "all agent events"               |
+|    3 | All topics                   | Moderate  | "show me everything"             |
+|    4 | Middle wildcard              | Rare      | "all completion events"          |
+
+The design principle: *common cases need zero special syntax or quoting.*
+
+** The trailing-dot insight
+
+Topic names cannot end with a dot (already enforced by validation). So a trailing dot is unambiguously a prefix indicator — and dots are completely shell-safe. No quoting needed.
+
+#+begin_src bash
+ever sub agent.tasks       # exact match — most common, no special syntax
+ever sub agent.            # prefix match — everything under agent, no quoting!
+ever sub .                 # all topics — no quoting!
+#+end_src
+
+Compare with systems that force quoting for the common case:
+#+begin_src bash
+# NATS — must quote because > is shell redirect
+nats sub 'agent.>'
+
+# With * — must quote because shell globs
+ever sub 'agent.*'         # our system would need this too without trailing dot
+#+end_src
+
+The trailing dot avoids quoting for the 95% case. Users only need quoting for the rare middle-wildcard pattern.
+
+** Full syntax
+
+#+begin_src bash
+# No quoting needed (common)
+ever sub agent.tasks              # exact match
+ever sub agent.                   # prefix: agent.tasks, agent.build, agent.x.y
+ever sub .                        # all topics
+
+# Quoting needed (rare — middle wildcard)
+ever sub 'agent.*.complete'       # agent.build.complete, agent.test.complete
+#+end_src
+
+** Why this works
+
+| Input              | Kind    | Shell-safe? | Why                              |
+|--------------------+---------+-------------+----------------------------------|
+| =agent.tasks=      | Exact   | Yes         | No special characters            |
+| =agent.=           | Prefix  | Yes         | Dot is shell-safe                |
+| =.=                | All     | Yes         | Just a dot                       |
+| =agent.*.complete= | Pattern | No          | =*= needs quoting — but this is rare |
+
+* Separator Analysis
+
+** Why dot and not slash?
+
+Slash (=/=) is the universal hierarchy symbol, but it has a critical ergonomic problem in CLI tools: *shell tab-completion interference*.
+
+#+begin_src bash
+# With slash separator:
+ever sub agent/           # shell tries to tab-complete as filesystem path!
+                          # if data/topics/agent/ exists, shell suggests files
+
+# With dot separator:
+ever sub agent.           # shell does nothing — dots aren't path separators
+#+end_src
+
+Ever creates directories like =data/topics/agent.tasks/= on disk. If topics used =/= as separator, =ever sub agent/= would trigger filesystem autocomplete against the data directory, suggesting wrong completions.
+
+Other considerations:
+
+| Separator | Typing    | Shell-safe | Hierarchy feel | CLI natural |
+|-----------+-----------+------------+----------------+-------------|
+| =.= (dot) | No shift  | Yes        | Good (packages, domains) | Best |
+| =/= (slash) | No shift | No (tab-complete) | Best (paths) | Poor |
+| =:= (colon) | Shift    | Yes        | Moderate (ports, Redis) | OK |
+| =-= (hyphen) | No shift | Yes       | Flat (not hierarchy) | N/A |
+
+Dot is the best trade-off: shell-safe, no shift key, natural hierarchy feel, and the trailing-dot prefix trick works perfectly with it.
+
+* Pattern Matching Rules
+
+** Three modes
+
+1. *Exact match*: no trailing dot, no =*= → must match the full topic name
+2. *Prefix match*: trailing dot → matches any topic that starts with the prefix
+3. *Segment wildcard*: =*= in pattern → matches exactly one segment at that position
+
+** The =*= wildcard
+
+=*= matches exactly one segment (any characters between dots). This is the only wildcard character. It comes from shell glob / gitignore, where every developer already knows it.
+
+There is no =**=. Instead:
+- "Everything under X" → trailing dot: =agent.= (much cleaner than =agent.**=)
+- "All topics" → bare dot: =.=
+- Middle multi-match like =agent.**.complete= → not supported (covers <1% of use cases, creates backtracking ambiguity)
+
+** Why no =**= ?
+
+The trailing dot already covers the primary use case for =**= (prefix matching), and it does so without shell quoting. Adding =**= would:
+- Require shell quoting every time (=ever sub 'agent.**'=)
+- Create a decision burden: "should I use =agent.= or =agent.**=?"
+- Enable middle placement (=a.**.b=) which needs backtracking
+- Add complexity for a use case already solved by the simpler syntax
+
+** Formal rules
+
+#+begin_src
+Input parsing:
+  1. If input is "."           → match ALL topics
+  2. If input ends with "."    → PREFIX match (strip trailing dot, match topics starting with prefix)
+  3. If input contains "*"     → PATTERN match (split on ".", compare segments, * = any one segment)
+  4. Otherwise                 → EXACT match
+#+end_src
+
+** Examples
+
+#+begin_src
+Input                   Mode     Matches                            Does NOT match
+────────────────────────────────────────────────────────────────────────────────────
+agent.tasks             exact    agent.tasks                        agent.build
+agent.                  prefix   agent.tasks, agent.build,          agent, file.x
+                                 agent.x.y.z
+.                       all      (everything)
+agent.*.complete        pattern  agent.build.complete,              agent.x.y.complete
+                                 agent.test.complete
+*                       pattern  agent, file, build                 agent.tasks
+*.*                     pattern  agent.tasks, file.changes          a, a.b.c
+*.tasks                 pattern  agent.tasks, build.tasks           tasks
+#+end_src
+
+* Wire Protocol
+
+The =FetchRequest= gains an optional =pattern= field:
+
+#+begin_src json
+{"topic": "agent.tasks", "offset": 0, "max_count": 100}
+{"pattern": "agent.", "offset": 0, "max_count": 100}
+#+end_src
+
+When =pattern= is present, server resolves matching topics, fetches from each, returns events with source topic. =EventData= gains a =topic= field:
+
+#+begin_src json
+{"events": [
+  {"topic": "agent.tasks", "offset": 0, "timestamp": 1234, "value": "..."},
+  {"topic": "agent.build", "offset": 0, "timestamp": 1235, "value": "..."}
+]}
+#+end_src
+
+* Implementation
+
+** Match function
+
+#+begin_src zig
+/// Match modes:
+///   "."           → all topics
+///   "prefix."     → prefix match
+///   contains "*"  → segment pattern match
+///   otherwise     → exact match
+pub fn matchTopic(input: []const u8, topic_name: []const u8) bool
+#+end_src
+
+Pure function. No allocations.
+
+** TopicManager
+
+#+begin_src zig
+/// Return all topics matching an input pattern. Caller owns the returned slice.
+pub fn matchTopics(self: *TopicManager, allocator: Allocator, input: []const u8) ![][]const u8
+#+end_src
+
+* Test Plan
+
+#+begin_src
+# Exact match
+match("agent.tasks", "agent.tasks")          = true
+match("agent.tasks", "agent.build")          = false
+match("agent.tasks", "agent.tasks.x")        = false
+match("agent", "agent")                      = true
+
+# Prefix match (trailing dot)
+match("agent.", "agent.tasks")               = true
+match("agent.", "agent.build")               = true
+match("agent.", "agent.tasks.build")          = true
+match("agent.", "agent")                     = false   # prefix requires more after
+match("agent.tasks.", "agent.tasks.build")    = true
+match("agent.tasks.", "agent.tasks")         = false
+match(".", "agent")                          = true    # dot alone = all
+match(".", "a.b.c")                          = true
+
+# Segment wildcard
+match("agent.*", "agent.tasks")              = true
+match("agent.*", "agent.build")              = true
+match("agent.*", "agent.tasks.build")        = false   # * is one segment
+match("agent.*", "agent")                    = false
+match("*", "agent")                          = true
+match("*", "agent.tasks")                    = false
+match("*.*", "agent.tasks")                  = true
+match("*.tasks", "agent.tasks")              = true
+match("*.tasks", "build.tasks")              = true
+match("*.tasks", "tasks")                    = false
+match("agent.*.complete", "agent.build.complete") = true
+match("agent.*.complete", "agent.x.y.complete")   = false
+
+# Edge cases
+match("", "agent")                           = false
+match("agent", "")                           = false
+match("*", "")                               = false
+match(".", "")                               = false   # no empty topics exist
+#+end_src
+
+* History
+- 2026-03-30: Implemented matchTopic (pure function, 4 test groups, 25 assertions), matchTopics on TopicManager, pattern-based fetch in protocol/server/client, CLI auto-detection of patterns. No shell quoting needed for prefix match or match-all.
