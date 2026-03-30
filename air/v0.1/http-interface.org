@@ -101,7 +101,7 @@ Same as the binary TCP server — one thread per connection via =std.Thread.spaw
 ** CLI Integration
 
 #+begin_src
-ever store start                       # TCP on 4822 + HTTP on 4280
+ever store start                       # TCP on 7890 + HTTP on 4280
 ever store start --http-port 4280      # custom HTTP port
 ever store start --no-http             # TCP only
 #+end_src

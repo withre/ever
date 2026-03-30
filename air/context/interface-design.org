@@ -133,7 +133,7 @@ try subscriber.subscribe("agent.tasks", .{ .from = .earliest }, struct {
 *** Examples
 #+begin_src
 error: topic "agent.tasks" not found. Create it with: ever topic create agent.tasks
-error: connection refused at localhost:4822. Is the store running? Start with: ever store start
+error: connection refused at localhost:7890. Is the store running? Start with: ever store start
 error: offset 1500 is beyond the end of topic "events" (current max: 1234)
 #+end_src
 
@@ -149,7 +149,7 @@ error: offset 1500 is beyond the end of topic "events" (current max: 1234)
 #+begin_src toml
 [store]
 data_dir = "./data"
-listen = "127.0.0.1:4822"
+listen = "127.0.0.1:7890"
 max_segment_size = "64MB"
 max_message_size = "16MB"
 

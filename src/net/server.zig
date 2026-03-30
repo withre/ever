@@ -14,7 +14,7 @@ const store = @import("../store/store.zig");
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
-    port: u16 = 4222,
+    port: u16 = 7890,
     max_connections: u32 = 1024,
 };
 

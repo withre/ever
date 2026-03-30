@@ -55,7 +55,7 @@ Use a simple hand-written argument parser in Zig:
 #+begin_src bash
 # Start the store
 $ ever store start --data-dir ./mydata
-Ever store listening on 127.0.0.1:4822
+Ever store listening on 127.0.0.1:7890
 
 # Create a topic
 $ ever topic create agent.tasks

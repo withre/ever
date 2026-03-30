@@ -58,7 +58,7 @@ fn handleStore(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !
 
 fn startServer(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
     var address: []const u8 = "127.0.0.1";
-    var port: u16 = 4222;
+    var port: u16 = 7890;
     var data_dir: []const u8 = "./data";
 
     var i: usize = 0;
@@ -108,7 +108,7 @@ fn handleTopic(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !
 
     const sub = args[0];
     const address = "127.0.0.1";
-    const port: u16 = 4222;
+    const port: u16 = 7890;
 
     if (std.mem.eql(u8, sub, "create")) {
         if (args.len < 2) {
@@ -154,7 +154,7 @@ fn handlePub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
     const topic_name = args[0];
     const data = args[1];
     const address = "127.0.0.1";
-    const port: u16 = 4222;
+    const port: u16 = 7890;
 
     var client = try ever.client.Client.connect(allocator, io, address, port);
     defer client.deinit();
@@ -171,7 +171,7 @@ fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
     var from_offset: u64 = 0;
     var max_count: u32 = 100;
     const address = "127.0.0.1";
-    const port: u16 = 4222;
+    const port: u16 = 7890;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {

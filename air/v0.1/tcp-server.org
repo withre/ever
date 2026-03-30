@@ -45,7 +45,7 @@ pub const Server = struct {
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
-    port: u16 = 4822,
+    port: u16 = 7890,
     max_connections: u32 = 1024,
     read_timeout_ms: u32 = 30_000,
 };

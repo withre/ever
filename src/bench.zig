@@ -247,7 +247,7 @@ fn benchTopicPublish(allocator: Allocator, io: Io, iterations: u64) !BenchResult
 }
 
 fn benchTcpPublish(allocator: Allocator, io: Io, iterations: u64) !BenchResult {
-    const port: u16 = 14222;
+    const port: u16 = 17890;
     const dir = try makeTempDir(io);
     defer cleanupTempDir(io, dir);
 
