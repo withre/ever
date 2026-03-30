@@ -74,6 +74,18 @@ fn startServer(allocator: std.mem.Allocator, io: Io, args: []const []const u8, e
     const dir = Dir.cwd().createDirPathOpen(io, data_dir, .{ .open_options = .{ .iterate = true } }) catch
         std.process.fatal("cannot open data directory '{s}'.", .{data_dir});
 
+    // Acquire exclusive lockfile to prevent multiple stores on same data dir
+    const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
+        std.process.fatal("cannot create lockfile in '{s}'.", .{data_dir});
+    defer lock_file.close(io);
+
+    const LOCK_EX = 2;
+    const LOCK_NB = 4;
+    const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
+    if (lock_result != 0) {
+        std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{data_dir});
+    }
+
     var topic_manager = try ever.topic.TopicManager.init(allocator, io, dir, .{});
     defer topic_manager.deinit();
 

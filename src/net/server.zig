@@ -49,7 +49,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         const ip4 = try net.Ip4Address.parse(self.config.address, self.config.port);
         const address: net.IpAddress = .{ .ip4 = ip4 };
-        self.net_server = try address.listen(self.io, .{ .reuse_address = true });
+        self.net_server = try address.listen(self.io, .{ .reuse_address = false });
 
         while (!self.shutdown_requested.load(.acquire)) {
             const stream = self.net_server.?.accept(self.io) catch |err| switch (err) {
