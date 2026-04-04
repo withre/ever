@@ -105,6 +105,8 @@ pub const RegisterHookRequest = struct {
     pattern: []const u8,
     command: []const []const u8,
     cwd: []const u8,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
 };
 
 pub const RegisterHookResponse = struct {
@@ -121,6 +123,8 @@ pub const HookInfo = struct {
     command: []const []const u8,
     cwd: []const u8,
     cursor: u64,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
 };
 
 pub const ListHooksResponse = struct {

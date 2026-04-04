@@ -17,6 +17,8 @@ pub const Hook = struct {
     cwd: []const u8,
     cursor: u64,
     created_at: i64,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
 };
 
 /// JSON-serializable hook for persistence.
@@ -27,6 +29,8 @@ const HookJson = struct {
     cwd: []const u8,
     cursor: u64,
     created_at: i64,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
 };
 
 const HookFileJson = struct {
@@ -34,6 +38,7 @@ const HookFileJson = struct {
     next_id: u64,
 };
 
+/// Thread-safe registry of hooks. Persists to hooks.json in the data directory.
 pub const HookTable = struct {
     allocator: Allocator,
     hooks: std.ArrayList(Hook),
@@ -73,10 +78,19 @@ pub const HookTable = struct {
         for (hook.command) |arg| self.allocator.free(arg);
         self.allocator.free(hook.command);
         self.allocator.free(hook.cwd);
+        if (hook.env) |env| {
+            for (env) |e| self.allocator.free(e);
+            self.allocator.free(env);
+        }
     }
 
     /// Add a hook. Returns the assigned ID.
     pub fn add(self: *HookTable, pattern: []const u8, command: []const []const u8, cwd: []const u8) !u64 {
+        return self.addFull(pattern, command, cwd, false, null);
+    }
+
+    /// Add a hook with full options (once, env). Returns the assigned ID.
+    pub fn addFull(self: *HookTable, pattern: []const u8, command: []const []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
         self.lock();
         defer self.mutex.unlock();
 
@@ -99,6 +113,21 @@ pub const HookTable = struct {
         const cwd_copy = try self.allocator.dupe(u8, cwd);
         errdefer self.allocator.free(cwd_copy);
 
+        // Deep copy env if present
+        const env_copy: ?[]const []const u8 = if (env) |e| blk: {
+            const ec = try self.allocator.alloc([]const u8, e.len);
+            var env_copied: usize = 0;
+            errdefer {
+                for (ec[0..env_copied]) |ev| self.allocator.free(ev);
+                self.allocator.free(ec);
+            }
+            for (e, 0..) |item, j| {
+                ec[j] = try self.allocator.dupe(u8, item);
+                env_copied = j + 1;
+            }
+            break :blk ec;
+        } else null;
+
         try self.hooks.append(self.allocator, .{
             .id = id,
             .pattern = pattern_copy,
@@ -106,6 +135,8 @@ pub const HookTable = struct {
             .cwd = cwd_copy,
             .cursor = 0,
             .created_at = getMilliTimestamp(),
+            .once = once,
+            .env = env_copy,
         });
 
         try self.saveLocked();
@@ -149,13 +180,21 @@ pub const HookTable = struct {
         }
     }
 
-    /// Get a snapshot of hooks for the daemon (caller owns returned slice).
+    /// Get a deep-copied snapshot of hooks for the daemon.
+    /// Caller owns the returned slice and all string data within it.
+    /// Free with `freeHookSnapshot`.
     pub fn snapshot(self: *HookTable, allocator: Allocator) ![]Hook {
         self.lock();
         defer self.mutex.unlock();
         const result = try allocator.alloc(Hook, self.hooks.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |h| freeHookCopy(allocator, h);
+            allocator.free(result);
+        }
         for (self.hooks.items, 0..) |hook, i| {
-            result[i] = hook;
+            result[i] = try deepCopyHook(allocator, hook);
+            initialized = i + 1;
         }
         return result;
     }
@@ -224,6 +263,21 @@ pub const HookTable = struct {
             const cwd_copy = try self.allocator.dupe(u8, h.cwd);
             errdefer self.allocator.free(cwd_copy);
 
+            // Deep copy env if present
+            const env_copy: ?[]const []const u8 = if (h.env) |e| blk: {
+                const ec = try self.allocator.alloc([]const u8, e.len);
+                var env_copied: usize = 0;
+                errdefer {
+                    for (ec[0..env_copied]) |ev| self.allocator.free(ev);
+                    self.allocator.free(ec);
+                }
+                for (e, 0..) |item, j| {
+                    ec[j] = try self.allocator.dupe(u8, item);
+                    env_copied = j + 1;
+                }
+                break :blk ec;
+            } else null;
+
             try self.hooks.append(self.allocator, .{
                 .id = h.id,
                 .pattern = pattern_copy,
@@ -231,6 +285,8 @@ pub const HookTable = struct {
                 .cwd = cwd_copy,
                 .cursor = h.cursor,
                 .created_at = h.created_at,
+                .once = h.once,
+                .env = env_copy,
             });
         }
     }
@@ -249,6 +305,8 @@ pub const HookTable = struct {
                 .cwd = hook.cwd,
                 .cursor = hook.cursor,
                 .created_at = hook.created_at,
+                .once = hook.once,
+                .env = hook.env,
             };
         }
 
@@ -299,11 +357,75 @@ pub const HookTable = struct {
     }
 };
 
+/// Free a snapshot returned by `HookTable.snapshot`. Frees all deep-copied
+/// string data and the slice itself.
+pub fn freeHookSnapshot(allocator: Allocator, hooks: []Hook) void {
+    for (hooks) |hook| freeHookCopy(allocator, hook);
+    allocator.free(hooks);
+}
+
+fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
+    const pattern = try allocator.dupe(u8, hook.pattern);
+    errdefer allocator.free(pattern);
+
+    const cmd = try allocator.alloc([]const u8, hook.command.len);
+    var cmd_copied: usize = 0;
+    errdefer {
+        for (cmd[0..cmd_copied]) |c| allocator.free(c);
+        allocator.free(cmd);
+    }
+    for (hook.command, 0..) |arg, i| {
+        cmd[i] = try allocator.dupe(u8, arg);
+        cmd_copied = i + 1;
+    }
+
+    const cwd = try allocator.dupe(u8, hook.cwd);
+    errdefer allocator.free(cwd);
+
+    const env_copy: ?[]const []const u8 = if (hook.env) |e| blk: {
+        const ec = try allocator.alloc([]const u8, e.len);
+        var env_copied: usize = 0;
+        errdefer {
+            for (ec[0..env_copied]) |ev| allocator.free(ev);
+            allocator.free(ec);
+        }
+        for (e, 0..) |item, j| {
+            ec[j] = try allocator.dupe(u8, item);
+            env_copied = j + 1;
+        }
+        break :blk ec;
+    } else null;
+
+    return .{
+        .id = hook.id,
+        .pattern = pattern,
+        .command = cmd,
+        .cwd = cwd,
+        .cursor = hook.cursor,
+        .created_at = hook.created_at,
+        .once = hook.once,
+        .env = env_copy,
+    };
+}
+
+fn freeHookCopy(allocator: Allocator, hook: Hook) void {
+    allocator.free(hook.pattern);
+    for (hook.command) |arg| allocator.free(arg);
+    allocator.free(hook.command);
+    allocator.free(hook.cwd);
+    if (hook.env) |env| {
+        for (env) |e| allocator.free(e);
+        allocator.free(env);
+    }
+}
+
 // ── Hook Daemon ─────────────────────────────────────────────────────────────
 
 /// The hook daemon runs as a thread alongside the store. It polls the
 /// TopicManager for new events matching registered hooks and executes
 /// their commands via fork/exec.
+/// Background daemon that polls for new events and executes matching hooks
+/// via fork/exec. Runs on a dedicated thread.
 pub const HookDaemon = struct {
     allocator: Allocator,
     hook_table: *HookTable,
@@ -312,6 +434,7 @@ pub const HookDaemon = struct {
     envp: [*:null]const ?[*:0]const u8,
     thread: ?std.Thread,
 
+    /// Create a new HookDaemon. Call `start()` to begin polling.
     pub fn init(
         allocator: Allocator,
         hook_table: *HookTable,
@@ -328,10 +451,12 @@ pub const HookDaemon = struct {
         };
     }
 
+    /// Spawn the daemon polling thread.
     pub fn start(self: *HookDaemon) !void {
         self.thread = try std.Thread.spawn(.{}, daemonLoop, .{self});
     }
 
+    /// Signal shutdown and join the daemon thread.
     pub fn stop(self: *HookDaemon) void {
         self.shutdown.store(true, .release);
         if (self.thread) |t| {
@@ -357,7 +482,7 @@ pub const HookDaemon = struct {
         // Take a snapshot — copies id/pattern/cursor values so we don't hold the
         // hook_table mutex during fetch or fork/exec.
         const hooks = self.hook_table.snapshot(self.allocator) catch return;
-        defer self.allocator.free(hooks);
+        defer freeHookSnapshot(self.allocator, hooks);
 
         for (hooks) |hook| {
             self.processHook(hook) catch |err| {
@@ -391,6 +516,13 @@ pub const HookDaemon = struct {
                 std.debug.print("Hook #{d} command failed: {}\n", .{ hook.id, err });
             };
             self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
+
+            // One-shot hooks: remove after first event execution
+            if (hook.once) {
+                self.hook_table.remove(hook.id) catch {};
+                std.debug.print("Hook #{d} (once) auto-removed after firing.\n", .{hook.id});
+                return;
+            }
         }
     }
 
@@ -419,14 +551,49 @@ pub const HookDaemon = struct {
         }
         try shell_cmd.appendSlice(self.allocator, "' && ");
 
+        // Prepend custom env vars from hook config
+        if (hook.env) |env| {
+            for (env) |env_pair| {
+                // env_pair is "KEY=VAL" — validate KEY, shell-escape the value
+                if (std.mem.indexOfScalar(u8, env_pair, '=')) |eq_pos| {
+                    const key = env_pair[0..eq_pos];
+                    // Validate key: must be non-empty, alphanumeric + underscore
+                    if (key.len == 0) continue;
+                    var valid_key = true;
+                    for (key) |kc| {
+                        if (!((kc >= 'a' and kc <= 'z') or (kc >= 'A' and kc <= 'Z') or
+                            (kc >= '0' and kc <= '9') or kc == '_'))
+                        {
+                            valid_key = false;
+                            break;
+                        }
+                    }
+                    if (!valid_key) continue;
+                    // First char must not be a digit
+                    if (key[0] >= '0' and key[0] <= '9') continue;
+
+                    try shell_cmd.appendSlice(self.allocator, key);
+                    try shell_cmd.appendSlice(self.allocator, "='");
+                    for (env_pair[eq_pos + 1 ..]) |c| {
+                        if (c == '\'') {
+                            try shell_cmd.appendSlice(self.allocator, "'\\''");
+                        } else {
+                            try shell_cmd.append(self.allocator, c);
+                        }
+                    }
+                    try shell_cmd.appendSlice(self.allocator, "' ");
+                }
+            }
+        }
+
         try shell_cmd.appendSlice(self.allocator, "EVER_TOPIC='");
-        try shell_cmd.appendSlice(self.allocator, event.topic);
+        try appendShellEscaped(&shell_cmd, self.allocator, event.topic);
         try shell_cmd.appendSlice(self.allocator, "' EVER_OFFSET='");
         try shell_cmd.appendSlice(self.allocator, offset_str);
         try shell_cmd.appendSlice(self.allocator, "' EVER_TIMESTAMP='");
         try shell_cmd.appendSlice(self.allocator, ts_str);
         try shell_cmd.appendSlice(self.allocator, "' EVER_KEY='");
-        if (event.key) |k| try shell_cmd.appendSlice(self.allocator, k);
+        if (event.key) |k| try appendShellEscaped(&shell_cmd, self.allocator, k);
         try shell_cmd.appendSlice(self.allocator, "' exec ");
 
         for (hook.command) |arg| {
@@ -441,7 +608,9 @@ pub const HookDaemon = struct {
             try shell_cmd.appendSlice(self.allocator, "' ");
         }
 
-        // Write JSON to PID-specific temp file for stdin (avoid race with other processes)
+        // Write JSON to PID-specific temp file for stdin.
+        // Use O_NOFOLLOW to prevent symlink attacks, and unlink-before-create
+        // to ensure we own the file.
         const my_pid = std.os.linux.getpid();
         var stdin_path_buf: [64]u8 = undefined;
         const stdin_path = std.fmt.bufPrint(&stdin_path_buf, "/tmp/.ever-hook-stdin-{d}", .{my_pid}) catch "/tmp/.ever-hook-stdin";
@@ -449,7 +618,15 @@ pub const HookDaemon = struct {
         defer self.allocator.free(stdin_path_z);
         @memcpy(stdin_path_z[0..stdin_path.len], stdin_path);
         {
-            const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+            // Remove any existing file/symlink first
+            _ = std.os.linux.unlink(stdin_path_z.ptr);
+            // O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW — create new file exclusively, refuse symlinks
+            const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .EXCL = true,
+                .NOFOLLOW = true,
+            }, 0o600);
             const fd_i: isize = @bitCast(fd_rc);
             if (fd_i >= 0) {
                 const tfd: i32 = @intCast(fd_rc);
@@ -488,12 +665,24 @@ pub const HookDaemon = struct {
     }
 };
 
+/// Append a string with single-quote escaping for safe shell interpolation.
+/// Inside single quotes, the only character that needs escaping is the single quote itself.
+fn appendShellEscaped(list: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\'') {
+            try list.appendSlice(allocator, "'\\''");
+        } else {
+            try list.append(allocator, c);
+        }
+    }
+}
+
 fn buildEventJsonFromStore(allocator: Allocator, event: store.Event) ![]u8 {
     var json: std.ArrayList(u8) = .empty;
     errdefer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"topic\":\"");
-    try json.appendSlice(allocator, event.topic);
+    try appendJsonEscaped(&json, allocator, event.topic);
     try json.appendSlice(allocator, "\",\"offset\":");
     {
         var buf: [20]u8 = undefined;
@@ -506,21 +695,37 @@ fn buildEventJsonFromStore(allocator: Allocator, event: store.Event) ![]u8 {
     }
     if (event.key) |k| {
         try json.appendSlice(allocator, ",\"key\":\"");
-        try json.appendSlice(allocator, k);
+        try appendJsonEscaped(&json, allocator, k);
         try json.append(allocator, '"');
     } else {
         try json.appendSlice(allocator, ",\"key\":null");
     }
     try json.appendSlice(allocator, ",\"value\":\"");
-    for (event.value) |c| switch (c) {
+    try appendJsonEscaped(&json, allocator, event.value);
+    try json.appendSlice(allocator, "\"}");
+    return json.toOwnedSlice(allocator);
+}
+
+/// Append a string with JSON escaping for all special and control characters.
+fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
         '"' => try json.appendSlice(allocator, "\\\""),
         '\\' => try json.appendSlice(allocator, "\\\\"),
         '\n' => try json.appendSlice(allocator, "\\n"),
         '\t' => try json.appendSlice(allocator, "\\t"),
-        else => try json.append(allocator, c),
+        '\r' => try json.appendSlice(allocator, "\\r"),
+        0x08 => try json.appendSlice(allocator, "\\b"),
+        0x0C => try json.appendSlice(allocator, "\\f"),
+        else => {
+            if (c < 0x20) {
+                var buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                try json.appendSlice(allocator, &buf);
+            } else {
+                try json.append(allocator, c);
+            }
+        },
     };
-    try json.appendSlice(allocator, "\"}");
-    return json.toOwnedSlice(allocator);
 }
 
 fn getMilliTimestamp() i64 {

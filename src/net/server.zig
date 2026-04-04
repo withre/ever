@@ -25,7 +25,9 @@ pub const Server = struct {
     config: Config,
     net_server: ?net.Server,
     shutdown_requested: std.atomic.Value(bool),
+    active_connections: std.atomic.Value(u32),
 
+    /// Create a new server. Call `run()` to start accepting connections.
     pub fn init(allocator: Allocator, io: Io, topic_manager: *TopicManager, config: Config) !Server {
         return .{
             .allocator = allocator,
@@ -35,17 +37,21 @@ pub const Server = struct {
             .config = config,
             .net_server = null,
             .shutdown_requested = std.atomic.Value(bool).init(false),
+            .active_connections = std.atomic.Value(u32).init(0),
         };
     }
 
+    /// Attach a hook table for server-side hook management.
     pub fn setHookTable(self: *Server, ht: *HookTable) void {
         self.hook_table = ht;
     }
 
+    /// Release server resources (closes the listener socket).
     pub fn deinit(self: *Server) void {
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
     }
 
+    /// Start the accept loop. Blocks until `shutdown()` is called.
     pub fn run(self: *Server) !void {
         const ip4 = try net.Ip4Address.parse(self.config.address, self.config.port);
         const address: net.IpAddress = .{ .ip4 = ip4 };
@@ -56,13 +62,27 @@ pub const Server = struct {
                 error.ConnectionAborted => continue,
                 else => { if (self.shutdown_requested.load(.acquire)) break; return err; },
             };
+
+            // Enforce max_connections limit
+            const current = self.active_connections.load(.acquire);
+            if (current >= self.config.max_connections) {
+                var s = stream;
+                // Send error before closing
+                sendError(self.allocator, s.socket.handle, protocol.ErrorCode.internal, "too many connections") catch {};
+                s.close(self.io);
+                continue;
+            }
+
+            _ = self.active_connections.fetchAdd(1, .acq_rel);
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, stream }) catch {
+                _ = self.active_connections.fetchSub(1, .acq_rel);
                 var s = stream; s.close(self.io); continue;
             };
             thread.detach();
         }
     }
 
+    /// Signal the server to stop accepting connections and close the listener.
     pub fn shutdown(self: *Server) void {
         self.shutdown_requested.store(true, .release);
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
@@ -70,7 +90,10 @@ pub const Server = struct {
 
     fn handleConnection(self: *Server, stream: net.Stream) void {
         var s = stream;
-        defer s.close(self.io);
+        defer {
+            s.close(self.io);
+            _ = self.active_connections.fetchSub(1, .acq_rel);
+        }
         const fd = s.socket.handle;
         while (!self.shutdown_requested.load(.acquire)) {
             const frame = protocol.readFrame(self.allocator, fd) catch break;
@@ -215,7 +238,7 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
-        const id = ht.add(req.pattern, req.command, req.cwd) catch
+        const id = ht.addFull(req.pattern, req.command, req.cwd, req.once, req.env) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook");
 
         const resp_body = try protocol.encodeBody(self.allocator, protocol.RegisterHookResponse{ .id = id });
@@ -241,7 +264,9 @@ pub const Server = struct {
         const ht = self.hook_table orelse
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
 
-        const hooks = ht.list();
+        const hooks = ht.snapshot(self.allocator) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "list hooks failed");
+        defer hooks_mod.freeHookSnapshot(self.allocator, hooks);
 
         const hook_infos = try self.allocator.alloc(protocol.HookInfo, hooks.len);
         defer self.allocator.free(hook_infos);
@@ -253,6 +278,8 @@ pub const Server = struct {
                 .command = hook.command,
                 .cwd = hook.cwd,
                 .cursor = hook.cursor,
+                .once = hook.once,
+                .env = hook.env,
             };
         }
 

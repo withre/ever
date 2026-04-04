@@ -105,8 +105,15 @@ pub const TopicManager = struct {
         defer self.mutex.unlock();
         const keys = self.topics.keys();
         const result = try allocator.alloc([]const u8, keys.len);
-        errdefer allocator.free(result);
-        for (keys, 0..) |key, i| result[i] = try allocator.dupe(u8, key);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |s| allocator.free(s);
+            allocator.free(result);
+        }
+        for (keys, 0..) |key, i| {
+            result[i] = try allocator.dupe(u8, key);
+            initialized = i + 1;
+        }
         return result;
     }
 

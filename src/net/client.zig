@@ -37,12 +37,18 @@ pub const HookInfoOwned = struct {
     command: []const []const u8,
     cwd: []const u8,
     cursor: u64,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
 
     pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
         allocator.free(self.pattern);
         for (self.command) |arg| allocator.free(arg);
         allocator.free(self.command);
         allocator.free(self.cwd);
+        if (self.env) |env| {
+            for (env) |e| allocator.free(e);
+            allocator.free(env);
+        }
     }
 };
 
@@ -75,6 +81,7 @@ pub const Client = struct {
         };
     }
 
+    /// Close the connection to the store.
     pub fn deinit(self: *Client) void {
         self.stream.close(self.io);
     }
@@ -218,10 +225,17 @@ pub const Client = struct {
 
     /// Register a hook on the server.
     pub fn registerHook(self: *Client, pattern: []const u8, command: []const []const u8, cwd: []const u8) !u64 {
+        return self.registerHookFull(pattern, command, cwd, false, null);
+    }
+
+    /// Register a hook with full options (once, env).
+    pub fn registerHookFull(self: *Client, pattern: []const u8, command: []const []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
         const req = protocol.RegisterHookRequest{
             .pattern = pattern,
             .command = command,
             .cwd = cwd,
+            .once = once,
+            .env = env,
         };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
@@ -289,12 +303,29 @@ pub const Client = struct {
                 cmd_copied = j + 1;
             }
 
+            // Deep copy env if present
+            const env_copy: ?[]const []const u8 = if (h.env) |env| blk: {
+                const ec = try self.allocator.alloc([]const u8, env.len);
+                var env_copied: usize = 0;
+                errdefer {
+                    for (ec[0..env_copied]) |e| self.allocator.free(e);
+                    self.allocator.free(ec);
+                }
+                for (env, 0..) |item, j| {
+                    ec[j] = try self.allocator.dupe(u8, item);
+                    env_copied = j + 1;
+                }
+                break :blk ec;
+            } else null;
+
             hooks[i] = .{
                 .id = h.id,
                 .pattern = try self.allocator.dupe(u8, h.pattern),
                 .command = cmd_copy,
                 .cwd = try self.allocator.dupe(u8, h.cwd),
                 .cursor = h.cursor,
+                .once = h.once,
+                .env = env_copy,
             };
             initialized = i + 1;
         }

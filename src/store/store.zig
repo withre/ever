@@ -23,6 +23,7 @@ pub const Event = struct {
     /// Header: offset(8) + timestamp(8) + topic_len(2) + key_len(4) + val_len(4) = 26 bytes.
     pub const header_size: usize = 26;
 
+    /// Encode this event into `buf`. Returns the encoded slice, or error if buffer too small.
     pub fn encode(self: Event, buf: []u8) error{BufferTooSmall}![]u8 {
         const key_bytes = self.key orelse &[_]u8{};
         const total = header_size + self.topic.len + key_bytes.len + self.value.len;
@@ -43,6 +44,7 @@ pub const Event = struct {
         return buf[0..total];
     }
 
+    /// Decode an event from raw bytes. Returns CorruptRecord if data is malformed.
     pub fn decode(data: []const u8) error{CorruptRecord}!Event {
         if (data.len < header_size) return error.CorruptRecord;
 
@@ -65,6 +67,7 @@ pub const Event = struct {
         return .{ .offset = offset, .timestamp = timestamp, .topic = topic, .key = key, .value = value };
     }
 
+    /// Total byte size of this event when encoded (header + topic + key + value).
     pub fn recordSize(self: Event) usize {
         const key_len = if (self.key) |k| k.len else 0;
         return header_size + self.topic.len + key_len + self.value.len;

@@ -37,6 +37,8 @@ pub fn main(init: std.process.Init) !void {
         try handlePub(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "sub")) {
         try handleSub(allocator, io, args[2..]);
+    } else if (std.mem.eql(u8, command, "wait")) {
+        handleWait(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "on")) {
         try handleOn(allocator, io, args[2..], init.minimal.environ.block.slice.ptr);
     } else if (std.mem.eql(u8, command, "hook")) {
@@ -149,10 +151,12 @@ fn handlePub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
 }
 
 fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
-    if (args.len < 1) std.process.fatal("usage: ever sub <topic> [--from <offset>] [--max <count>]", .{});
+    if (args.len < 1) std.process.fatal("usage: ever sub <topic> [--from <offset>] [--max <count>] [--follow] [--json-values]", .{});
     const topic_name = args[0];
     var from_offset: u64 = 0;
     var max_count: u32 = 100;
+    var follow = false;
+    var json_values = false;
     const address = "127.0.0.1";
     const port: u16 = 7890;
 
@@ -162,6 +166,10 @@ fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
             i += 1; from_offset = std.fmt.parseInt(u64, args[i], 10) catch std.process.fatal("invalid offset.", .{});
         } else if (std.mem.eql(u8, args[i], "--max") and i + 1 < args.len) {
             i += 1; max_count = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid count.", .{});
+        } else if (std.mem.eql(u8, args[i], "--follow")) {
+            follow = true;
+        } else if (std.mem.eql(u8, args[i], "--json-values")) {
+            json_values = true;
         }
     }
 
@@ -171,23 +179,138 @@ fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
         (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
-    var result = if (is_pattern) try client.fetchPattern(topic_name, from_offset, max_count) else try client.fetch(topic_name, from_offset, max_count);
-    defer result.deinit();
+    if (follow) {
+        // --follow mode: initial fetch then loop with blocking
+        var offset = from_offset;
+        var did_initial = false;
 
-    if (result.events.len == 0) {
-        std.debug.print("No events.\n", .{});
+        while (true) {
+            var result = if (!did_initial)
+                // Initial non-blocking fetch
+                (if (is_pattern) try client.fetchPattern(topic_name, offset, max_count) else try client.fetch(topic_name, offset, max_count))
+            else
+                // Blocking fetch for new events
+                try client.fetchBlocking(
+                    if (!is_pattern) topic_name else null,
+                    if (is_pattern) topic_name else null,
+                    offset,
+                    100,
+                    5000,
+                );
+            defer result.deinit();
+
+            for (result.events) |event| {
+                printEvent(event, json_values);
+            }
+
+            if (result.events.len > 0) {
+                offset += result.events.len;
+            }
+            did_initial = true;
+        }
     } else {
-        for (result.events) |event| {
-            const t = if (event.topic) |tp| tp else "";
-            if (t.len > 0) {
-                if (event.key) |k| std.debug.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value })
-                else std.debug.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
-            } else {
-                if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
-                else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+        // One-shot fetch (original behavior)
+        var result = if (is_pattern) try client.fetchPattern(topic_name, from_offset, max_count) else try client.fetch(topic_name, from_offset, max_count);
+        defer result.deinit();
+
+        if (result.events.len == 0) {
+            std.debug.print("No events.\n", .{});
+        } else {
+            for (result.events) |event| {
+                printEvent(event, json_values);
             }
         }
     }
+}
+
+fn printEvent(event: ever.client.Event, json_values: bool) void {
+    if (json_values) {
+        std.debug.print("{s}\n", .{event.value});
+    } else {
+        const t = if (event.topic) |tp| tp else "";
+        if (t.len > 0) {
+            if (event.key) |k| std.debug.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value })
+            else std.debug.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
+        } else {
+            if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
+            else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+        }
+    }
+}
+
+// ── ever wait ────────────────────────────────────────────────────────────────
+
+fn handleWait(allocator: std.mem.Allocator, io: Io, args: []const []const u8) void {
+    if (args.len < 1) std.process.fatal("usage: ever wait <topic> [--count <n>] [--timeout <seconds>] [--from <offset>] [--json-values]", .{});
+    const topic_name = args[0];
+    var count: u32 = 1;
+    var timeout_secs: u32 = 0; // 0 = no timeout
+    var from_offset: u64 = 0;
+    var json_values = false;
+    const address = "127.0.0.1";
+    const port: u16 = 7890;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--count") and i + 1 < args.len) {
+            i += 1; count = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid count.", .{});
+        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+            i += 1; timeout_secs = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid timeout.", .{});
+        } else if (std.mem.eql(u8, args[i], "--from") and i + 1 < args.len) {
+            i += 1; from_offset = std.fmt.parseInt(u64, args[i], 10) catch std.process.fatal("invalid offset.", .{});
+        } else if (std.mem.eql(u8, args[i], "--json-values")) {
+            json_values = true;
+        }
+    }
+
+    var client = ever.client.Client.connect(allocator, io, address, port) catch
+        std.process.fatal("cannot connect to store at {s}:{d}.", .{ address, port });
+    defer client.deinit();
+
+    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
+        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
+
+    var collected: u32 = 0;
+    var offset = from_offset;
+    var elapsed_ms: u64 = 0;
+    const timeout_ms: u64 = @as(u64, timeout_secs) * 1000;
+    const block_interval_ms: u32 = 2000; // 2s blocking intervals
+
+    while (collected < count) {
+        // Check timeout
+        if (timeout_secs > 0 and elapsed_ms >= timeout_ms) {
+            // Timeout — exit with code 1
+            std.process.exit(1);
+        }
+
+        // Calculate remaining time for this block
+        const remaining_ms: u32 = if (timeout_secs > 0)
+            @intCast(@min(block_interval_ms, timeout_ms - elapsed_ms))
+        else
+            block_interval_ms;
+
+        var result = client.fetchBlocking(
+            if (!is_pattern) topic_name else null,
+            if (is_pattern) topic_name else null,
+            offset,
+            @min(100, count - collected),
+            remaining_ms,
+        ) catch std.process.fatal("fetch failed.", .{});
+        defer result.deinit();
+
+        for (result.events) |event| {
+            printEvent(event, json_values);
+            collected += 1;
+        }
+
+        if (result.events.len > 0) {
+            offset += result.events.len;
+        }
+
+        elapsed_ms += remaining_ms;
+    }
+
+    // Success — all events arrived, exit 0
 }
 
 // ── ever on ─────────────────────────────────────────────────────────────────
@@ -267,13 +390,13 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
             defer shell_cmd.deinit(allocator);
 
             try shell_cmd.appendSlice(allocator, "EVER_TOPIC='");
-            try shell_cmd.appendSlice(allocator, if (event.topic) |t| t else "");
+            if (event.topic) |t| try appendShellEscaped(&shell_cmd, allocator, t);
             try shell_cmd.appendSlice(allocator, "' EVER_OFFSET='");
             try shell_cmd.appendSlice(allocator, offset_str);
             try shell_cmd.appendSlice(allocator, "' EVER_TIMESTAMP='");
             try shell_cmd.appendSlice(allocator, ts_str);
             try shell_cmd.appendSlice(allocator, "' EVER_KEY='");
-            try shell_cmd.appendSlice(allocator, if (event.key) |k| k else "");
+            if (event.key) |k| try appendShellEscaped(&shell_cmd, allocator, k);
             try shell_cmd.appendSlice(allocator, "' exec ");
             for (cmd_args) |arg| {
                 // Shell-escape each argument
@@ -288,7 +411,8 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
                 try shell_cmd.appendSlice(allocator, "' ");
             }
 
-            // Write JSON to a PID-specific temp file for stdin (avoid race with other processes)
+            // Write JSON to a PID-specific temp file for stdin.
+            // Use unlink+O_CREAT|O_EXCL|O_NOFOLLOW to prevent symlink attacks.
             const my_pid = std.os.linux.getpid();
             var stdin_path_buf: [64]u8 = undefined;
             const stdin_path = std.fmt.bufPrint(&stdin_path_buf, "/tmp/.ever-on-stdin-{d}", .{my_pid}) catch "/tmp/.ever-on-stdin";
@@ -296,7 +420,13 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
             defer allocator.free(stdin_path_z);
             @memcpy(stdin_path_z[0..stdin_path.len], stdin_path);
             {
-                const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+                _ = std.os.linux.unlink(stdin_path_z.ptr);
+                const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{
+                    .ACCMODE = .WRONLY,
+                    .CREAT = true,
+                    .EXCL = true,
+                    .NOFOLLOW = true,
+                }, 0o600);
                 if (@as(isize, @bitCast(fd_rc)) >= 0) {
                     const fd: i32 = @intCast(fd_rc);
                     _ = std.os.linux.write(fd, json.ptr, json.len);
@@ -397,6 +527,17 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: std.mem.Allocator, s: 
     };
 }
 
+/// Append a string with single-quote escaping for safe shell interpolation.
+fn appendShellEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\'') {
+            try list.appendSlice(allocator, "'\\''");
+        } else {
+            try list.append(allocator, c);
+        }
+    }
+}
+
 // ── ever hook ────────────────────────────────────────────────────────────────
 
 fn handleHook(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
@@ -406,21 +547,29 @@ fn handleHook(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !v
     const port: u16 = 7890;
 
     if (std.mem.eql(u8, sub, "add")) {
-        // ever hook add <pattern> -- <cmd> [args...]
+        // ever hook add <pattern> [--once] [--env KEY=VAL]... -- <cmd> [args...]
         var pattern: ?[]const u8 = null;
         var cmd_start: ?usize = null;
+        var once = false;
+        var env_list: std.ArrayList([]const u8) = .empty;
+        defer env_list.deinit(allocator);
 
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--")) {
                 cmd_start = i + 1;
                 break;
+            } else if (std.mem.eql(u8, args[i], "--once")) {
+                once = true;
+            } else if (std.mem.eql(u8, args[i], "--env") and i + 1 < args.len) {
+                i += 1;
+                try env_list.append(allocator, args[i]);
             } else if (pattern == null) {
                 pattern = args[i];
             }
         }
 
-        if (pattern == null) std.process.fatal("usage: ever hook add <pattern> -- <command> [args...]", .{});
+        if (pattern == null) std.process.fatal("usage: ever hook add <pattern> [--once] [--env KEY=VAL] -- <command> [args...]", .{});
         if (cmd_start == null or cmd_start.? >= args.len)
             std.process.fatal("missing command after '--'.", .{});
 
@@ -433,9 +582,11 @@ fn handleHook(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !v
         const cwd_i: isize = @bitCast(cwd_len);
         const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
+        const env_slice: ?[]const []const u8 = if (env_list.items.len > 0) env_list.items else null;
+
         var c = try ever.client.Client.connect(allocator, io, address, port);
         defer c.deinit();
-        const id = try c.registerHook(pattern.?, cmd_args, cwd);
+        const id = try c.registerHookFull(pattern.?, cmd_args, cwd, once, env_slice);
 
         // Format command for display
         var cmd_display: std.ArrayList(u8) = .empty;
@@ -444,7 +595,11 @@ fn handleHook(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !v
             if (j > 0) try cmd_display.append(allocator, ' ');
             try cmd_display.appendSlice(allocator, arg);
         }
-        std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern.?, cmd_display.items });
+        if (once) {
+            std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern.?, cmd_display.items });
+        } else {
+            std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern.?, cmd_display.items });
+        }
     } else if (std.mem.eql(u8, sub, "list")) {
         var c = try ever.client.Client.connect(allocator, io, address, port);
         defer c.deinit();
@@ -502,9 +657,10 @@ fn printUsage() void {
         \\  topic list     List all topics
         \\  topic delete   Delete a topic
         \\  pub            Publish an event
-        \\  sub            Subscribe to events
+        \\  sub            Subscribe to events (--follow, --json-values)
+        \\  wait           Block until events arrive (--count, --timeout)
         \\  on             Watch events and run command
-        \\  hook add       Register a persistent server-side hook
+        \\  hook add       Register a server-side hook (--once, --env)
         \\  hook list      List registered hooks
         \\  hook rm        Remove a hook by ID
         \\  version        Show version
