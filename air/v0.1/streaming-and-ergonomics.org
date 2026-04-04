@@ -1,0 +1,101 @@
+#+title: Streaming & Ergonomics Improvements
+#+state: complete
+#+FILETAGS: :cli:subscriber:orchestrator:
+
+* Summary
+Five improvements to Ever that eliminate boilerplate in ACE orchestration patterns:
+1. =ever sub --follow= — tail-f style streaming for topics
+2. =ever wait --count N --timeout S= — blocking wait replacing sleep loops
+3. =ever hook add --once= — one-shot hooks that auto-remove
+4. =ever hook add --env KEY=VAL= — custom env vars for hooks
+5. =ever sub --json-values= — unwrap event values for cleaner piping
+
+* Motivation
+The ACE stack requires significant shell boilerplate to work around limitations in Ever's native capabilities. Blocking waits use hand-rolled sleep loops with offset math, there's no way to stream events in real-time, one-shot hooks require manual cleanup, and extracting event values for piping requires post-processing.
+
+** Goals
+- Reduce boilerplate for the most common ACE patterns
+- Keep Ever simple and independent (no Chronoa dependency)
+- Make the "right thing" easy (streaming/blocking) and the "wrong thing" (polling) unnecessary
+
+** Non-Goals
+- Ever should not depend on or know about Chronoa
+- No daemon management within Ever
+
+* Proposal
+
+** Feature 1: =ever sub --follow= (Priority: HIGH)
+
+Stream new events as they arrive, like =tail -f=. Uses the existing =fetchBlocking= protocol mechanism server-side.
+
+#+begin_src bash
+ever sub work.done --follow                # stream new events only
+ever sub work.done --from 0 --follow       # replay history then follow
+ever sub work.done --follow --json-values  # combine with json-values
+#+end_src
+
+Implementation:
+- CLI: After initial fetch, loop calling =fetchBlocking= with =block_ms=5000=, incrementing offset
+- Prints events as they arrive, never exits (until Ctrl-C or pipe close)
+- Reuses existing client =fetchBlocking= — no protocol changes needed
+
+** Feature 2: =ever wait= (Priority: HIGH)
+
+Purpose-built blocking wait. Replaces the common =while true; sleep; wc -l; done= polling pattern.
+
+#+begin_src bash
+ever wait work.done --count 3 --timeout 300
+ever wait work.done --timeout 60           # default count=1
+ever wait work.done --from 5 --count 2 --timeout 300
+#+end_src
+
+Exit codes: 0 = all events arrived, 1 = timeout. Prints matched events on success.
+
+Implementation:
+- New top-level command in main.zig
+- Uses =fetchBlocking= in a loop, accumulating events until count is met or timeout expires
+- Prints events on success (same format as =ever sub=)
+
+** Feature 3: =ever hook add --once= (Priority: MEDIUM)
+
+One-shot hooks that auto-remove after first fire. Requires protocol change to pass the =once= flag.
+
+Implementation:
+- Add =once: bool= field to Hook, HookJson, RegisterHookRequest
+- HookDaemon removes hook after executing it once (via hook_table.remove)
+- CLI: parse =--once= flag in =ever hook add=
+
+** Feature 4: =ever hook add --env KEY=VAL= (Priority: MEDIUM)
+
+Custom environment variables for hooks. Enables passing context (e.g., Chronoa session name) without hardcoding.
+
+Implementation:
+- Add =env: []const []const u8= to Hook, HookJson, RegisterHookRequest
+- HookDaemon prepends custom env vars to the shell command (same pattern as EVER_TOPIC)
+- CLI: parse =--env KEY=VAL= flags (repeatable)
+
+** Feature 5: =ever sub --json-values= (Priority: LOW)
+
+Print only the event value (user's JSON payload) instead of the full envelope. Makes piping to jq trivial.
+
+Implementation:
+- CLI-only change in =handleSub=
+- Parse =--json-values= flag
+- When set, print only =event.value= per line (no envelope, no prefix)
+
+* Implementation Order
+
+1. =--json-values= — simplest, CLI-only change
+2. =--follow= — CLI-only, reuses fetchBlocking
+3. =wait= — new command, reuses fetchBlocking
+4. =--once= — requires protocol + hook table + daemon changes
+5. =--env= — requires protocol + hook table + daemon changes
+
+Features 4 and 5 share the same code paths (hook table, protocol, daemon) so they should be done together.
+
+* History
+- 2026-04-04: Created, starting implementation
+- 2026-04-04: All 5 features implemented, build+tests pass
+- 2026-04-04: Reviewer approved, PM approved, security reviewer requested changes
+- 2026-04-04: Security fixes applied (env KEY validation, shell-escaping, O_NOFOLLOW, max_connections)
+- 2026-04-04: Complete

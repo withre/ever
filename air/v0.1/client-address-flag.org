@@ -1,0 +1,55 @@
+#+title: Client Address and Port Flags
+#+state: ready
+#+FILETAGS: :cli:core:
+
+* Summary
+Add =--address= and =--port= flags to all client commands (=pub=, =sub=, =wait=, =on=, =topic=, =hook=) so they can connect to non-default or remote stores. Also support =EVER_ADDR= environment variable.
+
+* Motivation
+Every client command hardcodes =127.0.0.1:7890=. Users cannot connect to a store on a different port (e.g. started with =--port 8000=) or a remote host. This was flagged as a known bug in two separate code reviews.
+
+** Goals
+- =--address= and =--port= flags on all client commands
+- =EVER_ADDR= env var as default (format: =host:port=)
+- Flag overrides env var, env var overrides hardcoded default
+- Consistent across all commands (single helper to parse)
+
+** Non-Goals
+- TLS/authentication for remote connections
+- Config file for persistent settings
+
+* Proposal
+
+** Resolution order
+1. =--address= / =--port= flags (highest priority)
+2. =EVER_ADDR= env var (e.g. =export EVER_ADDR=192.168.1.10:7890=)
+3. Default =127.0.0.1:7890=
+
+** Usage
+
+#+begin_src bash
+# Default (127.0.0.1:7890)
+ever pub agent.tasks '{"done":true}'
+
+# Custom port
+ever pub --port 8000 agent.tasks '{"done":true}'
+
+# Remote store
+ever pub --address 192.168.1.10 --port 8000 agent.tasks '{"done":true}'
+
+# Via environment (affects all commands)
+export EVER_ADDR=192.168.1.10:8000
+ever pub agent.tasks '{"done":true}'
+ever sub agent.
+ever hook list
+#+end_src
+
+** Implementation
+Extract a =parseStoreAddress= helper in main.zig that:
+1. Reads =EVER_ADDR= from the environ block
+2. Overrides with =--address= / =--port= if present
+3. Returns =(address, port)= tuple
+
+Each handler calls this instead of hardcoding constants.
+
+* History

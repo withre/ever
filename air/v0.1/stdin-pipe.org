@@ -1,0 +1,59 @@
+#+title: Pipe-Based Stdin for Triggers and Hooks
+#+state: ready
+#+FILETAGS: :subscriber:cli:
+
+* Summary
+Replace the temp-file-based stdin delivery (=/tmp/.ever-hook-stdin-PID=) with direct =pipe2()= for passing event JSON to triggered commands. Eliminates TOCTOU race and temp file cleanup concerns.
+
+* Motivation
+Both =ever on= and the hook daemon write event JSON to a temp file, then redirect the child's stdin from that file. This has problems:
+- TOCTOU race between =unlink()= and =open(O_CREAT|O_EXCL)= — another process could race in
+- PID-based path means concurrent executions within the same process share the same file
+- Temp files can leak if the process crashes between write and cleanup
+
+The correct Unix pattern: create a pipe, fork, write JSON to the pipe's write end, child reads from the pipe's read end. No filesystem involvement.
+
+** Goals
+- Replace temp file with =pipe2()= + =fork()= for both =ever on= and =HookDaemon=
+- No temp files created anywhere
+- Event JSON delivered atomically through the pipe
+- Works for payloads up to =PIPE_BUF= (64KB on Linux) without blocking
+
+** Non-Goals
+- Handling payloads larger than pipe buffer (64KB is far beyond typical event sizes)
+
+* Proposal
+
+** Pattern
+
+#+begin_src zig
+// Create pipe
+var pipe_fds: [2]i32 = undefined;
+_ = std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
+
+const pid = std.os.linux.fork();
+if (pid == 0) {
+    // Child: redirect stdin from pipe read end
+    _ = std.os.linux.close(pipe_fds[1]); // close write end
+    _ = std.os.linux.dup2(pipe_fds[0], 0); // stdin = pipe read end
+    _ = std.os.linux.close(pipe_fds[0]);
+    // exec...
+} else {
+    // Parent: write JSON to pipe write end, then close
+    _ = std.os.linux.close(pipe_fds[0]); // close read end
+    writeAll(pipe_fds[1], event_json);
+    _ = std.os.linux.close(pipe_fds[1]); // EOF for child's stdin
+    // waitpid...
+}
+#+end_src
+
+This is the standard pattern used by shell pipelines, =popen()=, and every process-spawning library.
+
+** Scope
+Two call sites to update:
+1. =src/main.zig= =handleOn= — replace temp file logic
+2. =src/store/hooks.zig= =executeHookCommand= — replace temp file logic
+
+Both currently share the same pattern (write to temp, append =< /tmp/...= to shell command). The pipe approach eliminates the redirect entirely — the child's stdin is already the pipe.
+
+* History

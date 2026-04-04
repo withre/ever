@@ -1,0 +1,45 @@
+#+title: Graceful Server Shutdown
+#+state: ready
+#+FILETAGS: :core:protocol:
+
+* Summary
+Track active connection threads and join them on shutdown, preventing use-after-free when the server is stopping.
+
+* Motivation
+The server spawns detached threads per connection. On shutdown (Ctrl-C or =server.shutdown()=), the listener socket closes but in-flight handler threads may still be accessing =TopicManager=, =HookTable=, or =allocator= memory that is being freed by the main thread's defers. This is a use-after-free race condition flagged by two separate code reviews.
+
+** Goals
+- Track active connection threads (ArrayList or atomic counter + condition)
+- On shutdown: set flag, close listener, wait for all handlers to finish (with timeout)
+- Signal handler for SIGINT/SIGTERM that calls =shutdown()=
+- Handlers check shutdown flag between operations and exit early
+
+** Non-Goals
+- Client-side reconnection on server restart
+- Zero-downtime upgrades
+
+* Proposal
+
+** Connection tracking
+Replace =thread.detach()= with tracking in a thread-safe list. On shutdown, iterate and join each thread with a timeout.
+
+Simpler alternative: use the existing =active_connections= atomic counter. Shutdown waits (spin + sleep) until counter reaches 0 or a timeout expires.
+
+#+begin_src zig
+pub fn shutdown(self: *Server) void {
+    self.shutdown_requested.store(true, .release);
+    if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
+
+    // Wait for in-flight connections to finish (max 5 seconds)
+    var waited_ms: u32 = 0;
+    while (self.active_connections.load(.acquire) > 0 and waited_ms < 5000) {
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 100_000_000 }, null); // 100ms
+        waited_ms += 100;
+    }
+}
+#+end_src
+
+** Signal handling
+Register SIGINT/SIGTERM handler that calls =server.shutdown()=. Requires storing a global pointer to the server (or using a global atomic flag).
+
+* History
