@@ -1,0 +1,250 @@
+#+title: CLI Argument Parsing Library
+#+state: draft
+#+FILETAGS: :cli:core:
+
+* Summary
+Build a reusable CLI argument parsing library (=src/cli.zig=) that handles flag parsing, subcommand dispatch, and help generation with truecolour output. Designed to be extracted into a standalone library later.
+
+* Motivation
+main.zig is 677 lines of hand-rolled argument parsing with repetitive patterns: every handler manually iterates args, parses =--flag value= pairs, calls =std.process.fatal= on errors, and builds its own help string. This creates:
+
+- Inconsistent flag handling across commands (some support =--address=, most don't)
+- No =--help= support on subcommands
+- Plain text help with no visual hierarchy
+- Duplicated parsing boilerplate (~20 lines per handler)
+- No type safety on flag values
+
+The ren library (=~/Coding/github.com/rytswd/ren=) demonstrates sophisticated truecolour terminal rendering in Zig. The CLI library should use similar colour primitives for help output.
+
+** Goals
+- Declarative command/flag definitions (comptime struct → parser + help)
+- Consistent =--flag value= and =--flag=value= parsing across all commands
+- Truecolour help output with palettes (gradient separators, coloured headers)
+- Fully customisable help: override any section, or provide raw string for complex layouts like airctl
+- Subcommand nesting (=ever store start=, =ever hook add=)
+- Error messages with suggestions ("did you mean --follow?")
+- Extractable as a standalone library (no Ever-specific dependencies)
+
+** Non-Goals
+- Shell completion generation (future)
+- Config file integration
+- Positional argument validation beyond basic count checking
+
+* Research
+
+** Rust clap
+
+Clap uses a derive macro approach: annotate a struct with =#[derive(Parser)]=, fields become flags:
+
+#+begin_src rust
+#[derive(Parser)]
+struct Cli {
+    #[arg(short, long)]
+    verbose: bool,
+    #[arg(short, long, default_value = "127.0.0.1")]
+    address: String,
+}
+#+end_src
+
+Zig equivalent: comptime struct introspection. Define a struct with default values, the library generates a parser and help text from the type information.
+
+** airctl help style
+
+airctl groups commands into categories (Getting Started, Review, Workflow, Configuration, Information) with visual separation. This is a custom layout that doesn't fit a generated template. The library must support:
+1. *Auto-generated help* from command definitions (default)
+2. *Custom help sections* for complex groupings
+3. *Raw help override* for complete manual control
+
+** ren colour approach
+
+ren uses comptime hex parsing (=Colour.hex("#FF8800")=), palettes with named roles (neutral, primary, accent), and gradient separators. The CLI library should:
+- Accept a =Palette= for theming
+- Use gradient separators between help sections
+- Colour command names, flag names, and descriptions differently
+- Degrade gracefully to plain text when not a TTY
+
+* Proposal
+
+** Declarative API
+
+#+begin_src zig
+const cli = @import("cli.zig");
+
+const app = cli.App{
+    .name = "ever",
+    .description = "lightweight event storage",
+    .version = "0.1.0",
+
+    .commands = &.{
+        .{
+            .name = "pub",
+            .description = "Publish an event",
+            .args = &.{
+                .{ .name = "topic", .kind = .positional, .required = true, .description = "Topic name" },
+                .{ .name = "data", .kind = .positional, .required = true, .description = "JSON event data" },
+            },
+            .flags = &.{
+                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+            },
+            .run = handlePub,
+        },
+        .{
+            .name = "store",
+            .description = "Manage the storage server",
+            .subcommands = &.{
+                .{ .name = "start", .description = "Start the server", .flags = &.{...}, .run = handleStoreStart },
+            },
+        },
+    },
+};
+
+pub fn main(init: std.process.Init) !void {
+    app.run(init);
+}
+#+end_src
+
+** Handler receives parsed result
+
+#+begin_src zig
+fn handlePub(ctx: cli.Context) !void {
+    const topic = ctx.arg("topic");       // positional
+    const data = ctx.arg("data");         // positional
+    const address = ctx.flag("address");  // --address, defaults to "127.0.0.1"
+    const port = ctx.flagInt(u16, "port"); // --port, parsed to u16
+    // ...
+}
+#+end_src
+
+** Help output with truecolour
+
+Default auto-generated help:
+
+#+begin_src
+╭ ever — lightweight event storage ─────────────────────────╮
+
+  Usage: ever <command> [flags]
+
+  Commands:
+    pub              Publish an event
+    sub              Subscribe to events
+    wait             Block until events arrive
+    on               Watch events and run command
+
+  Store:
+    store start      Start the storage server
+
+  Hooks:
+    hook add         Register a server-side hook
+    hook list        List registered hooks
+    hook rm          Remove a hook by ID
+
+  Flags:
+    -h, --help       Show help
+    -v, --version    Show version
+
+╰───────────────────────────────────────────────────────────╯
+#+end_src
+
+With truecolour:
+- App name and description in gradient (primary → accent)
+- Section headers (Commands, Store, Hooks, Flags) in primary colour
+- Command names in accent colour, descriptions in neutral
+- Separator lines as gradients (like ren)
+- Box drawing characters for the frame
+
+** Custom help sections
+
+For airctl-style grouping:
+
+#+begin_src zig
+const app = cli.App{
+    .name = "ever",
+    .help_sections = &.{
+        .{ .title = "Event Commands", .commands = &.{"pub", "sub", "wait", "on"} },
+        .{ .title = "Store Management", .commands = &.{"store start"} },
+        .{ .title = "Hooks", .commands = &.{"hook add", "hook list", "hook rm"} },
+        .{ .title = "Information", .commands = &.{"version", "help"} },
+    },
+    // ...
+};
+#+end_src
+
+Or for complete manual control:
+
+#+begin_src zig
+const app = cli.App{
+    .name = "ever",
+    .custom_help = myCustomHelpFunction,
+    // ...
+};
+
+fn myCustomHelpFunction(writer: *std.Io.Writer, palette: cli.Palette) !void {
+    // Full manual control over help output
+}
+#+end_src
+
+** Palette system
+
+#+begin_src zig
+pub const Palette = struct {
+    name: Colour,        // app/command names
+    description: Colour, // description text
+    flag: Colour,        // --flag names
+    separator: Colour,   // separator lines
+    subtle: Colour,      // secondary text
+    error_colour: Colour,// error messages
+};
+
+pub const default_palette = Palette{
+    .name = Colour.hex("#82AAFF"),
+    .description = Colour.hex("#C0C0C0"),
+    .flag = Colour.hex("#C3E88D"),
+    .separator = Colour.hex("#546E7A"),
+    .subtle = Colour.hex("#666666"),
+    .error_colour = Colour.hex("#FF5370"),
+};
+#+end_src
+
+** Graceful TTY degradation
+
+#+begin_src zig
+// Detect TTY and disable colours automatically
+const use_colour = if (std.Io.File.stderr().isTty(io)) true else false;
+// Or force with --color=always / --color=never / --no-color
+#+end_src
+
+When not a TTY (piped output), all colour is stripped and box drawing degrades to ASCII.
+
+* Implementation Plan
+
+** File: =src/cli.zig= (portable, no Ever dependencies)
+
+| Component         | Estimate | Description                                    |
+|-------------------+----------+------------------------------------------------|
+| Colour            | ~50 LOC  | RGB struct, hex parsing, ANSI escape output     |
+| Palette           | ~30 LOC  | Named colour roles, presets                     |
+| Flag/Arg parsing  | ~150 LOC | Split args, match flags, type coercion          |
+| Context           | ~50 LOC  | Parsed result with typed accessors              |
+| Help generator    | ~200 LOC | Auto layout, sections, box drawing, gradients   |
+| App/Command types | ~100 LOC | Comptime definitions, dispatch, error handling  |
+| *Total*           | *~580 LOC* |                                               |
+
+** Migration path
+
+1. Build =cli.zig= with Ever's commands as the test case
+2. Rewrite =main.zig= handlers to use =cli.Context= instead of manual parsing
+3. Add =--address= / =--port= to all commands via shared flag definition
+4. Add =--help= support on every subcommand
+5. Later: extract =cli.zig= to a standalone package (=build.zig.zon= dependency)
+
+** Dependencies on ren
+
+Do NOT depend on ren. Copy the minimal colour primitives needed:
+- =Colour= struct with =.hex()= comptime constructor
+- ANSI escape code formatting (=\x1b[38;2;R;G;Bm=)
+- TTY detection
+
+This keeps the CLI library self-contained and extractable. ren is a rendering library with block layout, Unicode width, animations — far more than CLI help needs.
+
+* History

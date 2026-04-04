@@ -1,0 +1,216 @@
+#+title: Timer-Based Event Publishing
+#+state: ready
+#+FILETAGS: :orchestrator:store:
+
+* Summary
+Add built-in timers that publish events on a schedule. =ever timer add= registers a recurring or one-shot timer that publishes a JSON payload to a topic at specified intervals or cron expressions. Combined with hooks, this makes Ever a complete event-driven automation system with no external dependencies.
+
+* Motivation
+Currently, timed events require an external cron job or a script running =ever pub= in a loop. This defeats Ever's single-binary philosophy. Users should be able to say "publish a heartbeat every 5 minutes" without setting up cron, systemd timers, or a wrapper script.
+
+The separation is clean: *timers are about when, hooks are about what.* A timer publishes an event at a scheduled time. A hook executes a command when that event arrives. Together they replace cron + shell scripts with a single Ever store.
+
+#+begin_src bash
+# Timer publishes, hook reacts — replaces crontab entry
+ever timer add heartbeat --every 5m health.check '{"action":"ping"}'
+ever hook add health.check -- ./check-services.sh
+#+end_src
+
+** Goals
+- =ever timer add <name> --every <duration> <topic> [payload]= for intervals
+- =ever timer add <name> --cron "<expr>" <topic> [payload]= for cron schedules
+- =ever timer list= / =ever timer rm <name>= / =ever timer info <name>=
+- Timer daemon thread in =ever store start= (like hook daemon)
+- Timers persist across restart
+- Catch-up on missed fires after downtime (configurable)
+- Auto-create topic if it doesn't exist
+
+** Non-Goals
+- Sub-second precision (1-second tick loop is sufficient)
+- Timezone support beyond UTC (v0.2)
+- One-shot timers with absolute time (v0.2 — =--at "2026-04-05T15:00:00"=)
+
+* Research
+
+Research conducted across 9 systems (cron, systemd timers, Temporal, K8s CronJobs, robfig/cron, at(1), Redis TTL, NATS JetStream, Zig stdlib). Full findings in project notes.
+
+Key takeaways:
+- systemd timers validate =Persistent=true= as the right model for missed-fire catch-up
+- robfig/cron's =@every= + standard 5-field cron covers 95%+ of use cases
+- In-process timer thread (like hooks daemon) is the right architecture — single binary, no coordination
+- Temporal's approach of storing schedules as durable state validates self-hosting timer definitions in the log
+
+* Proposal
+
+** Schedule formats
+
+Two formats, both first-class:
+
+*** Intervals (=--every=)
+
+#+begin_src bash
+ever timer add heartbeat --every 5m health.check '{"action":"ping"}'
+ever timer add cleanup --every 1h maintenance.gc '{"action":"gc"}'
+ever timer add pulse --every 30s status.alive '{}'
+#+end_src
+
+Duration: =<number><unit>= where unit is =s= (seconds), =m= (minutes), =h= (hours), =d= (days).
+
+*** Cron expressions (=--cron=)
+
+#+begin_src bash
+ever timer add nightly --cron "0 3 * * *" maintenance.backup '{"type":"full"}'
+ever timer add workdays --cron "0 9 * * 1-5" report.daily '{"generate":true}'
+#+end_src
+
+Standard 5-field: minute(0-59) hour(0-23) day-of-month(1-31) month(1-12) day-of-week(0-6).
+
+Supported: =*=, literals, =*/N= (step), =N-M= (range), =N,M,O= (list).
+
+*** Predefined macros
+
+=@hourly=, =@daily=, =@weekly=, =@monthly= as shorthand for common cron expressions.
+
+** CLI
+
+#+begin_src bash
+# Add timers
+ever timer add heartbeat --every 5m health.check '{"action":"ping"}'
+ever timer add nightly --cron "0 3 * * *" maintenance.backup '{"type":"full"}'
+ever timer add hourly-report --cron "@hourly" report.hourly '{}'
+
+# List
+ever timer list
+# NAME             SCHEDULE       TOPIC                NEXT FIRE            FIRES
+# heartbeat        every 5m       health.check         2026-04-04 10:35     287
+# nightly          0 3 * * *      maintenance.backup   2026-04-05 03:00     12
+# hourly-report    @hourly        report.hourly        2026-04-04 11:00     45
+
+# Details
+ever timer info heartbeat
+# Name:        heartbeat
+# Schedule:    every 5m
+# Topic:       health.check
+# Payload:     {"action":"ping"}
+# Last fired:  2026-04-04 10:30:00 UTC
+# Next fire:   2026-04-04 10:35:00 UTC
+# Fire count:  287
+# Created:     2026-04-04 08:00:00 UTC
+
+# Remove
+ever timer rm heartbeat
+#+end_src
+
+** What timers publish
+
+When timer =heartbeat= fires, it publishes to =health.check=:
+
+#+begin_src json
+{"action":"ping","_timer":{"name":"heartbeat","fire_count":288}}
+#+end_src
+
+User payload is the top level. Timer metadata goes in =_timer= (underscore prefix avoids collisions). If no user payload is given, just the =_timer= object is published.
+
+** Architecture
+
+Timer daemon runs as an in-process thread alongside the hook daemon in =ever store start=:
+
+#+begin_src
+ever store start
+  ├── TCP server (connections)
+  ├── Hook daemon (reacts to events)
+  └── Timer daemon (publishes events on schedule)
+       ├── load timers from storage
+       ├── check for missed fires → publish catch-up
+       └── loop: sleep 1s → check schedules → publish if due
+#+end_src
+
+The timer daemon calls =topic_manager.publish()= directly — no TCP roundtrip.
+
+** Persistence
+
+Timers stored in =timers.json= in the data directory (same pattern as =hooks.json=):
+
+#+begin_src json
+{
+  "timers": [
+    {
+      "name": "heartbeat",
+      "schedule": {"type": "interval", "seconds": 300},
+      "topic": "health.check",
+      "payload": "{\"action\":\"ping\"}",
+      "last_fired_at": 1711234567890,
+      "fire_count": 287,
+      "persistent": true,
+      "created_at": 1711200000000
+    }
+  ]
+}
+#+end_src
+
+Atomic writes (temp file + rename), same as hooks.
+
+** Missed fires
+
+When =persistent= is true (default) and the store restarts after downtime:
+
+- *Intervals*: if =last_fired_at + interval < now=, fire once immediately (not for every missed interval)
+- *Cron*: if =next_fire(last_fired_at) < now=, fire once immediately
+
+This matches systemd's =Persistent=true= behavior — catch up but don't flood.
+
+A =--no-persist= flag disables catch-up for timers where missed fires are irrelevant.
+
+** Cron parser (MVP)
+
+Minimal implementation — each field is a 60-bit bitmap:
+
+#+begin_src zig
+const CronField = struct {
+    bits: u64,  // bitmap of matching values
+
+    fn matches(self: CronField, value: u6) bool {
+        return (self.bits >> value) & 1 == 1;
+    }
+};
+
+const CronExpr = struct {
+    minute: CronField,
+    hour: CronField,
+    day_of_month: CronField,
+    month: CronField,
+    day_of_week: CronField,
+
+    fn nextFire(self: CronExpr, after: i64) i64 { ... }
+};
+#+end_src
+
+=nextFire= iterates from =after + 60s= checking each minute until all fields match. Worst case ~525,600 iterations (1 year) but practically finds a match in <60.
+
+** Protocol
+
+New message types:
+
+#+begin_src
+add_timer = 0x0A     → { name, schedule, topic, payload, persistent }
+remove_timer = 0x0B  → { name }
+list_timers = 0x0C   → returns all timers
+timer_info = 0x0D    → { name } → returns timer details
+#+end_src
+
+Plus OK responses at =0x8A-0x8D=.
+
+* Implementation Estimate
+
+| Component         | Estimate | Notes                                  |
+|-------------------+----------+----------------------------------------|
+| Cron parser       | ~120 LOC | Field parsing, nextFire calculation     |
+| Timer table       | ~100 LOC | Load/save JSON, add/remove (like hooks) |
+| Timer daemon      | ~100 LOC | Tick loop, missed fire check, publish   |
+| Protocol messages | ~30 LOC  | 4 new message types                    |
+| Server handlers   | ~50 LOC  | Handle new messages                    |
+| Client methods    | ~40 LOC  | addTimer, removeTimer, listTimers, info |
+| CLI commands      | ~80 LOC  | ever timer add/list/rm/info            |
+| *Total*           | *~520 LOC* |                                      |
+
+* History

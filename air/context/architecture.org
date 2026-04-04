@@ -2,225 +2,178 @@
 
 ** Core Philosophy
 
-Ever is built on the principle that event storage should be *simple, fast, and reliable* without the operational overhead of distributed systems. A single-node event log with proper durability guarantees covers the vast majority of use cases where events need to be tracked and consumed.
+Ever is a single-binary event storage system. One store process, many client processes, no external dependencies. Events are immutable, topics are logical, and the shared log is the source of truth.
 
 ** Design Principles
 
-*** Shared Append-Only Log
-- Single shared log for all events from all topics — sequential writes, optimal page cache
-- Topics are a logical index, not separate files — no per-topic I/O overhead
-- Events tagged with topic name in each record (2-byte topic_len header field)
-- Mutex-serialized writes — fixes concurrency, simple and correct
-- Segmented log files with in-memory position index for O(1) reads
+*** Single Shared Log
+- All events from all topics write sequentially to one log file
+- Topics are an in-memory index over the shared log, not separate files
+- Each event record includes its topic name (2-byte topic_len header field)
+- Segment rotation at configurable size (default 64MB)
+- In-memory position index rebuilt from log on startup — O(1) reads
 
-*** Explicit Resource Management (Zig-First)
-- No hidden memory allocations — all allocations go through =std.mem.Allocator=
-- No hidden control flow — no exceptions, no async magic
-- Explicit error handling using Zig's error unions
-- Deterministic cleanup with =defer= and =errdefer=
-- Leverage comptime for zero-cost abstractions
+*** One Store, Many Clients
+- One =ever store start= process owns the data directory
+- Any number of =ever pub/sub/on/wait/hook/topic= clients connect via TCP
+- Lockfile (=ever.lock= with =flock=) prevents multiple stores on same data dir
+- =reuse_address=false= prevents multiple stores on same port
 
-*** Process-Based Architecture
-- Distinct processes for distinct roles (store, publisher, subscriber, orchestrator, transformer)
-- Communication via well-defined protocol over TCP or Unix domain sockets
-- Each process is independently deployable and restartable
-- Orchestrator manages lifecycle but processes can run standalone
+*** Thread Safety
+- =TopicManager= mutex serializes all topic/publish/fetch operations
+- =Log= mutex serializes appends (nested under TopicManager mutex)
+- =HookTable= mutex serializes hook registration/removal
+- Server tracks =active_connections= with atomic counter
+- Hook and timer daemons are separate threads sharing =TopicManager=
 
-*** At-Least-Once Delivery
-- Consumer offset tracking for reliable replay
-- Acknowledgment-based consumption — offset advances only after consumer ACK
-- Consumers can rewind and replay from any committed offset
-- No exactly-once guarantees (simplifies implementation significantly)
+*** Event-Driven Automation
+- *Hooks*: =ever hook add <pattern> -- <cmd>= — persistent server-side triggers
+- *Triggers*: =ever on <pattern> -- <cmd>= — ephemeral client-side triggers
+- *Timers* (planned): =ever timer add --every 5m <topic> <payload>= — scheduled publishing
+- Separation: timers are "when", hooks are "what", events are the glue
 
-** System Architecture
+** Architecture Diagram
 
 #+begin_src
-┌──────────────┐     ┌──────────────────────────────────┐     ┌──────────────┐
-│  Publisher    │────▶│           Store                   │◀────│  Subscriber  │
-│  (producer)  │     │  ┌────────────────────────────┐   │     │  (consumer)  │
-└──────────────┘     │  │  Topic: "agent.tasks"      │   │     └──────────────┘
-                     │  │  ┌─────┬─────┬─────┬────┐  │   │
-┌──────────────┐     │  │  │seg0 │seg1 │seg2 │seg3│  │   │     ┌──────────────┐
-│ Transformer  │◀───▶│  │  └─────┴─────┴─────┴────┘  │   │◀───▶│ Transformer  │
-│ (pub + sub)  │     │  └────────────────────────────┘   │     │ (pub + sub)  │
-└──────────────┘     │  ┌────────────────────────────┐   │     └──────────────┘
-                     │  │  Topic: "file.changes"     │   │
-                     │  │  ┌─────┬─────┐             │   │
-                     │  │  │seg0 │seg1 │             │   │
-                     │  │  └─────┴─────┘             │   │
-                     │  └────────────────────────────┘   │
-                     └──────────────────────────────────┘
-                                    ▲
-                                    │
-                            ┌───────┴────────┐
-                            │  Orchestrator   │
-                            │  (lifecycle)    │
-                            └────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ ever store start                                               │
+│                                                                │
+│  ┌──────────────────────────────────┐                          │
+│  │ Shared Log                       │                          │
+│  │  ┌────────┬────────┬────────┐    │                          │
+│  │  │ seg 0  │ seg 1  │ seg 2  │    │  00000000.log files      │
+│  │  └────────┴────────┴────────┘    │                          │
+│  │  in-memory position index        │                          │
+│  └──────────────┬───────────────────┘                          │
+│                 │                                              │
+│  ┌──────────────┴───────────────────┐                          │
+│  │ TopicManager (mutex-protected)   │                          │
+│  │  topics: HashMap(name → offsets) │                          │
+│  │  publish / fetch / fetchPattern  │                          │
+│  └──┬────────────┬──────────────────┘                          │
+│     │            │                                             │
+│  ┌──┴─────┐  ┌───┴──────────┐  ┌──────────────┐               │
+│  │  TCP   │  │ Hook Daemon  │  │ Timer Daemon │  (planned)     │
+│  │ Server │  │  hooks.json  │  │ timers.json  │               │
+│  │ :7890  │  │  fork/exec   │  │ publish on   │               │
+│  └────────┘  └──────────────┘  │ schedule     │               │
+│                                └──────────────┘               │
+└────────────────────────────────────────────────────────────────┘
+        ▲            ▲            ▲
+        │ TCP        │ TCP        │ TCP
+   ┌────┴──┐   ┌─────┴──┐   ┌────┴────┐
+   │ever   │   │ever    │   │ever     │
+   │pub/sub│   │on/wait │   │hook/    │
+   │       │   │        │   │topic    │
+   └───────┘   └────────┘   └─────────┘
 #+end_src
 
-** Core Components
+** Storage Layout
 
-*** 1. Store (Storage Engine)
-
-The store is the heart of Ever. It manages topics, each backed by segmented append-only logs.
-
-**** Log Structure
-- *Segment*: Fixed-size file containing sequential events
-- *Index*: Sparse offset-to-position mapping for fast lookups
-- *Topic*: Named collection of segments forming a logical stream
-
-**** Storage Layout on Disk
 #+begin_src
 data/
-├── topics/
-│   ├── agent.tasks/
-│   │   ├── 00000000000000000000.log    # Segment file (events)
-│   │   ├── 00000000000000000000.idx    # Index file (offset → position)
-│   │   ├── 00000000000000001024.log    # Next segment
-│   │   └── 00000000000000001024.idx
-│   └── file.changes/
-│       ├── 00000000000000000000.log
-│       └── 00000000000000000000.idx
-└── meta/
-    ├── topics.json                      # Topic registry
-    └── consumers/                       # Consumer offset storage
-        └── my-consumer-group.json
+├── 00000000000000000000.log   # Shared log segment 0
+├── 00000000000000065536.log   # Segment 1 (after rotation)
+├── hooks.json                 # Persistent hook registrations
+├── timers.json                # Persistent timer schedules (planned)
+└── ever.lock                  # flock-based lockfile
 #+end_src
 
-**** Segment File Format
-Each event in a segment:
+No per-topic directories. All events interleaved in the shared log.
+
+** Event Record Format
+
 #+begin_src
-┌──────────┬──────────┬──────────┬──────────┬──────────────┐
-│ offset   │ timestamp│ key_len  │ val_len  │ key | value  │
-│ (u64)    │ (i64)    │ (u32)    │ (u32)    │ (bytes)      │
-└──────────┴──────────┴──────────┴──────────┴──────────────┘
+┌──────────┬───────────┬───────────┬──────────┬──────────┬─────────────────────┐
+│ offset   │ timestamp │ topic_len │ key_len  │ val_len  │ topic | key | value │
+│ u64 LE   │ i64 LE    │ u16 LE    │ u32 LE   │ u32 LE   │ variable bytes      │
+└──────────┴───────────┴───────────┴──────────┴──────────┴─────────────────────┘
 #+end_src
 
-*** 2. Protocol Layer
+Header: 26 bytes. Topic name embedded in every record (max 255 bytes). Key is optional (key_len=0). Value is the user's JSON payload. Empty value (val_len=0) indicates a topic creation marker — filtered from user-facing fetch results.
 
-Binary protocol for communication between processes.
+** Wire Protocol
 
-**** Message Types
-- =Publish= — Write event(s) to a topic
-- =Subscribe= — Start consuming from a topic at an offset
-- =Fetch= — Pull a batch of events from current position
-- =Ack= — Acknowledge consumption up to an offset
-- =CreateTopic= — Create a new topic
-- =DeleteTopic= — Remove a topic
-- =Heartbeat= — Keep-alive for long-lived connections
-- =Error= — Error response with code and message
-
-**** Frame Format
 #+begin_src
-┌──────────┬──────────┬──────────┬──────────────┐
-│ msg_type │ flags    │ body_len │ body         │
-│ (u8)     │ (u8)    │ (u32)    │ (bytes)      │
-└──────────┴──────────┴──────────┴──────────────┘
+┌───────────┬──────────┬──────────┬──────────────────┐
+│ version   │ msg_type │ body_len │ body             │
+│ u8 (=1)   │ u8       │ u32 LE   │ JSON bytes       │
+└───────────┴──────────┴──────────┴──────────────────┘
 #+end_src
 
-*** 3. Networking Layer
+6-byte frame header. Bodies are JSON. Message types:
 
-TCP and Unix domain socket server using Zig's =std.posix= and =std.net=.
+| Range   | Purpose        | Types                                                 |
+|---------+----------------+-------------------------------------------------------|
+| 0x01-06 | Core requests  | publish, fetch, create/delete/list topics, ack        |
+| 0x07-09 | Hook requests  | register/unregister/list hooks                        |
+| 0x0A-0D | Timer requests | add/remove/list/info timers (planned)                 |
+| 0x81-89 | OK responses   | Mirrors of requests                                  |
+| 0xFF    | Error          | Code + message                                        |
 
-**** Design Decisions
-- Single-threaded event loop using =std.posix.poll= or =io_uring= (if available)
-- Non-blocking I/O for handling many concurrent connections
-- Connection-per-consumer model with optional multiplexing
-- Graceful shutdown with drain period for in-flight messages
+Fetch supports =block_ms= for blocking long-poll (server delays response until events arrive or timeout).
 
-*** 4. Publisher
+** Recovery Model
 
-Client library and standalone process for producing events.
+On startup, =ever store start=:
+1. Acquire =ever.lock= (fail if another store running)
+2. Scan =*.log= segment files, build position index
+3. Replay log to rebuild topic index (=rebuildIndex=)
+   - Topics discovered from event records (including empty-value markers from =createTopic=)
+4. Load =hooks.json= → start hook daemon
+5. Load =timers.json= → start timer daemon (planned)
+6. Start TCP listener
 
-**** Features
-- Synchronous and batched publish modes
-- Optional key-based partitioning (for ordered delivery within a key)
-- Automatic reconnection on connection loss
-- Back-pressure handling when store is overloaded
+Everything reconstructs from the log + JSON config files. No separate database.
 
-*** 5. Subscriber
+** Subscription Model
 
-Client library and standalone process for consuming events.
+Three patterns, common cases need no shell quoting:
 
-**** Features
-- Pull-based fetching with configurable batch size
-- Push-based streaming mode for low-latency consumption
-- Consumer group support — multiple consumers sharing a topic
-- Offset management — automatic or manual commit
+| Input           | Mode    | Matches                             |
+|-----------------+---------+-------------------------------------|
+| =agent.tasks=   | Exact   | Only =agent.tasks=                  |
+| =agent.=        | Prefix  | =agent.tasks=, =agent.build=, etc.  |
+| =.=             | All     | Every topic                         |
+| =agent.*.done=  | Pattern | =agent.build.done=, =agent.X.done=  |
 
-*** 6. Orchestrator
+Trailing dot is shell-safe (no quoting needed). The =*= wildcard matches exactly one segment.
 
-Process manager for the Ever ecosystem.
+** Concurrency Model
 
-**** Responsibilities
-- Start/stop store, publisher, subscriber processes
-- Configuration management and distribution
-- Health monitoring and automatic restart
-- Graceful shutdown coordination
-- CLI interface for operational commands
+- TCP server: thread-per-connection (detached)
+- TopicManager: single mutex guards all operations
+- Log: nested mutex (redundant under TopicManager mutex, but safe)
+- Hook daemon: separate thread, polls TopicManager
+- Timer daemon: separate thread, publishes to TopicManager (planned)
+- Client commands: single-threaded, one TCP connection
 
-*** 7. Transformer
+Known limitation: detached threads not joined on shutdown (=graceful-shutdown.org= spec exists).
 
-Combined publisher + subscriber for event pipeline processing.
+** Key Learnings
 
-**** Design
-- Subscribes to input topic, applies transformation function, publishes to output topic
-- User-defined transformation logic (compiled Zig function or external process via stdin/stdout)
-- At-least-once processing guarantee inherited from subscriber semantics
-- Lightweight — single process handles one transformation step
+*** Shared log > per-topic files
+Originally each topic had its own directory with segment files. Cross-topic queries (=ever sub agent.=) required N separate readBatch calls. The shared log eliminated this — all reads are sequential from one file, and the OS page cache works optimally since recent events from all topics are physically adjacent.
 
-** Error Handling Strategy
+*** Topic creation must be durable
+Topics created with =createTopic= but never published to would vanish on restart because =rebuildIndex= only discovers topics from event records. Fix: =createTopic= writes a marker event (empty value) to the log.
 
-*** Error Types
-- *StorageError*: Disk I/O failures, segment corruption, out of space
-- *ProtocolError*: Malformed messages, version mismatch, unknown message types
-- *NetworkError*: Connection refused, timeout, broken pipe
-- *TopicError*: Topic not found, already exists, invalid name
-- *ConsumerError*: Invalid offset, consumer group conflict
+*** freeEvent contract
+=Log.read/readBatch= returns events where topic+key+value are a single contiguous allocation. Always use =store.freeEvent()= to free — never free individual fields. This reduces allocator pressure from 3 allocs per read to 1.
 
-*** Recovery Strategies
-- *Store*: fsync on commit, segment checksums for corruption detection
-- *Publisher*: Retry with backoff on transient failures
-- *Subscriber*: Resume from last committed offset on restart
-- *Orchestrator*: Automatic process restart with configurable backoff
+*** Blocking fetch over polling
+=ever on= and =ever sub --follow= use =block_ms= in =FetchRequest=. The server holds the connection (poll+sleep loop) until events arrive or timeout. This eliminates idle CPU from client-side polling loops.
 
-** Performance Considerations
+*** Double mutex is acceptable
+=TopicManager.publish= holds its mutex, then calls =Log.append= which acquires the Log mutex. This is redundant but not a bug — the Log mutex ensures correctness if Log is ever used without TopicManager. The overhead is one extra spinlock acquisition per write (~nanoseconds).
 
-*** Write Path
-- Sequential append — no random I/O on write
-- Batch writes to amortize fsync cost
-- Memory-mapped segment files for efficient access
-- Zero-copy where possible (direct buffer writes)
+** Performance Profile (ReleaseFast, single node)
 
-*** Read Path
-- Index for O(1) offset lookups within segments
-- Sequential read for batch fetches
-- OS page cache friendly access patterns
-- Configurable read-ahead for streaming consumers
+| Operation        | Throughput     | Avg latency |
+|------------------+----------------+-------------|
+| Log append       | ~340k ops/sec  | ~3µs        |
+| Log read         | ~450k ops/sec  | ~2µs        |
+| Batch read (100) | ~460k evts/sec | ~220µs      |
+| Topic publish    | ~340k ops/sec  | ~3µs        |
 
-*** Memory Management
-- Arena allocators for request-scoped allocations
-- Fixed-size buffer pools for I/O operations
-- No garbage collection — deterministic memory behavior
-- Configurable memory limits per component
-
-** Future Considerations
-
-*** Compression
-- Per-segment or per-batch compression (LZ4, zstd)
-- Configurable per topic
-
-*** Retention Policies
-- Time-based retention (delete segments older than X)
-- Size-based retention (keep at most Y bytes per topic)
-- Compaction (keep only latest event per key)
-
-*** Binary Event Format
-- Move from JSON to a more compact binary encoding
-- Schema registry for typed events
-- Backward/forward compatibility
-
-*** Observability
-- Metrics export (Prometheus format)
-- Structured logging
-- Health check endpoints
+Bottleneck is syscall overhead (pwrite/pread), not CPU. fsync-on-append drops to ~1.8k ops/sec (disk-bound).

@@ -1,0 +1,119 @@
+#+title: Store Status Command
+#+state: ready
+#+FILETAGS: :cli:store:
+
+* Summary
+Add =ever store status= that inspects the data directory and reports storage statistics — total events, topics, segment files, disk usage, hook count. Works offline (reads files directly, no running server needed).
+
+* Motivation
+There's no way to inspect an Ever data directory without starting the server. Users need to answer: how many events are stored? How large is the log? Which topics exist? How many hooks are registered? Is the store healthy?
+
+This is especially useful after a crash, before starting the server, or for monitoring scripts.
+
+** Goals
+- =ever store status= reads the data dir and prints a summary
+- Works without a running server (reads files directly)
+- =ever store status --json= for machine-readable output
+- Shows: total events, total bytes, segment count, topic list with per-topic event counts, hook count, lock status
+
+** Non-Goals
+- Interactive TUI dashboard (v0.2 — would use ren for rendering)
+- Live updating / real-time metrics
+- Connecting to a running server for runtime stats
+
+* Proposal
+
+** Usage
+
+#+begin_src bash
+ever store status --data-dir ./data
+#+end_src
+
+** Output (human-readable)
+
+#+begin_src
+Ever Store: ./data
+══════════════════════════════════════
+
+  Log
+    Segments:    3
+    Total size:  12.4 MB
+    Events:      48,291
+
+  Topics (5)
+    agent.build         18,402 events
+    agent.test           9,211 events
+    file.changes        15,033 events
+    deploy.trigger       5,644 events
+    health.check             1 events
+
+  Hooks (2)
+    #1  deploy.trigger → ./deploy.sh         cursor: 5,640
+    #2  agent.          → ./log-agent.sh     cursor: 27,601
+
+  Lock: not held
+#+end_src
+
+** Output (--json)
+
+#+begin_src json
+{
+  "data_dir": "./data",
+  "log": {
+    "segments": 3,
+    "total_bytes": 13003776,
+    "total_events": 48291
+  },
+  "topics": [
+    {"name": "agent.build", "events": 18402},
+    {"name": "agent.test", "events": 9211},
+    {"name": "file.changes", "events": 15033},
+    {"name": "deploy.trigger", "events": 5644},
+    {"name": "health.check", "events": 1}
+  ],
+  "hooks": [
+    {"id": 1, "pattern": "deploy.trigger", "command": "./deploy.sh", "cursor": 5640},
+    {"id": 2, "pattern": "agent.", "command": "./log-agent.sh", "cursor": 27601}
+  ],
+  "lock_held": false
+}
+#+end_src
+
+* Design Details
+
+** Implementation approach
+
+This command does NOT connect to a running server. It reads the data directory directly:
+
+1. Open the data dir
+2. Scan segment files (=*.log=) — count them, sum sizes
+3. Scan the shared log to count events and discover topics (same as =rebuildIndex= but read-only)
+4. Read =hooks.json= for hook info
+5. Try =flock(LOCK_EX | LOCK_NB)= on =ever.lock= to check if a server is running (if lock fails → server is running)
+
+Since this reads the same files the server does, it works whether or not the server is running. The only constraint: if the server is actively writing, the status may show a slightly stale count (eventual consistency, not a problem for status display).
+
+** Lock status detection
+
+#+begin_src zig
+// Try non-blocking exclusive lock
+const lock_result = std.os.linux.flock(lock_fd, LOCK_EX | LOCK_NB);
+if (lock_result == 0) {
+    // Lock acquired — no server running. Release immediately.
+    _ = std.os.linux.flock(lock_fd, LOCK_UN);
+    // status: "not held"
+} else {
+    // Lock failed — server is running
+    // status: "held (server running)"
+}
+#+end_src
+
+** Scanning without full deserialization
+
+For speed with large logs, the scanner only needs to read event headers (26 bytes) to extract topic name and skip the payload. No need to allocate or copy event data — just count and accumulate topic names.
+
+** No server dependency
+
+This command takes =--data-dir= (not =--address= / =--port=). It's a local filesystem operation. The =Io= parameter is needed for file operations but no network.
+
+* History

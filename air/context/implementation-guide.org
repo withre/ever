@@ -61,27 +61,36 @@
 - Export module API through a root file that re-exports public symbols
 - Co-locate tests with the code they test (inline =test= blocks)
 
-*** File I/O Patterns
-- Use =std.fs= for all file operations
-- Prefer =pread=/=pwrite= for concurrent access to shared files
-- Always handle partial reads/writes
-- Use =std.posix.fsync= or =std.posix.fdatasync= for durability
-- Memory-map files with =std.posix.mmap= for read-heavy workloads
-- Close file descriptors in =defer= blocks immediately after opening
+*** File I/O Patterns (v0.16)
+- Use =std.Io.Dir= and =std.Io.File= for all file operations — all take =io= parameter
+- =file.writePositionalAll(io, bytes, offset)= / =file.readPositionalAll(io, buf, offset)= for positional I/O
+- =dir.createFile(io, name, .{ .read = true, .truncate = false })= for creating files
+- =dir.openFile(io, name, .{ .mode = .read_write })= for opening existing files
+- =file.stat(io)= for metadata, =file.sync(io)= for fsync, =file.close(io)= for cleanup
+- Use =defer file.close(io)= immediately after opening
+- For raw syscalls (flock, temp files): =std.os.linux.open=, =.close=, =.write=, =.read=, =.flock=, =.unlink=
 
-*** Networking Patterns
-- Use =std.net= for TCP and =std.net.Address= for Unix domain sockets
-- Non-blocking I/O with poll-based event loop
-- Handle =EAGAIN=/=EWOULDBLOCK= gracefully
-- Implement connection timeouts and keep-alive
-- Buffer management: use fixed-size ring buffers for I/O
+*** Networking Patterns (v0.16)
+- Use =std.Io.net.IpAddress.listen(io, .{})= for server binding
+- Use =std.Io.net.IpAddress.connect(io, .{ .mode = .stream })= for client connections
+- Extract =.socket.handle= from =net.Stream= for raw posix fd operations
+- Protocol read/write uses raw posix fd (=std.posix.read= / =std.os.linux.write=) — not Io.Reader/Writer
+- Thread-per-connection model (=std.Thread.spawn=, =thread.detach()=)
+- Track active connections with =std.atomic.Value(u32)= for =max_connections= enforcement
 
 *** Serialization
-- Start with JSON (=std.json=) for human-readable data
-- Design protocol messages with binary encoding in mind for future migration
-- Use packed structs or manual byte-level encoding for wire format
-- Always validate untrusted input — never trust message sizes or offsets
-- Include version fields in wire formats for forward compatibility
+- =std.json.Stringify.valueAlloc(allocator, value, .{})= for encoding structs to JSON
+- =std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true })= for decoding
+- Binary wire format: manual =std.mem.writeInt= / =std.mem.readInt= with =.little= endianness
+- Validate all untrusted input — check message sizes, offset bounds, topic name characters
+- Shell-escape all strings passed to fork/exec (single-quote wrapping with ='\''= escape)
+
+*** Process Spawning Patterns
+- =std.os.linux.fork()= / =.execve()= / =.waitpid()= for running external commands
+- Pass environ from =init.minimal.environ.block.slice.ptr= to child =execve=
+- For stdin: write to temp file with =O_CREAT|O_EXCL|O_NOFOLLOW=, redirect via shell =<= (current approach; pipe2() preferred, see =stdin-pipe.org=)
+- PID-based temp file paths (=/tmp/.ever-hook-stdin-{pid}=) to avoid collisions
+- Validate env var keys (alphanumeric + underscore only) before shell interpolation
 
 ** Documentation Standards
 
@@ -180,6 +189,18 @@ zig build test -Doptimize=ReleaseSafe
 - =Log.read()= and =Log.readBatch()= return events with topic+key+value in a single contiguous allocation
 - Always use =store.freeEvent(allocator, event)= to free — never free fields separately
 - The allocation starts at =event.topic.ptr= and covers topic+key+value contiguously
+
+*** Architectural Learnings
+- *Shared log beats per-topic files*: Cross-topic queries go from N file reads to one sequential read. OS page cache works optimally. The rewrite was ~25% of the codebase but simplified server handlers significantly.
+- *Topic creation must write to the log*: =createTopic= writes a marker event (empty value) so =rebuildIndex= discovers the topic on restart. Without this, empty topics vanish.
+- *fetch must filter markers*: Events with =value.len == 0= are internal markers, not user events. Both =fetch= and =fetchPattern= skip them.
+- *Blocking fetch > polling*: Server holds the TCP connection with a sleep loop when =block_ms > 0=. Eliminates client-side polling for =ever on=, =ever sub --follow=, =ever wait=.
+- *snapshot() must deep-copy*: =HookTable.list()= returns internal references. If used across mutex boundaries (like building a JSON response), another thread could invalidate them. Always use =snapshot()= for cross-thread access.
+- *Shell escaping is security-critical*: Every string interpolated into a shell command (topic names, keys, env vars, cwd) must be single-quote escaped. A topic name containing ='= breaks out of quoting context. Use =appendShellEscaped= helper.
+- *JSON escaping needed everywhere*: Topic names, keys, and values all need escaping when building JSON strings manually. Use =appendJsonEscaped= helper.
+- *Debug vs ReleaseFast differ*: Data races may only manifest in release builds. Always test =zig build -Doptimize=ReleaseFast= before committing concurrency changes.
+- *Lockfile released on process death*: =flock= is automatically released by the kernel when the process exits (even kill -9). No stale lockfile cleanup needed.
+- *reuse_address=false is essential*: With =true=, multiple stores bind to the same port and clients get randomly routed. Set =false= so the OS rejects duplicate binds.
 
 *** Debugging
 - Use =std.debug.print= for quick debugging (remove before commit)
