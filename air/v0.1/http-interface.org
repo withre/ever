@@ -1,5 +1,5 @@
 #+title: HTTP Interface
-#+state: work-in-progress
+#+state: ready
 #+FILETAGS: :protocol:core:
 
 * Summary

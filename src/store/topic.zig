@@ -71,15 +71,21 @@ pub const TopicManager = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    /// Register a new topic. No I/O — just adds to the index.
+    /// Register a new topic. Writes a marker event to the log so the
+    /// topic survives restart even if no events are published to it.
     pub fn createTopic(self: *TopicManager, name: []const u8) !void {
         self.lock();
         defer self.mutex.unlock();
         try validateTopicName(name);
         if (self.topics.contains(name)) return TopicError.AlreadyExists;
+
+        // Write a marker event so rebuildIndex discovers this topic on restart
+        const offset = try self.log.append(name, null, "");
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
-        try self.topics.put(owned, .{});
+        var idx: TopicIndex = .{};
+        try idx.offsets.append(self.allocator, offset);
+        try self.topics.put(owned, idx);
     }
 
     /// Remove a topic from the index. Log data stays (no compaction yet).
@@ -141,6 +147,7 @@ pub const TopicManager = struct {
     }
 
     /// Fetch events for a single topic by topic-local offset range.
+    /// Skips internal marker events (empty value from createTopic).
     pub fn fetch(self: *TopicManager, allocator: Allocator, topic_name: []const u8, start: u64, max_count: u32) ![]Event {
         self.lock();
         defer self.mutex.unlock();
@@ -150,11 +157,17 @@ pub const TopicManager = struct {
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
-        const begin = @min(start, offsets.len);
-        const end = @min(begin + max_count, offsets.len);
-
-        for (offsets[begin..end]) |global_offset| {
-            const event = (try self.log.read(allocator, global_offset)) orelse continue;
+        var skipped: u64 = 0;
+        var i: usize = 0;
+        while (i < offsets.len and events.items.len < max_count) : (i += 1) {
+            const event = (try self.log.read(allocator, offsets[i])) orelse continue;
+            // Skip marker events (empty value from createTopic)
+            if (event.value.len == 0) {
+                if (skipped < start) skipped += 1;
+                store.freeEvent(allocator, event);
+                continue;
+            }
+            if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
             errdefer store.freeEvent(allocator, event);
             try events.append(allocator, event);
         }
@@ -162,6 +175,7 @@ pub const TopicManager = struct {
     }
 
     /// Fetch events across all topics matching a pattern.
+    /// Skips internal marker events (empty value from createTopic).
     pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
         self.lock();
         defer self.mutex.unlock();
@@ -172,11 +186,17 @@ pub const TopicManager = struct {
         while (topic_iter.next()) |entry| {
             if (!matchTopic(pattern, entry.key_ptr.*)) continue;
             const offsets = entry.value_ptr.offsets.items;
-            const begin = @min(start, offsets.len);
-            const end = @min(begin + max_count, offsets.len);
 
-            for (offsets[begin..end]) |global_offset| {
-                const event = (try self.log.read(allocator, global_offset)) orelse continue;
+            var skipped: u64 = 0;
+            var i: usize = 0;
+            while (i < offsets.len and events.items.len < max_count) : (i += 1) {
+                const event = (try self.log.read(allocator, offsets[i])) orelse continue;
+                if (event.value.len == 0) {
+                    if (skipped < start) skipped += 1;
+                    store.freeEvent(allocator, event);
+                    continue;
+                }
+                if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
                 errdefer store.freeEvent(allocator, event);
                 try events.append(allocator, event);
             }

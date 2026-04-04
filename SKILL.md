@@ -45,6 +45,14 @@ ever sub agent.                           # prefix — all agent.* topics (no qu
 ever sub .                                # all topics (no quoting!)
 ever sub 'agent.*.complete'               # wildcard (needs shell quoting)
 ever sub agent.tasks --from 5 --max 10    # offset + limit
+ever sub agent.tasks --follow             # tail-f style: stream new events as they arrive
+ever sub agent.tasks --json-values        # output just the JSON value (no topic/offset wrapper)
+
+# Wait (blocking)
+ever wait agent.tasks                     # block until 1 event arrives (exit 0)
+ever wait agent.tasks --count 5           # block until 5 events arrive
+ever wait agent.tasks --timeout 30        # exit 1 if no events within 30s
+ever wait agent.tasks --count 3 --timeout 10  # both: 3 events or 10s timeout
 
 # Version
 ever version
@@ -60,6 +68,68 @@ The two most common patterns need NO shell quoting:
 | `agent.` | Everything under agent | Yes (trailing dot) |
 | `.` | All topics | Yes |
 | `agent.*.done` | Wildcard (one segment) | No (quote it) |
+
+## Streaming & Waiting
+
+### `ever sub --follow` — Tail-f Style Streaming
+
+Keeps the connection open and prints new events as they arrive, like `tail -f`:
+
+```bash
+# Stream all agent events in real time
+ever sub agent. --follow
+
+# Stream with just the JSON payloads (great for piping)
+ever sub task.results --follow --json-values
+```
+
+`--follow` never exits on its own — kill it with Ctrl-C or a signal. Useful for live monitoring, log tailing, and feeding events into another process.
+
+### `ever sub --json-values` — Raw JSON Output
+
+Strips the `[topic:offset]` wrapper and outputs just the event's JSON value, one per line:
+
+```bash
+# Normal output:
+ever sub task.build
+# [task.build:0] {"status":"complete","duration_ms":1234}
+
+# With --json-values:
+ever sub task.build --json-values
+# {"status":"complete","duration_ms":1234}
+```
+
+Useful for piping into `jq`, feeding into other tools, or when you only care about the payload.
+
+### `ever wait` — Block Until Events Arrive
+
+Blocks until the requested number of events appear, then exits. Exit code 0 means events arrived, exit code 1 means timeout:
+
+```bash
+# Wait for 1 event (blocks forever until it arrives)
+ever wait task.complete
+
+# Wait for 3 events, give up after 30 seconds
+ever wait task.complete --count 3 --timeout 30
+
+# Wait with offset (only count events from offset 10+)
+ever wait task.complete --from 10 --timeout 60
+
+# Wait and output just the JSON values
+ever wait task.complete --count 1 --timeout 10 --json-values
+```
+
+Use in scripts for synchronization:
+
+```bash
+# Wait for build to finish, then deploy
+if ever wait build.done --timeout 300; then
+  ./deploy.sh
+else
+  echo "Build timed out" >&2
+  exit 1
+fi
+```
 
 ## Agent Communication Patterns
 
@@ -86,7 +156,10 @@ Agent A completes work and signals Agent B via an event. Agent B watches for it:
 # Agent A finishes and publishes
 ever pub pipeline.stage1 '{"status":"done","output":"/tmp/result.json"}'
 
-# Agent B polls for the signal
+# Agent B blocks until the signal arrives (preferred over polling)
+ever wait pipeline.stage1 --timeout 60
+
+# Or poll for it (non-blocking)
 ever sub pipeline.stage1 --from 0 --max 1
 ```
 
@@ -179,6 +252,16 @@ ever hook add agent.build.complete -- ./deploy.sh
 # Register with prefix pattern
 ever hook add agent. -- ./log-agent.sh
 
+# One-shot hook: fires once then auto-removes itself
+ever hook add --once deploy.trigger -- ./deploy.sh
+# Output: Hook #3 registered (once)
+
+# Custom environment variables passed to the hook command
+ever hook add --env SLACK_CHANNEL=ops --env LOG_LEVEL=debug agent.errors -- ./notify.sh
+
+# Combine --once and --env
+ever hook add --once --env DEPLOY_ENV=staging deploy.trigger -- ./deploy.sh
+
 # List all hooks
 ever hook list
 # ID  Pattern                Command         Last Offset
@@ -190,6 +273,10 @@ ever hook rm 1
 ```
 
 Hooks run as fork/exec from the store's hook daemon thread. Same stdin/env vars as `ever on`.
+
+**`--once`**: The hook fires exactly once, then the store removes it automatically. Ideal for one-time triggers like "deploy when build finishes" without leaving stale hooks around.
+
+**`--env KEY=VAL`**: Pass custom environment variables to the hook command. Can be repeated. Keys must match `[A-Za-z_][A-Za-z0-9_]*`. These are available in the hook process alongside the standard `EVER_TOPIC`, `EVER_OFFSET`, `EVER_KEY`, and `EVER_TIMESTAMP` vars.
 
 ### When to use which
 
