@@ -1,0 +1,63 @@
+* Context Maintenance
+
+Context files are the project's institutional memory. They prevent the same corrections from being repeated across sessions. Update them as a final step of each task, alongside tests and builds.
+
+** When to Update
+
+After completing a task, ask: *"Did I learn something that a fresh session would get wrong?"*
+
+Triggers:
+- User corrected a design decision or approach
+- A pattern emerged that applies beyond this one task
+- An existing context entry was misleading or caused a wrong approach
+- A new module was added that needs its own patterns documented
+- A Zig v0.16 API difference was discovered the hard way
+
+Skip updating when the work was routine and followed existing patterns without friction.
+
+** What to Capture
+
+*Principles and "why"* — the reasoning behind decisions, so a fresh session can make the same judgment call in a new situation.
+
+*Patterns with scope* — reusable approaches, stated broadly enough to apply beyond the original context.
+
+*Constraints* — things that seem natural but are wrong for this project.
+
+Good:
+- "Shared log beats per-topic files — cross-topic queries go from N file reads to one sequential read"
+- "Shell-escape every string interpolated into a fork/exec command — topic names can contain characters that break quoting"
+- "Topic creation must write to the log — otherwise empty topics vanish on restart"
+
+Bad:
+- "Use =seg.positions.items[@intCast(local_idx)]= to look up file position"
+- "The =rebuildIndex= function in topic.zig scans from offset 0"
+
+The good examples state what to do and why. The bad examples reference specific code locations that will change — the code itself is the source of truth for those.
+
+** Where Learnings Go
+
+| Learning type                              | Destination                 |
+|--------------------------------------------+-----------------------------|
+| Zig v0.16 API differences and idioms       | =implementation-guide.org=  |
+| Architectural decisions and their rationale | =architecture.org=          |
+| Storage, protocol, recovery patterns        | =architecture.org=          |
+| Air document format, states, tags           | =air-conventions.org=       |
+| Workflow rules (what agents must always do) | =AGENTS.md=                 |
+| CLI design, subscription patterns           | =interface-design.org=      |
+| Project overview, tech stack, structure     | =OVERVIEW.org=              |
+
+** How to Write Context Entries
+
+- *Be specific enough to verify* — "use =appendShellEscaped= for all strings in fork/exec commands" not "be careful with escaping"
+- *Include examples when the pattern is non-obvious* — examples are the most reliable way to steer correct output
+- *State motivation* — explaining why a rule exists helps generalize it to new situations
+- *Keep entries independent* — each bullet should make sense without reading the others
+- *Remove entries that no longer apply* — stale guidance is worse than no guidance (the per-topic architecture notes were actively misleading after the shared log rewrite)
+
+** Multi-Agent Session Learnings
+
+When spawning agents via Chronoa for implementation or review:
+- Capture reviewer findings in the relevant context file, not just in the review output
+- If an agent hits a Zig v0.16 API issue, add it to the "Zig v0.16 API Notes" in =implementation-guide.org=
+- If an agent discovers a race condition or safety issue, add the fix pattern to "Architectural Learnings"
+- Security findings (injection, escaping, TOCTOU) should be captured as concrete rules, not just "be careful"

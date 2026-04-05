@@ -11,6 +11,7 @@ Review these files for project understanding:
 - ./air/context/architecture.org
 - ./air/context/implementation-guide.org
 - ./air/context/interface-design.org
+- ./air/context/context-maintenance.org
 
 ## Planning Documents
 For detailed specifications, browse the Air directory structure:
