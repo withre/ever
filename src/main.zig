@@ -1,195 +1,104 @@
 const std = @import("std");
 const ever = @import("ever");
+const cli = @import("cli.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
+/// Resolve store address from flags, env var, or default
+pub fn parseStoreAddress(ctx: *const cli.Context, env_block: [*:null]const ?[*:0]const u8) struct {
+    address: []const u8,
+    port: u16,
+} {
+    const default_addr = "127.0.0.1";
+    const default_port: u16 = 7890;
 
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
-    var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(allocator);
+    const flag_addr = ctx.flag("address");
+    const flag_port = ctx.flag("port");
 
-    while (args_iter.next()) |arg| {
-        try args_list.append(allocator, arg);
+    if (flag_addr.len > 0 and flag_port.len > 0) {
+        return .{
+            .address = flag_addr,
+            .port = std.fmt.parseInt(u16, flag_port, 10) catch default_port,
+        };
     }
 
-    const args = args_list.items;
-
-    if (args.len < 2) {
-        printUsage();
-        return;
-    }
-
-    const command = args[1];
-
-    if (std.mem.eql(u8, command, "version")) {
-        std.debug.print("ever 0.1.0\n", .{});
-    } else if (std.mem.eql(u8, command, "help")) {
-        printUsage();
-    } else if (std.mem.eql(u8, command, "store")) {
-        try handleStore(allocator, io, args[2..], init.minimal.environ.block.slice.ptr);
-    } else if (std.mem.eql(u8, command, "topic")) {
-        try handleTopic(allocator, io, args[2..]);
-    } else if (std.mem.eql(u8, command, "pub")) {
-        try handlePub(allocator, io, args[2..]);
-    } else if (std.mem.eql(u8, command, "sub")) {
-        try handleSub(allocator, io, args[2..]);
-    } else if (std.mem.eql(u8, command, "wait")) {
-        handleWait(allocator, io, args[2..]);
-    } else if (std.mem.eql(u8, command, "on")) {
-        try handleOn(allocator, io, args[2..], init.minimal.environ.block.slice.ptr);
-    } else if (std.mem.eql(u8, command, "hook")) {
-        try handleHook(allocator, io, args[2..]);
-    } else {
-        std.process.fatal("unknown command '{s}'. Run 'ever help' for usage.", .{command});
-    }
-}
-
-fn handleStore(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp: [*:null]const ?[*:0]const u8) !void {
-    if (args.len < 1) std.process.fatal("missing subcommand. Usage: ever store <start>", .{});
-    if (std.mem.eql(u8, args[0], "start")) {
-        try startServer(allocator, io, args[1..], envp);
-    } else {
-        std.process.fatal("unknown store subcommand '{s}'.", .{args[0]});
-    }
-}
-
-fn startServer(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp: [*:null]const ?[*:0]const u8) !void {
-    var address: []const u8 = "127.0.0.1";
-    var port: u16 = 7890;
-    var data_dir: []const u8 = "./data";
-
+    // Check EVER_ADDR env var
     var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--address") and i + 1 < args.len) {
-            i += 1; address = args[i];
-        } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            i += 1; port = std.fmt.parseInt(u16, args[i], 10) catch std.process.fatal("invalid port '{s}'.", .{args[i]});
-        } else if (std.mem.eql(u8, args[i], "--data-dir") and i + 1 < args.len) {
-            i += 1; data_dir = args[i];
+    while (env_block[i]) |env_str| : (i += 1) {
+        const len = std.mem.indexOfSentinel(u8, 0, env_str);
+        if (std.mem.startsWith(u8, env_str[0..len], "EVER_ADDR=")) {
+            const value = env_str[10..len];
+            if (std.mem.indexOfScalar(u8, value, ':')) |colon_pos| {
+                const addr = value[0..colon_pos];
+                const port_str = value[colon_pos + 1 ..];
+                const port = std.fmt.parseInt(u16, port_str, 10) catch default_port;
+                return .{ .address = addr, .port = port };
+            }
         }
     }
 
-    const dir = Dir.cwd().createDirPathOpen(io, data_dir, .{ .open_options = .{ .iterate = true } }) catch
-        std.process.fatal("cannot open data directory '{s}'.", .{data_dir});
-
-    // Acquire exclusive lockfile to prevent multiple stores on same data dir
-    const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
-        std.process.fatal("cannot create lockfile in '{s}'.", .{data_dir});
-    defer lock_file.close(io);
-
-    const LOCK_EX = 2;
-    const LOCK_NB = 4;
-    const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
-    if (lock_result != 0) {
-        std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{data_dir});
-    }
-
-    var topic_manager = try ever.topic.TopicManager.init(allocator, io, dir, .{});
-    defer topic_manager.deinit();
-
-    // Initialize hook table
-    var hook_table = try ever.hooks.HookTable.init(allocator, data_dir);
-    defer hook_table.deinit();
-
-    var server = try ever.net.Server.init(allocator, io, &topic_manager, .{ .address = address, .port = port });
-    defer server.deinit();
-    server.setHookTable(&hook_table);
-
-    // Start hook daemon
-    var hook_daemon = ever.hooks.HookDaemon.init(allocator, &hook_table, &topic_manager, envp);
-    hook_daemon.start() catch |err| {
-        std.debug.print("Warning: failed to start hook daemon: {}\n", .{err});
+    return .{
+        .address = if (flag_addr.len > 0) flag_addr else default_addr,
+        .port = if (flag_port.len > 0) std.fmt.parseInt(u16, flag_port, 10) catch default_port else default_port,
     };
-    defer hook_daemon.stop();
-
-    std.debug.print("Ever store listening on {s}:{d}\n", .{ address, port });
-    std.debug.print("Data directory: {s}\n", .{data_dir});
-    std.debug.print("Hook daemon started.\n", .{});
-    std.debug.print("Press Ctrl-C to stop.\n", .{});
-    server.run() catch |err| std.process.fatal("server failed: {}", .{err});
 }
 
-fn handleTopic(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
-    if (args.len < 1) std.process.fatal("usage: ever topic <create|list|delete> [name]", .{});
-    const sub = args[0];
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
+fn handlePub(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
 
-    if (std.mem.eql(u8, sub, "create")) {
-        if (args.len < 2) std.process.fatal("usage: ever topic create <name>", .{});
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        try c.createTopic(args[1]);
-        std.debug.print("Created topic: {s}\n", .{args[1]});
-    } else if (std.mem.eql(u8, sub, "list")) {
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        const topics = try c.listTopics();
-        defer { for (topics) |t| allocator.free(t); allocator.free(topics); }
-        if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
-    } else if (std.mem.eql(u8, sub, "delete")) {
-        if (args.len < 2) std.process.fatal("usage: ever topic delete <name>", .{});
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        try c.deleteTopic(args[1]);
-        std.debug.print("Deleted topic: {s}\n", .{args[1]});
-    } else std.process.fatal("unknown topic subcommand '{s}'.", .{sub});
-}
+    const topic = ctx.arg("topic");
+    const data = ctx.arg("data");
 
-fn handlePub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
-    if (args.len < 2) std.process.fatal("usage: ever pub <topic> <data>", .{});
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
-    var c = try ever.client.Client.connect(allocator, io, address, port);
-    defer c.deinit();
-    const offset = try c.publish(args[0], null, args[1]);
-    std.debug.print("Published to {s} at offset {d}\n", .{ args[0], offset });
-}
-
-fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
-    if (args.len < 1) std.process.fatal("usage: ever sub <topic> [--from <offset>] [--max <count>] [--follow] [--json-values]", .{});
-    const topic_name = args[0];
-    var from_offset: u64 = 0;
-    var max_count: u32 = 100;
-    var follow = false;
-    var json_values = false;
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--from") and i + 1 < args.len) {
-            i += 1; from_offset = std.fmt.parseInt(u64, args[i], 10) catch std.process.fatal("invalid offset.", .{});
-        } else if (std.mem.eql(u8, args[i], "--max") and i + 1 < args.len) {
-            i += 1; max_count = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid count.", .{});
-        } else if (std.mem.eql(u8, args[i], "--follow")) {
-            follow = true;
-        } else if (std.mem.eql(u8, args[i], "--json-values")) {
-            json_values = true;
-        }
+    if (topic.len == 0) {
+        std.debug.print("error: topic is required\n", .{});
+        std.process.exit(1);
+    }
+    if (data.len == 0) {
+        std.debug.print("error: data is required\n", .{});
+        std.process.exit(1);
     }
 
-    var client = try ever.client.Client.connect(allocator, io, address, port);
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    const offset = try c.publish(topic, null, data);
+    std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
+}
+
+fn handleSub(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+
+    const topic_name = ctx.arg("topic");
+    if (topic_name.len == 0) {
+        std.debug.print("error: topic is required\n", .{});
+        std.process.exit(1);
+    }
+
+    const from_offset = ctx.flagInt(u64, "from");
+    const max_count = ctx.flagInt(u32, "max");
+    const follow = ctx.flagBool("follow");
+    const json_values = ctx.flagBool("json-values");
+
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+
+    var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
         (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
     if (follow) {
-        // --follow mode: initial fetch then loop with blocking
         var offset = from_offset;
         var did_initial = false;
-
         while (true) {
             var result = if (!did_initial)
-                // Initial non-blocking fetch
                 (if (is_pattern) try client.fetchPattern(topic_name, offset, max_count) else try client.fetch(topic_name, offset, max_count))
             else
-                // Blocking fetch for new events
                 try client.fetchBlocking(
                     if (!is_pattern) topic_name else null,
                     if (is_pattern) topic_name else null,
@@ -198,73 +107,41 @@ fn handleSub(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !vo
                     5000,
                 );
             defer result.deinit();
-
-            for (result.events) |event| {
-                printEvent(event, json_values);
-            }
-
-            if (result.events.len > 0) {
-                offset += result.events.len;
-            }
+            for (result.events) |event| printEvent(event, json_values);
+            if (result.events.len > 0) offset += result.events.len;
             did_initial = true;
         }
     } else {
-        // One-shot fetch (original behavior)
         var result = if (is_pattern) try client.fetchPattern(topic_name, from_offset, max_count) else try client.fetch(topic_name, from_offset, max_count);
         defer result.deinit();
-
         if (result.events.len == 0) {
             std.debug.print("No events.\n", .{});
         } else {
-            for (result.events) |event| {
-                printEvent(event, json_values);
-            }
+            for (result.events) |event| printEvent(event, json_values);
         }
     }
 }
 
-fn printEvent(event: ever.client.Event, json_values: bool) void {
-    if (json_values) {
-        std.debug.print("{s}\n", .{event.value});
-    } else {
-        const t = if (event.topic) |tp| tp else "";
-        if (t.len > 0) {
-            if (event.key) |k| std.debug.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value })
-            else std.debug.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
-        } else {
-            if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
-            else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
-        }
-    }
-}
+fn handleWait(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
 
-// ── ever wait ────────────────────────────────────────────────────────────────
-
-fn handleWait(allocator: std.mem.Allocator, io: Io, args: []const []const u8) void {
-    if (args.len < 1) std.process.fatal("usage: ever wait <topic> [--count <n>] [--timeout <seconds>] [--from <offset>] [--json-values]", .{});
-    const topic_name = args[0];
-    var count: u32 = 1;
-    var timeout_secs: u32 = 0; // 0 = no timeout
-    var from_offset: u64 = 0;
-    var json_values = false;
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--count") and i + 1 < args.len) {
-            i += 1; count = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid count.", .{});
-        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
-            i += 1; timeout_secs = std.fmt.parseInt(u32, args[i], 10) catch std.process.fatal("invalid timeout.", .{});
-        } else if (std.mem.eql(u8, args[i], "--from") and i + 1 < args.len) {
-            i += 1; from_offset = std.fmt.parseInt(u64, args[i], 10) catch std.process.fatal("invalid offset.", .{});
-        } else if (std.mem.eql(u8, args[i], "--json-values")) {
-            json_values = true;
-        }
+    const topic_name = ctx.arg("topic");
+    if (topic_name.len == 0) {
+        std.debug.print("error: topic is required\n", .{});
+        std.process.exit(1);
     }
 
-    var client = ever.client.Client.connect(allocator, io, address, port) catch
-        std.process.fatal("cannot connect to store at {s}:{d}.", .{ address, port });
+    const count = ctx.flagInt(u32, "count");
+    const timeout_secs = ctx.flagInt(u32, "timeout");
+    const from_offset = ctx.flagInt(u64, "from");
+    const json_values = ctx.flagBool("json-values");
+
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+
+    var client = ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port) catch
+        std.process.fatal("cannot connect to store at {s}:{d}.", .{ addr_info.address, addr_info.port });
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
@@ -274,21 +151,14 @@ fn handleWait(allocator: std.mem.Allocator, io: Io, args: []const []const u8) vo
     var offset = from_offset;
     var elapsed_ms: u64 = 0;
     const timeout_ms: u64 = @as(u64, timeout_secs) * 1000;
-    const block_interval_ms: u32 = 2000; // 2s blocking intervals
+    const block_interval_ms: u32 = 2000;
 
     while (collected < count) {
-        // Check timeout
-        if (timeout_secs > 0 and elapsed_ms >= timeout_ms) {
-            // Timeout — exit with code 1
-            std.process.exit(1);
-        }
-
-        // Calculate remaining time for this block
+        if (timeout_secs > 0 and elapsed_ms >= timeout_ms) std.process.exit(1);
         const remaining_ms: u32 = if (timeout_secs > 0)
             @intCast(@min(block_interval_ms, timeout_ms - elapsed_ms))
         else
             block_interval_ms;
-
         var result = client.fetchBlocking(
             if (!is_pattern) topic_name else null,
             if (is_pattern) topic_name else null,
@@ -297,76 +167,56 @@ fn handleWait(allocator: std.mem.Allocator, io: Io, args: []const []const u8) vo
             remaining_ms,
         ) catch std.process.fatal("fetch failed.", .{});
         defer result.deinit();
-
         for (result.events) |event| {
             printEvent(event, json_values);
             collected += 1;
         }
-
-        if (result.events.len > 0) {
-            offset += result.events.len;
-        }
-
+        if (result.events.len > 0) offset += result.events.len;
         elapsed_ms += remaining_ms;
     }
-
-    // Success — all events arrived, exit 0
 }
 
-// ── ever on ─────────────────────────────────────────────────────────────────
+fn handleOn(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+    const envp: [*:null]const ?[*:0]const u8 = undefined;
 
-fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp: [*:null]const ?[*:0]const u8) !void {
-    var pattern: ?[]const u8 = null;
-    var once = false;
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
+    const pattern = ctx.arg("pattern");
+    const once = ctx.flagBool("once");
+    const cmd = ctx.flag("cmd");
 
-    // Find "--" separator
-    var cmd_start: ?usize = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--")) {
-            cmd_start = i + 1;
-            break;
-        } else if (std.mem.eql(u8, args[i], "--once")) {
-            once = true;
-        } else if (pattern == null) {
-            pattern = args[i];
-        }
+    if (pattern.len == 0) {
+        std.debug.print("error: pattern is required\n", .{});
+        std.process.exit(1);
+    }
+    if (cmd.len == 0) {
+        std.debug.print("error: command is required after --\n", .{});
+        std.process.exit(1);
     }
 
-    if (pattern == null)
-        std.process.fatal("usage: ever on <pattern> [--once] -- <command> [args...]", .{});
-    if (cmd_start == null or cmd_start.? >= args.len)
-        std.process.fatal("missing command after '--'.", .{});
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+    const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
+        (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
-    const cmd_args = args[cmd_start.?..];
-    const topic_pattern = pattern.?;
-
-    const is_pattern = std.mem.indexOfScalar(u8, topic_pattern, '*') != null or
-        (topic_pattern.len > 0 and topic_pattern[topic_pattern.len - 1] == '.');
-
-    // Connect and probe for current offset (start from latest)
-    var client = try ever.client.Client.connect(allocator, io, address, port);
+    var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
 
-    // Probe: fetch existing events to find the current end offset
     var probe = if (is_pattern)
-        try client.fetchBlocking(null, topic_pattern, 0, 1_000_000, 0)
+        try client.fetchBlocking(null, pattern, 0, 1_000_000, 0)
     else
-        try client.fetchBlocking(topic_pattern, null, 0, 1_000_000, 0);
+        try client.fetchBlocking(pattern, null, 0, 1_000_000, 0);
     const next_offset: u64 = probe.events.len;
     probe.deinit();
 
-    std.debug.print("Watching '{s}' from offset {d}...\n", .{ topic_pattern, next_offset });
+    std.debug.print("Watching '{s}' from offset {d}...\n", .{ pattern, next_offset });
 
-    // Main loop
     var offset = next_offset;
     while (true) {
         var result = if (is_pattern)
-            try client.fetchBlocking(null, topic_pattern, offset, 100, 5000)
+            try client.fetchBlocking(null, pattern, offset, 100, 5000)
         else
-            try client.fetchBlocking(topic_pattern, null, offset, 100, 5000);
+            try client.fetchBlocking(pattern, null, offset, 100, 5000);
         defer result.deinit();
 
         if (result.events.len == 0) {
@@ -375,17 +225,14 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
         }
 
         for (result.events) |event| {
-            // Build JSON for stdin
             const json = try buildEventJson(allocator, event);
             defer allocator.free(json);
 
-            // Build env strings
             var offset_buf: [20]u8 = undefined;
             const offset_str = std.fmt.bufPrint(&offset_buf, "{d}", .{event.offset}) catch "0";
             var ts_buf: [20]u8 = undefined;
             const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{event.timestamp}) catch "0";
 
-            // Build shell command: env vars + user command
             var shell_cmd: std.ArrayList(u8) = .empty;
             defer shell_cmd.deinit(allocator);
 
@@ -398,8 +245,15 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
             try shell_cmd.appendSlice(allocator, "' EVER_KEY='");
             if (event.key) |k| try appendShellEscaped(&shell_cmd, allocator, k);
             try shell_cmd.appendSlice(allocator, "' exec ");
-            for (cmd_args) |arg| {
-                // Shell-escape each argument
+
+            var cmd_list: std.ArrayList([]const u8) = .empty;
+            defer cmd_list.deinit(allocator);
+            var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
+            while (cmd_iter.next()) |arg| {
+                if (arg.len > 0) try cmd_list.append(allocator, arg);
+            }
+
+            for (cmd_list.items) |arg| {
                 try shell_cmd.append(allocator, '\'');
                 for (arg) |c| {
                     if (c == '\'') {
@@ -411,8 +265,6 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
                 try shell_cmd.appendSlice(allocator, "' ");
             }
 
-            // Write JSON to a PID-specific temp file for stdin.
-            // Use unlink+O_CREAT|O_EXCL|O_NOFOLLOW to prevent symlink attacks.
             const my_pid = std.os.linux.getpid();
             var stdin_path_buf: [64]u8 = undefined;
             const stdin_path = std.fmt.bufPrint(&stdin_path_buf, "/tmp/.ever-on-stdin-{d}", .{my_pid}) catch "/tmp/.ever-on-stdin";
@@ -434,11 +286,9 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
                 }
             }
 
-            // Execute: sh -c '<env> <cmd>' < /tmp/.ever-on-stdin-<pid>
             const full_cmd = try std.fmt.allocPrint(allocator, "{s}< {s}", .{ shell_cmd.items, stdin_path });
             defer allocator.free(full_cmd);
 
-            // Use fork+exec /bin/sh -c
             const pid = std.os.linux.fork();
             const pid_i: isize = @bitCast(pid);
 
@@ -448,30 +298,259 @@ fn handleOn(allocator: std.mem.Allocator, io: Io, args: []const []const u8, envp
             }
 
             if (pid_i == 0) {
-                // Child: exec sh -c '<command>'
                 const sh: [*:0]const u8 = "/bin/sh";
                 const dash_c: [*:0]const u8 = "-c";
-
-                // Null-terminate the command
                 const cmd_z = allocator.allocSentinel(u8, full_cmd.len, 0) catch std.os.linux.exit(127);
                 @memcpy(cmd_z[0..full_cmd.len], full_cmd);
-
                 const argv = [_]?[*:0]const u8{ sh, dash_c, cmd_z.ptr, null };
                 _ = std.os.linux.execve(sh, @ptrCast(&argv), envp);
                 std.os.linux.exit(127);
             }
 
-            // Parent: wait for child
             var status: u32 = 0;
             _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
             const exit_code = (status >> 8) & 0xFF;
             if (exit_code != 0) {
-                std.debug.print("Command exited with status {d} for event on '{s}'\n", .{ exit_code, if (event.topic) |t| t else topic_pattern });
+                std.debug.print("Command exited with status {d} for event on '{s}'\n", .{ exit_code, if (event.topic) |t| t else pattern });
             }
         }
 
         offset += result.events.len;
         if (once) break;
+    }
+}
+
+fn handleTopic(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+
+    const sub = ctx.arg("subcommand");
+    const name = ctx.arg("name");
+
+    if (sub.len == 0) {
+        std.debug.print("error: subcommand is required (create|list|delete)\n", .{});
+        std.process.exit(1);
+    }
+
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+
+    if (std.mem.eql(u8, sub, "create")) {
+        if (name.len == 0) {
+            std.debug.print("error: topic name is required\n", .{});
+            std.process.exit(1);
+        }
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        try c.createTopic(name);
+        std.debug.print("Created topic: {s}\n", .{name});
+    } else if (std.mem.eql(u8, sub, "list")) {
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        const topics = try c.listTopics();
+        defer {
+            for (topics) |t| allocator.free(t);
+            allocator.free(topics);
+        }
+        if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
+    } else if (std.mem.eql(u8, sub, "delete")) {
+        if (name.len == 0) {
+            std.debug.print("error: topic name is required\n", .{});
+            std.process.exit(1);
+        }
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        try c.deleteTopic(name);
+        std.debug.print("Deleted topic: {s}\n", .{name});
+    } else {
+        std.debug.print("error: unknown topic subcommand\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn handleHook(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+
+    const sub = ctx.arg("subcommand");
+
+    if (sub.len == 0) {
+        std.debug.print("error: subcommand is required (add|list|rm)\n", .{});
+        std.process.exit(1);
+    }
+
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+
+    if (std.mem.eql(u8, sub, "add")) {
+        const pattern = ctx.arg("pattern");
+        const once = ctx.flagBool("once");
+        const cmd = ctx.flag("cmd");
+
+        if (pattern.len == 0) {
+            std.debug.print("error: pattern is required\n", .{});
+            std.process.exit(1);
+        }
+        if (cmd.len == 0) {
+            std.debug.print("error: command is required after --\n", .{});
+            std.process.exit(1);
+        }
+
+        var cmd_list: std.ArrayList([]const u8) = .empty;
+        defer cmd_list.deinit(allocator);
+        var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
+        while (cmd_iter.next()) |arg| {
+            if (arg.len > 0) try cmd_list.append(allocator, arg);
+        }
+
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd_z: [*:0]const u8 = "/proc/self/cwd";
+        const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
+        const cwd_i: isize = @bitCast(cwd_len);
+        const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
+
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
+
+        var cmd_display: std.ArrayList(u8) = .empty;
+        defer cmd_display.deinit(allocator);
+        for (cmd_list.items, 0..) |arg, j| {
+            if (j > 0) try cmd_display.append(allocator, ' ');
+            try cmd_display.appendSlice(allocator, arg);
+        }
+        if (once) {
+            std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern, cmd_display.items });
+        } else {
+            std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern, cmd_display.items });
+        }
+    } else if (std.mem.eql(u8, sub, "list")) {
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        var result = try c.listHooks();
+        defer result.deinit();
+
+        if (result.hooks.len == 0) {
+            std.debug.print("No hooks registered.\n", .{});
+        } else {
+            std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
+            for (result.hooks) |hook| {
+                var cmd_display: std.ArrayList(u8) = .empty;
+                defer cmd_display.deinit(allocator);
+                for (hook.command, 0..) |arg, j| {
+                    if (j > 0) try cmd_display.append(allocator, ' ');
+                    try cmd_display.appendSlice(allocator, arg);
+                }
+
+                var id_buf: [20]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
+                var cursor_buf: [20]u8 = undefined;
+                const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
+
+                std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
+                    id_str,
+                    hook.pattern,
+                    cmd_display.items,
+                    cursor_str,
+                });
+            }
+        }
+    } else if (std.mem.eql(u8, sub, "rm")) {
+        const id_str = ctx.arg("id");
+        if (id_str.len == 0) {
+            std.debug.print("error: hook ID is required\n", .{});
+            std.process.exit(1);
+        }
+        const id = std.fmt.parseInt(u64, id_str, 10) catch
+            std.process.fatal("invalid hook ID '{s}'.", .{id_str});
+
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        try c.removeHook(id);
+        std.debug.print("Hook #{d} removed.\n", .{id});
+    } else {
+        std.debug.print("error: unknown hook subcommand\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn handleStore(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+    const envp: [*:null]const ?[*:0]const u8 = undefined;
+
+    const sub = ctx.arg("subcommand");
+
+    if (sub.len == 0) {
+        std.debug.print("error: subcommand is required (start)\n", .{});
+        std.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, sub, "start")) {
+        try startServer(allocator, io, ctx, envp);
+    } else {
+        std.debug.print("error: unknown store subcommand\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, envp: [*:null]const ?[*:0]const u8) !void {
+    const address = ctx.flag("address");
+    const port_str = ctx.flag("port");
+    const data_dir = ctx.flag("data-dir");
+
+    const port = std.fmt.parseInt(u16, port_str, 10) catch 7890;
+    const actual_data_dir = if (data_dir.len > 0) data_dir else "./data";
+
+    const dir = Dir.cwd().createDirPathOpen(io, actual_data_dir, .{ .open_options = .{ .iterate = true } }) catch
+        std.process.fatal("cannot open data directory '{s}'.", .{actual_data_dir});
+
+    const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
+        std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir});
+    defer lock_file.close(io);
+
+    const LOCK_EX = 2;
+    const LOCK_NB = 4;
+    const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
+    if (lock_result != 0) {
+        std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir});
+    }
+
+    var topic_manager = try ever.topic.TopicManager.init(allocator, io, dir, .{});
+    defer topic_manager.deinit();
+
+    var hook_table = try ever.hooks.HookTable.init(allocator, actual_data_dir);
+    defer hook_table.deinit();
+
+    var server = try ever.net.Server.init(allocator, io, &topic_manager, .{ .address = if (address.len > 0) address else "127.0.0.1", .port = port });
+    defer server.deinit();
+    server.setHookTable(&hook_table);
+
+    var hook_daemon = ever.hooks.HookDaemon.init(allocator, &hook_table, &topic_manager, envp);
+    hook_daemon.start() catch |err| {
+        std.debug.print("Warning: failed to start hook daemon: {}\n", .{err});
+    };
+    defer hook_daemon.stop();
+
+    std.debug.print("Ever store listening on {s}:{d}\n", .{ if (address.len > 0) address else "127.0.0.1", port });
+    std.debug.print("Data directory: {s}\n", .{actual_data_dir});
+    std.debug.print("Hook daemon started.\n", .{});
+    std.debug.print("Press Ctrl-C to stop.\n", .{});
+    server.run() catch |err| std.process.fatal("server failed: {}", .{err});
+}
+
+fn printEvent(event: ever.client.Event, json_values: bool) void {
+    if (json_values) {
+        std.debug.print("{s}\n", .{event.value});
+    } else {
+        const t = if (event.topic) |tp| tp else "";
+        if (t.len > 0) {
+            if (event.key) |k| std.debug.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value })
+            else std.debug.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
+        } else {
+            if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
+            else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+        }
     }
 }
 
@@ -504,7 +583,6 @@ fn buildEventJson(allocator: std.mem.Allocator, event: ever.client.Event) ![]u8 
     return json.toOwnedSlice(allocator);
 }
 
-/// Append a string to the JSON buffer with proper escaping for all control characters.
 fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| switch (c) {
         '"' => try json.appendSlice(allocator, "\\\""),
@@ -516,7 +594,6 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: std.mem.Allocator, s: 
         0x0C => try json.appendSlice(allocator, "\\f"),
         else => {
             if (c < 0x20) {
-                // Escape other control characters as \u00XX
                 var buf: [6]u8 = undefined;
                 _ = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
                 try json.appendSlice(allocator, &buf);
@@ -527,7 +604,6 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: std.mem.Allocator, s: 
     };
 }
 
-/// Append a string with single-quote escaping for safe shell interpolation.
 fn appendShellEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| {
         if (c == '\'') {
@@ -538,140 +614,185 @@ fn appendShellEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s:
     }
 }
 
-// ── ever hook ────────────────────────────────────────────────────────────────
+const app = cli.App{
+    .name = "ever",
+    .description = "lightweight event storage",
+    .version = "0.1.0",
+    .help_sections = &.{
+        .{ .title = "Event Commands", .commands = &.{ "pub", "sub", "wait", "on" } },
+        .{ .title = "Store Management", .commands = &.{ "store start" } },
+        .{ .title = "Topics", .commands = &.{ "topic create", "topic list", "topic delete" } },
+        .{ .title = "Hooks", .commands = &.{ "hook add", "hook list", "hook rm" } },
+        .{ .title = "Information", .commands = &.{ "version", "help" } },
+    },
+    .commands = &.{
+        .{
+            .name = "pub",
+            .description = "Publish an event",
+            .args = &.{
+                .{ .name = "topic", .required = true, .description = "Topic name" },
+                .{ .name = "data", .required = true, .description = "JSON event data" },
+            },
+            .flags = &.{
+                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+            },
+            .run = handlePub,
+        },
+        .{
+            .name = "sub",
+            .description = "Subscribe to events",
+            .args = &.{
+                .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
+            },
+            .flags = &.{
+                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                .{ .name = "from", .default = "0", .description = "Start offset" },
+                .{ .name = "max", .default = "100", .description = "Max events" },
+                .{ .name = "follow", .description = "Follow new events" },
+                .{ .name = "json-values", .description = "Print only JSON values" },
+            },
+            .run = handleSub,
+        },
+        .{
+            .name = "wait",
+            .description = "Block until events arrive",
+            .args = &.{
+                .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
+            },
+            .flags = &.{
+                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                .{ .name = "count", .default = "1", .description = "Events to wait for" },
+                .{ .name = "timeout", .default = "0", .description = "Timeout in seconds" },
+                .{ .name = "from", .default = "0", .description = "Start offset" },
+                .{ .name = "json-values", .description = "Print only JSON values" },
+            },
+            .run = handleWait,
+        },
+        .{
+            .name = "on",
+            .description = "Watch events and run command",
+            .args = &.{
+                .{ .name = "pattern", .required = true, .description = "Topic pattern" },
+            },
+            .flags = &.{
+                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                .{ .name = "once", .description = "Exit after first event" },
+                .{ .name = "cmd", .description = "Command to execute" },
+            },
+            .run = handleOn,
+        },
+        .{
+            .name = "topic",
+            .description = "Manage topics",
+            .subcommands = &.{
+                .{
+                    .name = "create",
+                    .description = "Create a new topic",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTopic,
+                },
+                .{
+                    .name = "list",
+                    .description = "List all topics",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTopic,
+                },
+                .{
+                    .name = "delete",
+                    .description = "Delete a topic",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTopic,
+                },
+            },
+        },
+        .{
+            .name = "hook",
+            .description = "Manage server-side hooks",
+            .subcommands = &.{
+                .{
+                    .name = "add",
+                    .description = "Register a server-side hook",
+                    .args = &.{.{ .name = "pattern", .required = true, .description = "Topic pattern" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                        .{ .name = "once", .description = "Remove after first trigger" },
+                        .{ .name = "cmd", .description = "Command to execute" },
+                    },
+                    .run = handleHook,
+                },
+                .{
+                    .name = "list",
+                    .description = "List registered hooks",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleHook,
+                },
+                .{
+                    .name = "rm",
+                    .description = "Remove a hook by ID",
+                    .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleHook,
+                },
+            },
+        },
+        .{
+            .name = "store",
+            .description = "Manage the storage server",
+            .subcommands = &.{
+                .{
+                    .name = "start",
+                    .description = "Start the storage server",
+                    .flags = &.{
+                        .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
+                        .{ .name = "port", .default = "7890", .description = "Bind port" },
+                        .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                    },
+                    .run = handleStore,
+                },
+            },
+        },
+    },
+};
 
-fn handleHook(allocator: std.mem.Allocator, io: Io, args: []const []const u8) !void {
-    if (args.len < 1) std.process.fatal("usage: ever hook <add|list|rm> [args]", .{});
-    const sub = args[0];
-    const address = "127.0.0.1";
-    const port: u16 = 7890;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    if (std.mem.eql(u8, sub, "add")) {
-        // ever hook add <pattern> [--once] [--env KEY=VAL]... -- <cmd> [args...]
-        var pattern: ?[]const u8 = null;
-        var cmd_start: ?usize = null;
-        var once = false;
-        var env_list: std.ArrayList([]const u8) = .empty;
-        defer env_list.deinit(allocator);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(allocator);
 
-        var i: usize = 1;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--")) {
-                cmd_start = i + 1;
-                break;
-            } else if (std.mem.eql(u8, args[i], "--once")) {
-                once = true;
-            } else if (std.mem.eql(u8, args[i], "--env") and i + 1 < args.len) {
-                i += 1;
-                try env_list.append(allocator, args[i]);
-            } else if (pattern == null) {
-                pattern = args[i];
-            }
-        }
-
-        if (pattern == null) std.process.fatal("usage: ever hook add <pattern> [--once] [--env KEY=VAL] -- <command> [args...]", .{});
-        if (cmd_start == null or cmd_start.? >= args.len)
-            std.process.fatal("missing command after '--'.", .{});
-
-        const cmd_args = args[cmd_start.?..];
-
-        // Get current working directory
-        var cwd_buf: [4096]u8 = undefined;
-        const cwd_z: [*:0]const u8 = "/proc/self/cwd";
-        const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
-        const cwd_i: isize = @bitCast(cwd_len);
-        const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
-
-        const env_slice: ?[]const []const u8 = if (env_list.items.len > 0) env_list.items else null;
-
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        const id = try c.registerHookFull(pattern.?, cmd_args, cwd, once, env_slice);
-
-        // Format command for display
-        var cmd_display: std.ArrayList(u8) = .empty;
-        defer cmd_display.deinit(allocator);
-        for (cmd_args, 0..) |arg, j| {
-            if (j > 0) try cmd_display.append(allocator, ' ');
-            try cmd_display.appendSlice(allocator, arg);
-        }
-        if (once) {
-            std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern.?, cmd_display.items });
-        } else {
-            std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern.?, cmd_display.items });
-        }
-    } else if (std.mem.eql(u8, sub, "list")) {
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        var result = try c.listHooks();
-        defer result.deinit();
-
-        if (result.hooks.len == 0) {
-            std.debug.print("No hooks registered.\n", .{});
-        } else {
-            std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
-            for (result.hooks) |hook| {
-                var cmd_display: std.ArrayList(u8) = .empty;
-                defer cmd_display.deinit(allocator);
-                for (hook.command, 0..) |arg, j| {
-                    if (j > 0) try cmd_display.append(allocator, ' ');
-                    try cmd_display.appendSlice(allocator, arg);
-                }
-
-                var id_buf: [20]u8 = undefined;
-                const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
-                var cursor_buf: [20]u8 = undefined;
-                const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
-
-                std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
-                    id_str,
-                    hook.pattern,
-                    cmd_display.items,
-                    cursor_str,
-                });
-            }
-        }
-    } else if (std.mem.eql(u8, sub, "rm")) {
-        if (args.len < 2) std.process.fatal("usage: ever hook rm <id>", .{});
-        const id = std.fmt.parseInt(u64, args[1], 10) catch
-            std.process.fatal("invalid hook ID '{s}'.", .{args[1]});
-
-        var c = try ever.client.Client.connect(allocator, io, address, port);
-        defer c.deinit();
-        try c.removeHook(id);
-        std.debug.print("Hook #{d} removed.\n", .{id});
-    } else {
-        std.process.fatal("unknown hook subcommand '{s}'. Use add, list, or rm.", .{sub});
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, arg);
     }
-}
 
-fn printUsage() void {
-    const usage =
-        \\Ever — lightweight event storage
-        \\
-        \\Usage: ever <command> [options]
-        \\
-        \\Commands:
-        \\  store start    Start the storage server
-        \\  topic create   Create a new topic
-        \\  topic list     List all topics
-        \\  topic delete   Delete a topic
-        \\  pub            Publish an event
-        \\  sub            Subscribe to events (--follow, --json-values)
-        \\  wait           Block until events arrive (--count, --timeout)
-        \\  on             Watch events and run command
-        \\  hook add       Register a server-side hook (--once, --env)
-        \\  hook list      List registered hooks
-        \\  hook rm        Remove a hook by ID
-        \\  version        Show version
-        \\  help           Show this help
-        \\
-        \\Run 'ever <command> --help' for more information.
-        \\
-    ;
-    std.debug.print("{s}", .{usage});
+    const env_block = init.minimal.environ.block.slice.ptr;
+    try app.run(allocator, io, args_list.items, env_block);
 }
 
 test "main module compiles" {
     _ = ever;
+    _ = cli;
 }
