@@ -26,6 +26,10 @@ pub const MessageType = enum(u8) {
     register_hook = 0x07,
     unregister_hook = 0x08,
     list_hooks = 0x09,
+    add_timer = 0x0A,
+    remove_timer = 0x0B,
+    list_timers = 0x0C,
+    timer_info = 0x0D,
 
     // Responses
     publish_ok = 0x81,
@@ -37,6 +41,10 @@ pub const MessageType = enum(u8) {
     register_hook_ok = 0x87,
     unregister_hook_ok = 0x88,
     list_hooks_ok = 0x89,
+    add_timer_ok = 0x8A,
+    remove_timer_ok = 0x8B,
+    list_timers_ok = 0x8C,
+    timer_info_ok = 0x8D,
 
     // Error
     error_response = 0xFF,
@@ -129,6 +137,44 @@ pub const HookInfo = struct {
 
 pub const ListHooksResponse = struct {
     hooks: []const HookInfo,
+};
+
+// --- Timer request/response types ---
+
+pub const AddTimerRequest = struct {
+    name: []const u8,
+    schedule_type: []const u8, // "interval" or "cron"
+    schedule_value: []const u8, // e.g. "5m" or "0 3 * * *"
+    topic: []const u8,
+    payload: []const u8 = "{}",
+    persistent: bool = true,
+};
+
+pub const RemoveTimerRequest = struct {
+    name: []const u8,
+};
+
+pub const TimerInfoRequest = struct {
+    name: []const u8,
+};
+
+pub const TimerInfoData = struct {
+    name: []const u8,
+    schedule: []const u8,
+    topic: []const u8,
+    payload: []const u8,
+    last_fired_at: i64,
+    fire_count: u64,
+    persistent: bool,
+    created_at: i64,
+};
+
+pub const ListTimersResponse = struct {
+    timers: []const TimerInfoData,
+};
+
+pub const TimerInfoResponse = struct {
+    timer: TimerInfoData,
 };
 
 // --- Encoding/Decoding ---
