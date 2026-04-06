@@ -483,6 +483,21 @@ fn handleStore(ctx: *const cli.Context) !void {
 
     if (std.mem.eql(u8, sub, "start")) {
         try startServer(allocator, io, ctx, envp);
+    } else if (std.mem.eql(u8, sub, "status")) {
+        const data_dir = ctx.flag("data-dir");
+        const json_output = ctx.flagBool("json");
+        const actual_dir = if (data_dir.len > 0) data_dir else "./data";
+
+        var store_status = ever.status.getStatus(allocator, io, actual_dir) catch |err| {
+            std.process.fatal("failed to get store status: {}", .{err});
+        };
+        defer store_status.deinit(allocator);
+
+        if (json_output) {
+            ever.status.printJson(&store_status, allocator);
+        } else {
+            ever.status.printHuman(&store_status);
+        }
     } else {
         std.debug.print("error: unknown store subcommand\n", .{});
         std.process.exit(1);
