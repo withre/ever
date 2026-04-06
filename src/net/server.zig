@@ -17,6 +17,9 @@ pub const Config = struct {
     max_connections: u32 = 1024,
 };
 
+/// Global server pointer for signal handler access.
+var global_server: ?*Server = null;
+
 pub const Server = struct {
     allocator: Allocator,
     io: Io,
@@ -82,10 +85,34 @@ pub const Server = struct {
         }
     }
 
-    /// Signal the server to stop accepting connections and close the listener.
+    /// Install SIGINT/SIGTERM handlers that trigger graceful shutdown.
+    pub fn installSignalHandlers(self: *Server) void {
+        global_server = self;
+        const act = std.os.linux.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.os.linux.sigemptyset(),
+            .flags = 0,
+        };
+        _ = std.os.linux.sigaction(.INT, &act, null);
+        _ = std.os.linux.sigaction(.TERM, &act, null);
+    }
+
+    /// Signal the server to stop accepting connections, close the listener,
+    /// and wait for in-flight connections to drain (up to 5 seconds).
     pub fn shutdown(self: *Server) void {
         self.shutdown_requested.store(true, .release);
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
+
+        // Wait for in-flight connections to finish (max 5 seconds)
+        var waited_ms: u32 = 0;
+        while (self.active_connections.load(.acquire) > 0 and waited_ms < 5000) {
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 100_000_000 }, null); // 100ms
+            waited_ms += 100;
+        }
+        const remaining = self.active_connections.load(.acquire);
+        if (remaining > 0) {
+            std.debug.print("Shutdown: {d} connections did not drain within 5s.\n", .{remaining});
+        }
     }
 
     fn handleConnection(self: *Server, stream: net.Stream) void {
@@ -288,6 +315,16 @@ pub const Server = struct {
         try protocol.writeFrame(fd, .list_hooks_ok, resp_body);
     }
 };
+
+fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
+    if (global_server) |s| {
+        s.shutdown_requested.store(true, .release);
+        // Close the listener to unblock accept(). The full drain
+        // happens in shutdown() which the main thread will reach
+        // after run() returns.
+        if (s.net_server) |*ns| { ns.deinit(s.io); s.net_server = null; }
+    }
+}
 
 fn sendError(allocator: Allocator, fd: std.posix.fd_t, code: u16, message: []const u8) !void {
     const body = try protocol.encodeBody(allocator, protocol.ErrorResponse{ .code = code, .message = message });

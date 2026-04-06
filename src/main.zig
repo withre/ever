@@ -265,47 +265,42 @@ fn handleOn(ctx: *const cli.Context) !void {
                 try shell_cmd.appendSlice(allocator, "' ");
             }
 
-            const my_pid = std.os.linux.getpid();
-            var stdin_path_buf: [64]u8 = undefined;
-            const stdin_path = std.fmt.bufPrint(&stdin_path_buf, "/tmp/.ever-on-stdin-{d}", .{my_pid}) catch "/tmp/.ever-on-stdin";
-            const stdin_path_z = allocator.allocSentinel(u8, stdin_path.len, 0) catch continue;
-            defer allocator.free(stdin_path_z);
-            @memcpy(stdin_path_z[0..stdin_path.len], stdin_path);
-            {
-                _ = std.os.linux.unlink(stdin_path_z.ptr);
-                const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{
-                    .ACCMODE = .WRONLY,
-                    .CREAT = true,
-                    .EXCL = true,
-                    .NOFOLLOW = true,
-                }, 0o600);
-                if (@as(isize, @bitCast(fd_rc)) >= 0) {
-                    const fd: i32 = @intCast(fd_rc);
-                    _ = std.os.linux.write(fd, json.ptr, json.len);
-                    _ = std.os.linux.close(fd);
-                }
-            }
+            const cmd_z = allocator.allocSentinel(u8, shell_cmd.items.len, 0) catch continue;
+            defer allocator.free(cmd_z);
+            @memcpy(cmd_z[0..shell_cmd.items.len], shell_cmd.items);
 
-            const full_cmd = try std.fmt.allocPrint(allocator, "{s}< {s}", .{ shell_cmd.items, stdin_path });
-            defer allocator.free(full_cmd);
+            var pipe_fds: [2]i32 = undefined;
+            const pipe_rc = std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
+            if (@as(isize, @bitCast(pipe_rc)) < 0) {
+                std.debug.print("pipe2 failed\n", .{});
+                continue;
+            }
 
             const pid = std.os.linux.fork();
             const pid_i: isize = @bitCast(pid);
 
             if (pid_i < 0) {
+                _ = std.os.linux.close(pipe_fds[0]);
+                _ = std.os.linux.close(pipe_fds[1]);
                 std.debug.print("fork failed\n", .{});
                 continue;
             }
 
             if (pid_i == 0) {
+                _ = std.os.linux.close(pipe_fds[1]);
+                _ = std.os.linux.dup2(pipe_fds[0], 0);
+                _ = std.os.linux.close(pipe_fds[0]);
+
                 const sh: [*:0]const u8 = "/bin/sh";
                 const dash_c: [*:0]const u8 = "-c";
-                const cmd_z = allocator.allocSentinel(u8, full_cmd.len, 0) catch std.os.linux.exit(127);
-                @memcpy(cmd_z[0..full_cmd.len], full_cmd);
                 const argv = [_]?[*:0]const u8{ sh, dash_c, cmd_z.ptr, null };
                 _ = std.os.linux.execve(sh, @ptrCast(&argv), envp);
                 std.os.linux.exit(127);
             }
+
+            _ = std.os.linux.close(pipe_fds[0]);
+            writeAllFd(pipe_fds[1], json);
+            _ = std.os.linux.close(pipe_fds[1]);
 
             var status: u32 = 0;
             _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
@@ -536,7 +531,13 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     std.debug.print("Data directory: {s}\n", .{actual_data_dir});
     std.debug.print("Hook daemon started.\n", .{});
     std.debug.print("Press Ctrl-C to stop.\n", .{});
-    server.run() catch |err| std.process.fatal("server failed: {}", .{err});
+    server.installSignalHandlers();
+    server.run() catch |err| {
+        if (!server.shutdown_requested.load(.acquire))
+            std.process.fatal("server failed: {}", .{err});
+    };
+    server.shutdown();
+    std.debug.print("Server shut down gracefully.\n", .{});
 }
 
 fn printEvent(event: ever.client.Event, json_values: bool) void {
@@ -551,6 +552,16 @@ fn printEvent(event: ever.client.Event, json_values: bool) void {
             if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
             else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
         }
+    }
+}
+
+fn writeAllFd(fd: i32, data: []const u8) void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = std.os.linux.write(fd, data[written..].ptr, data[written..].len);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break;
+        written += @intCast(n);
     }
 }
 

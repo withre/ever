@@ -608,54 +608,45 @@ pub const HookDaemon = struct {
             try shell_cmd.appendSlice(self.allocator, "' ");
         }
 
-        // Write JSON to PID-specific temp file for stdin.
-        // Use O_NOFOLLOW to prevent symlink attacks, and unlink-before-create
-        // to ensure we own the file.
-        const my_pid = std.os.linux.getpid();
-        var stdin_path_buf: [64]u8 = undefined;
-        const stdin_path = std.fmt.bufPrint(&stdin_path_buf, "/tmp/.ever-hook-stdin-{d}", .{my_pid}) catch "/tmp/.ever-hook-stdin";
-        const stdin_path_z = try self.allocator.allocSentinel(u8, stdin_path.len, 0);
-        defer self.allocator.free(stdin_path_z);
-        @memcpy(stdin_path_z[0..stdin_path.len], stdin_path);
-        {
-            // Remove any existing file/symlink first
-            _ = std.os.linux.unlink(stdin_path_z.ptr);
-            // O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW — create new file exclusively, refuse symlinks
-            const fd_rc = std.os.linux.open(stdin_path_z.ptr, .{
-                .ACCMODE = .WRONLY,
-                .CREAT = true,
-                .EXCL = true,
-                .NOFOLLOW = true,
-            }, 0o600);
-            const fd_i: isize = @bitCast(fd_rc);
-            if (fd_i >= 0) {
-                const tfd: i32 = @intCast(fd_rc);
-                _ = std.os.linux.write(tfd, json.ptr, json.len);
-                _ = std.os.linux.close(tfd);
-            }
-        }
+        // Null-terminate the shell command for execve
+        const cmd_z = try self.allocator.allocSentinel(u8, shell_cmd.items.len, 0);
+        defer self.allocator.free(cmd_z);
+        @memcpy(cmd_z[0..shell_cmd.items.len], shell_cmd.items);
 
-        const full_cmd = try std.fmt.allocPrint(self.allocator, "{s}< {s}", .{ shell_cmd.items, stdin_path });
-        defer self.allocator.free(full_cmd);
+        // Create pipe for stdin delivery
+        var pipe_fds: [2]i32 = undefined;
+        const pipe_rc = std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
+        if (@as(isize, @bitCast(pipe_rc)) < 0) return error.PipeFailed;
 
         // fork + exec
         const pid = std.os.linux.fork();
         const pid_i: isize = @bitCast(pid);
 
-        if (pid_i < 0) return error.ForkFailed;
+        if (pid_i < 0) {
+            _ = std.os.linux.close(pipe_fds[0]);
+            _ = std.os.linux.close(pipe_fds[1]);
+            return error.ForkFailed;
+        }
 
         if (pid_i == 0) {
-            // Child
+            // Child: redirect stdin from pipe read end
+            _ = std.os.linux.close(pipe_fds[1]); // close write end
+            _ = std.os.linux.dup2(pipe_fds[0], 0); // stdin = pipe read end
+            _ = std.os.linux.close(pipe_fds[0]);
+
             const sh: [*:0]const u8 = "/bin/sh";
             const dash_c: [*:0]const u8 = "-c";
-            const cmd_z = self.allocator.allocSentinel(u8, full_cmd.len, 0) catch std.os.linux.exit(127);
-            @memcpy(cmd_z[0..full_cmd.len], full_cmd);
             const argv = [_]?[*:0]const u8{ sh, dash_c, cmd_z.ptr, null };
             _ = std.os.linux.execve(sh, @ptrCast(&argv), self.envp);
             std.os.linux.exit(127);
         }
 
-        // Parent: wait
+        // Parent: write JSON to pipe write end, then close for EOF
+        _ = std.os.linux.close(pipe_fds[0]); // close read end
+        writeAllFd(pipe_fds[1], json);
+        _ = std.os.linux.close(pipe_fds[1]); // EOF for child's stdin
+
+        // Wait for child
         var status: u32 = 0;
         _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
         const exit_code = (status >> 8) & 0xFF;
@@ -664,6 +655,17 @@ pub const HookDaemon = struct {
         }
     }
 };
+
+/// Write all bytes to a raw file descriptor, retrying on partial writes.
+fn writeAllFd(fd: i32, data: []const u8) void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = std.os.linux.write(fd, data[written..].ptr, data[written..].len);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break;
+        written += @intCast(n);
+    }
+}
 
 /// Append a string with single-quote escaping for safe shell interpolation.
 /// Inside single quotes, the only character that needs escaping is the single quote itself.
