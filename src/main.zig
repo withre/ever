@@ -527,7 +527,37 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     };
     defer hook_daemon.stop();
 
+    // Start HTTP server unless --no-http
+    var http_server_inst: ?ever.http.HttpServer = null;
+    defer if (http_server_inst) |*hs| hs.deinit();
+
+    const http_port_str = ctx.flag("http-port");
+    const no_http = ctx.flagBool("no-http");
+    const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch 4280;
+
+    if (!no_http) {
+        http_server_inst = ever.http.HttpServer.init(allocator, io, &topic_manager, .{
+            .address = if (address.len > 0) address else "127.0.0.1",
+            .port = http_port,
+        });
+        if (std.Thread.spawn(.{}, struct {
+            fn run(hs: *ever.http.HttpServer) void {
+                hs.run() catch |err| {
+                    std.debug.print("HTTP server failed: {}\n", .{err});
+                };
+            }
+        }.run, .{&http_server_inst.?})) |http_thread| {
+            http_thread.detach();
+        } else |_| {
+            std.debug.print("Warning: failed to start HTTP server thread.\n", .{});
+            http_server_inst = null;
+        }
+    }
+
     std.debug.print("Ever store listening on {s}:{d}\n", .{ if (address.len > 0) address else "127.0.0.1", port });
+    if (!no_http) {
+        std.debug.print("HTTP API listening on {s}:{d}\n", .{ if (address.len > 0) address else "127.0.0.1", http_port });
+    }
     std.debug.print("Data directory: {s}\n", .{actual_data_dir});
     std.debug.print("Hook daemon started.\n", .{});
     std.debug.print("Press Ctrl-C to stop.\n", .{});
