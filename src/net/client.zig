@@ -133,7 +133,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .publish_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.PublishResponse, self.allocator, frame.body);
@@ -172,7 +175,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .fetch_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.FetchResponse, self.allocator, frame.body);
@@ -230,7 +236,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .create_topic_ok) return error.UnexpectedResponse;
     }
 
@@ -245,7 +254,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .delete_topic_ok) return error.UnexpectedResponse;
     }
 
@@ -271,7 +283,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .register_hook_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.RegisterHookResponse, self.allocator, frame.body);
@@ -290,7 +305,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .unregister_hook_ok) return error.UnexpectedResponse;
     }
 
@@ -302,7 +320,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .list_hooks_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.ListHooksResponse, self.allocator, frame.body);
@@ -367,7 +388,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .list_topics_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.ListTopicsResponse, self.allocator, frame.body);
@@ -407,7 +431,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .add_timer_ok) return error.UnexpectedResponse;
     }
 
@@ -422,7 +449,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .remove_timer_ok) return error.UnexpectedResponse;
     }
 
@@ -434,7 +464,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .list_timers_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.ListTimersResponse, self.allocator, frame.body);
@@ -482,7 +515,10 @@ pub const Client = struct {
             return error.ConnectionClosed;
         defer self.allocator.free(frame.body);
 
-        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type == .error_response) {
+            printServerError(self.allocator, frame.body);
+            return error.ServerError;
+        }
         if (frame.msg_type != .timer_info_ok) return error.UnexpectedResponse;
 
         const parsed = try protocol.decodeBody(protocol.TimerInfoResponse, self.allocator, frame.body);
@@ -501,6 +537,16 @@ pub const Client = struct {
         };
     }
 };
+
+/// Parse an error_response body and print the server's error message.
+fn printServerError(allocator: Allocator, body: []const u8) void {
+    const err_parsed = protocol.decodeBody(protocol.ErrorResponse, allocator, body) catch {
+        std.debug.print("error: server error (could not parse details)\n", .{});
+        return;
+    };
+    defer err_parsed.deinit();
+    std.debug.print("error: {s}\n", .{err_parsed.value.message});
+}
 
 test "Client struct compiles" {
     _ = Client;
