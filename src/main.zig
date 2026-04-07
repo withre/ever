@@ -469,6 +469,7 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     const name = ctx.arg("name");
     const every = ctx.flag("every");
     const cron = ctx.flag("cron");
+    const in_flag = ctx.flag("in");
     const topic = ctx.arg("topic");
     const payload = ctx.arg("payload");
     const persistent = !ctx.flagBool("no-persist");
@@ -477,12 +478,19 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
         std.debug.print("error: timer name is required\n", .{});
         std.process.exit(1);
     }
-    if (every.len == 0 and cron.len == 0) {
-        std.debug.print("error: either --every or --cron is required\n", .{});
+
+    // Count how many schedule flags are set
+    const has_every = every.len > 0;
+    const has_cron = cron.len > 0;
+    const has_in = in_flag.len > 0;
+    const schedule_count = @as(u8, if (has_every) 1 else 0) + @as(u8, if (has_cron) 1 else 0) + @as(u8, if (has_in) 1 else 0);
+
+    if (schedule_count == 0) {
+        std.debug.print("error: one of --every, --cron, or --in is required\n", .{});
         std.process.exit(1);
     }
-    if (every.len > 0 and cron.len > 0) {
-        std.debug.print("error: cannot specify both --every and --cron\n", .{});
+    if (schedule_count > 1) {
+        std.debug.print("error: --every, --cron, and --in are mutually exclusive\n", .{});
         std.process.exit(1);
     }
     if (topic.len == 0) {
@@ -490,16 +498,20 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const schedule_type = if (every.len > 0) "interval" else "cron";
-    const schedule_value = if (every.len > 0) every else cron;
+    const schedule_type: []const u8 = if (has_in) "one_shot" else if (has_every) "interval" else "cron";
+    const schedule_value = if (has_in) in_flag else if (has_every) every else cron;
     const actual_payload = if (payload.len > 0) payload else "{}";
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
     var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, persistent);
+    try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent);
 
-    std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (every.len > 0) "every" else "cron", schedule_value, topic });
+    if (has_in) {
+        std.debug.print("Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ name, in_flag, topic });
+    } else {
+        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (has_every) "every" else "cron", schedule_value, topic });
+    }
 }
 
 fn handleTimerList(ctx: *cli.Context) !void {
@@ -578,6 +590,186 @@ fn handleTimerInfo(ctx: *cli.Context) !void {
     std.debug.print("Next fire:   (calculated on server)\n", .{});
     std.debug.print("Fire count:  {d}\n", .{timer.fire_count});
     std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
+}
+
+fn handleTimerNew(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    // Prompt: Timer name
+    std.debug.print("Timer name: ", .{});
+    const name = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(name);
+    if (name.len == 0) {
+        std.debug.print("error: timer name is required\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: Schedule type
+    std.debug.print("Schedule type (every/cron/in): ", .{});
+    const sched_type_input = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(sched_type_input);
+
+    const is_every = std.mem.eql(u8, sched_type_input, "every");
+    const is_cron = std.mem.eql(u8, sched_type_input, "cron");
+    const is_in = std.mem.eql(u8, sched_type_input, "in");
+    if (!is_every and !is_cron and !is_in) {
+        std.debug.print("error: schedule type must be 'every', 'cron', or 'in'\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: Schedule value
+    if (is_every) {
+        std.debug.print("Interval: ", .{});
+    } else if (is_cron) {
+        std.debug.print("Cron expression: ", .{});
+    } else {
+        std.debug.print("Delay: ", .{});
+    }
+    const sched_value = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(sched_value);
+    if (sched_value.len == 0) {
+        std.debug.print("error: schedule value is required\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: Topic
+    std.debug.print("Topic: ", .{});
+    const topic = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(topic);
+    if (topic.len == 0) {
+        std.debug.print("error: topic is required\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: Payload
+    std.debug.print("Payload [{{}}]: ", .{});
+    const payload_input = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(payload_input);
+    const payload = if (payload_input.len > 0) payload_input else "{}";
+
+    // Prompt: Persistent (only for non-one-shot)
+    var persistent = true;
+    if (!is_in) {
+        std.debug.print("Persistent (y/n) [y]: ", .{});
+        const persist_input = readLine(allocator) catch {
+            std.debug.print("\nerror: failed to read input\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(persist_input);
+        if (std.mem.eql(u8, persist_input, "n") or std.mem.eql(u8, persist_input, "N")) {
+            persistent = false;
+        }
+    }
+
+    const schedule_type: []const u8 = if (is_in) "one_shot" else if (is_every) "interval" else "cron";
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent);
+
+    std.debug.print("\n", .{});
+    if (is_in) {
+        std.debug.print("Timer '{s}' registered: in {s} \u{2192} {s}\n", .{ name, sched_value, topic });
+    } else {
+        std.debug.print("Timer '{s}' registered: {s} {s} \u{2192} {s}\n", .{ name, sched_type_input, sched_value, topic });
+    }
+}
+
+fn handleHookNew(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    // Prompt: Topic pattern
+    std.debug.print("Topic pattern: ", .{});
+    const pattern = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(pattern);
+    if (pattern.len == 0) {
+        std.debug.print("error: topic pattern is required\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: Command
+    std.debug.print("Command: ", .{});
+    const cmd_input = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(cmd_input);
+    if (cmd_input.len == 0) {
+        std.debug.print("error: command is required\n", .{});
+        std.process.exit(1);
+    }
+
+    // Prompt: One-shot
+    std.debug.print("One-shot (y/n) [n]: ", .{});
+    const once_input = readLine(allocator) catch {
+        std.debug.print("\nerror: failed to read input\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(once_input);
+    const once = std.mem.eql(u8, once_input, "y") or std.mem.eql(u8, once_input, "Y");
+
+    // Parse command into args
+    var cmd_list: std.ArrayList([]const u8) = .empty;
+    defer cmd_list.deinit(allocator);
+    var cmd_iter = std.mem.splitScalar(u8, cmd_input, ' ');
+    while (cmd_iter.next()) |arg| {
+        if (arg.len > 0) try cmd_list.append(allocator, arg);
+    }
+
+    // Get cwd
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_z: [*:0]const u8 = "/proc/self/cwd";
+    const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
+    const cwd_i: isize = @bitCast(cwd_len);
+    const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
+
+    std.debug.print("\n", .{});
+    if (once) {
+        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
+    } else {
+        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
+    }
+}
+
+fn readLine(allocator: std.mem.Allocator) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    while (true) {
+        var byte: [1]u8 = undefined;
+        const rc = std.os.linux.read(0, &byte, 1);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break; // EOF or error
+        if (byte[0] == '\n') break;
+        if (byte[0] == '\r') continue;
+        try buf.append(allocator, byte[0]);
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn handleStart(ctx: *cli.Context) !void {
@@ -922,6 +1114,15 @@ const app = cli.App{
             .description = "Manage hooks triggered by events",
             .subcommands = &.{
                 .{
+                    .name = "new",
+                    .description = "Interactively create a hook",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleHookNew,
+                },
+                .{
                     .name = "add",
                     .description = "Register a server-side hook",
                     .args = &.{.{ .name = "pattern", .required = true, .description = "Topic pattern" }},
@@ -981,6 +1182,15 @@ const app = cli.App{
             .description = "Manage timer-based event generation",
             .subcommands = &.{
                 .{
+                    .name = "new",
+                    .description = "Interactively create a timer",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimerNew,
+                },
+                .{
                     .name = "add",
                     .description = "Add a recurring timer",
                     .args = &.{
@@ -993,6 +1203,7 @@ const app = cli.App{
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                         .{ .name = "every", .value_name = "INTERVAL", .description = "Interval (e.g. 5s, 1m, 2h)" },
                         .{ .name = "cron", .value_name = "EXPR", .description = "Cron expression" },
+                        .{ .name = "in", .value_name = "DURATION", .description = "Fire once after duration (e.g. 5s, 2m)" },
                         .{ .name = "no-persist", .takes_value = false, .description = "Don't catch up missed fires" },
                     },
                     .run = handleTimerAdd,

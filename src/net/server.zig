@@ -346,7 +346,8 @@ pub const Server = struct {
         const req = parsed.value;
 
         // Parse schedule
-        const schedule: timers_mod.Schedule = if (std.mem.eql(u8, req.schedule_type, "interval")) blk: {
+        const is_one_shot = std.mem.eql(u8, req.schedule_type, "one_shot");
+        const schedule: timers_mod.Schedule = if (std.mem.eql(u8, req.schedule_type, "interval") or is_one_shot) blk: {
             const secs = timers_mod.parseDuration(req.schedule_value) catch
                 return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid duration format");
             break :blk .{ .interval = secs };
@@ -358,16 +359,23 @@ pub const Server = struct {
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid schedule type");
 
         // Build schedule_str for display
-        const schedule_str = if (std.mem.eql(u8, req.schedule_type, "interval"))
+        const schedule_str = if (std.mem.eql(u8, req.schedule_type, "interval") or is_one_shot)
             try timers_mod.formatIntervalStr(self.allocator, schedule.interval)
         else
             try self.allocator.dupe(u8, req.schedule_value);
         defer self.allocator.free(schedule_str);
 
-        tt.add(req.name, schedule, schedule_str, req.topic, req.payload, req.persistent) catch |err| return switch (err) {
-            error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "timer name already exists"),
-            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "add timer failed"),
-        };
+        if (is_one_shot) {
+            tt.addOneShot(req.name, schedule, schedule_str, req.topic, req.payload) catch |err| return switch (err) {
+                error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "timer name already exists"),
+                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "add timer failed"),
+            };
+        } else {
+            tt.add(req.name, schedule, schedule_str, req.topic, req.payload, req.persistent) catch |err| return switch (err) {
+                error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "timer name already exists"),
+                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "add timer failed"),
+            };
+        }
 
         try protocol.writeFrame(fd, .add_timer_ok, "{}");
     }

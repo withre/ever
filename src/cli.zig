@@ -303,11 +303,20 @@ pub const App = struct {
     }
 
     fn printCommandHelp(self: *const App, cmd: Command, parent_name: []const u8) void {
-        // Description line
-        std.debug.print("{s}\n", .{cmd.description});
+        const tty = isTty();
+        const blue = if (tty) "\x1b[38;2;130;170;255m" else "";
+        const dim = if (tty) "\x1b[2m" else "";
+        const reset = if (tty) "\x1b[0m" else "";
+
+        // Description line with command name highlighted
+        if (parent_name.len > 0) {
+            std.debug.print("{s}{s} {s}{s} — {s}\n", .{ blue, parent_name, cmd.name, reset, cmd.description });
+        } else {
+            std.debug.print("{s}{s}{s} — {s}\n", .{ blue, cmd.name, reset, cmd.description });
+        }
 
         // Usage line
-        std.debug.print("\nUsage:\n", .{});
+        std.debug.print("\n{s}Usage:{s}\n", .{ blue, reset });
         if (cmd.subcommands.len > 0) {
             if (parent_name.len > 0) {
                 std.debug.print("  {s} {s} {s} <subcommand> [OPTIONS]\n", .{ self.name, parent_name, cmd.name });
@@ -335,7 +344,7 @@ pub const App = struct {
 
         // Subcommands
         if (cmd.subcommands.len > 0) {
-            std.debug.print("\nSubcommands:\n", .{});
+            std.debug.print("\n{s}Subcommands:{s}\n", .{ blue, reset });
             for (cmd.subcommands) |sub| {
                 std.debug.print("  {s:<17}{s}\n", .{ sub.name, sub.description });
             }
@@ -349,9 +358,8 @@ pub const App = struct {
 
         // Arguments
         if (cmd.args.len > 0) {
-            std.debug.print("\nArguments:\n", .{});
+            std.debug.print("\n{s}Arguments:{s}\n", .{ blue, reset });
             for (cmd.args) |a| {
-                // Build "<UPPER>" label
                 var label_buf: [64]u8 = undefined;
                 const label = fmtArgLabel(a, &label_buf);
                 std.debug.print("  {s:<28}{s}\n", .{ label, a.description });
@@ -360,14 +368,14 @@ pub const App = struct {
 
         // Flags
         if (cmd.flags.len > 0) {
-            std.debug.print("\nFlags:\n", .{});
+            std.debug.print("\n{s}Flags:{s}\n", .{ blue, reset });
             for (cmd.flags) |f| {
                 var left_buf: [64]u8 = undefined;
                 const left = fmtFlagLeft(f, &left_buf);
                 if (f.default) |def| {
-                    std.debug.print("  {s:<28}{s} (default: {s})\n", .{ left, f.description, def });
+                    std.debug.print("  {s}{s:<28}{s}{s} {s}(default: {s}){s}\n", .{ blue, left, reset, f.description, dim, def, reset });
                 } else {
-                    std.debug.print("  {s:<28}{s}\n", .{ left, f.description });
+                    std.debug.print("  {s}{s:<28}{s}{s}\n", .{ blue, left, reset, f.description });
                 }
             }
         }

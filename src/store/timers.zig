@@ -254,6 +254,7 @@ const TimerJson = struct {
     last_fired_at: i64,
     fire_count: u64,
     persistent: bool,
+    one_shot: bool = false,
     created_at: i64,
 };
 
@@ -270,6 +271,7 @@ pub const Timer = struct {
     last_fired_at: i64, // epoch millis, 0 = never
     fire_count: u64,
     persistent: bool,
+    one_shot: bool, // if true, auto-remove after first fire
     created_at: i64, // epoch millis
 };
 
@@ -313,6 +315,14 @@ pub const TimerTable = struct {
 
     /// Add a timer. Returns error if name already exists.
     pub fn add(self: *TimerTable, name: []const u8, schedule: Schedule, schedule_str: []const u8, topic: []const u8, payload: []const u8, persistent: bool) !void {
+        return self.addFull(name, schedule, schedule_str, topic, payload, persistent, false);
+    }
+
+    pub fn addOneShot(self: *TimerTable, name: []const u8, schedule: Schedule, schedule_str: []const u8, topic: []const u8, payload: []const u8) !void {
+        return self.addFull(name, schedule, schedule_str, topic, payload, false, true);
+    }
+
+    fn addFull(self: *TimerTable, name: []const u8, schedule: Schedule, schedule_str: []const u8, topic: []const u8, payload: []const u8, persistent: bool, one_shot: bool) !void {
         self.lock();
         defer self.mutex.unlock();
 
@@ -339,6 +349,7 @@ pub const TimerTable = struct {
             .last_fired_at = 0,
             .fire_count = 0,
             .persistent = persistent,
+            .one_shot = one_shot,
             .created_at = getMilliTimestamp(),
         });
 
@@ -486,6 +497,7 @@ pub const TimerTable = struct {
                 .last_fired_at = t.last_fired_at,
                 .fire_count = t.fire_count,
                 .persistent = t.persistent,
+                .one_shot = t.one_shot,
                 .created_at = t.created_at,
             });
         }
@@ -518,6 +530,7 @@ pub const TimerTable = struct {
                 .last_fired_at = timer.last_fired_at,
                 .fire_count = timer.fire_count,
                 .persistent = timer.persistent,
+                .one_shot = timer.one_shot,
                 .created_at = timer.created_at,
             };
         }
@@ -595,6 +608,7 @@ fn deepCopyTimer(allocator: Allocator, timer: Timer) !Timer {
         .last_fired_at = timer.last_fired_at,
         .fire_count = timer.fire_count,
         .persistent = timer.persistent,
+        .one_shot = timer.one_shot,
         .created_at = timer.created_at,
     };
 }
@@ -668,7 +682,13 @@ pub const TimerDaemon = struct {
             if (should_fire) {
                 self.fireTimer(timer, now_ms) catch |err| {
                     std.debug.print("Timer '{s}' fire error: {}\n", .{ timer.name, err });
+                    continue;
                 };
+                // Auto-remove one-shot timers after firing
+                if (timer.one_shot) {
+                    self.timer_table.remove(timer.name) catch {};
+                    std.debug.print("One-shot timer '{s}' removed after firing.\n", .{timer.name});
+                }
             }
         }
     }
