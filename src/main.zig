@@ -676,7 +676,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
 
     const http_port_str = ctx.flag("http-port");
     const no_http = ctx.flagBool("no-http");
-    const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch 4280;
+    const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch 8890;
 
     if (!no_http) {
         http_server_inst = ever.http.HttpServer.init(allocator, io, &topic_manager, .{
@@ -953,7 +953,7 @@ const app = cli.App{
                         .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
                         .{ .name = "port", .default = "7890", .description = "Bind port" },
                         .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
-                        .{ .name = "http-port", .default = "4280", .description = "HTTP API port" },
+                        .{ .name = "http-port", .default = "8890", .description = "HTTP API port" },
                         .{ .name = "no-http", .description = "Disable HTTP server" },
                     },
                     .run = handleStore,
