@@ -284,39 +284,45 @@ pub const App = struct {
 
     fn printRootHelp(self: *const App) void {
         const tty = isTty();
-        const blue = if (tty) "\x1b[38;2;130;170;255m" else "";
+        const title_c = if (tty) "\x1b[38;2;130;170;255m" else "";
+        const section_c = if (tty) "\x1b[38;2;200;180;80m\x1b[1m" else "";
+        const cmd_c = if (tty) "\x1b[38;2;120;180;200m" else "";
+        const desc_c = if (tty) "\x1b[38;2;140;140;140m" else "";
         const reset = if (tty) "\x1b[0m" else "";
 
-        std.debug.print("{s}{s}{s} — {s}\n\n", .{ blue, self.name, reset, self.description });
+        std.debug.print("{s}{s}{s} — {s}{s}{s}\n\n", .{ title_c, self.name, reset, desc_c, self.description, reset });
         std.debug.print("Usage: {s} <command> [options]\n", .{self.name});
 
         if (self.help_sections) |sections| {
             for (sections) |sec| {
-                std.debug.print("\n{s}{s}:{s}\n", .{ blue, sec.title, reset });
+                std.debug.print("\n{s}{s}:{s}\n", .{ section_c, sec.title, reset });
                 for (sec.entries) |entry| {
-                    std.debug.print("  {s:<17}{s}\n", .{ entry.label, entry.description });
+                    std.debug.print("  {s}{s:<17}{s}{s}{s}{s}\n", .{ cmd_c, entry.label, reset, desc_c, entry.description, reset });
                 }
             }
         }
 
-        std.debug.print("\nRun '{s} <command> --help' for more information.\n", .{self.name});
+        std.debug.print("\n{s}Run '{s} <command> --help' for more information.{s}\n", .{ desc_c, self.name, reset });
     }
 
     fn printCommandHelp(self: *const App, cmd: Command, parent_name: []const u8) void {
         const tty = isTty();
-        const blue = if (tty) "\x1b[38;2;130;170;255m" else "";
-        const dim = if (tty) "\x1b[2m" else "";
+        const cmd_c = if (tty) "\x1b[38;2;120;180;200m" else "";
+        const section_c = if (tty) "\x1b[38;2;200;180;80m\x1b[1m" else "";
+        const desc_c = if (tty) "\x1b[38;2;140;140;140m" else "";
+        const flag_c = if (tty) "\x1b[38;2;140;140;140m" else "";
+        const flag_desc_c = if (tty) "\x1b[38;2;110;110;110m" else "";
         const reset = if (tty) "\x1b[0m" else "";
 
         // Description line with command name highlighted
         if (parent_name.len > 0) {
-            std.debug.print("{s}{s} {s}{s} — {s}\n", .{ blue, parent_name, cmd.name, reset, cmd.description });
+            std.debug.print("{s}{s} {s}{s} — {s}{s}{s}\n", .{ cmd_c, parent_name, cmd.name, reset, desc_c, cmd.description, reset });
         } else {
-            std.debug.print("{s}{s}{s} — {s}\n", .{ blue, cmd.name, reset, cmd.description });
+            std.debug.print("{s}{s}{s} — {s}{s}{s}\n", .{ cmd_c, cmd.name, reset, desc_c, cmd.description, reset });
         }
 
         // Usage line
-        std.debug.print("\n{s}Usage:{s}\n", .{ blue, reset });
+        std.debug.print("\nUsage:\n", .{});
         if (cmd.subcommands.len > 0) {
             if (parent_name.len > 0) {
                 std.debug.print("  {s} {s} {s} <subcommand> [OPTIONS]\n", .{ self.name, parent_name, cmd.name });
@@ -332,11 +338,13 @@ pub const App = struct {
             if (cmd.flags.len > 0) std.debug.print(" [OPTIONS]", .{});
             for (cmd.args) |a| {
                 if (a.required) {
+                    std.debug.print(" {s}", .{cmd_c});
                     printArgUpper(a.name);
+                    std.debug.print("{s}", .{reset});
                 } else {
-                    std.debug.print(" [", .{});
+                    std.debug.print(" [{s}", .{cmd_c});
                     printArgUpperBare(a.name);
-                    std.debug.print("]", .{});
+                    std.debug.print("{s}]", .{reset});
                 }
             }
             std.debug.print("\n", .{});
@@ -344,38 +352,38 @@ pub const App = struct {
 
         // Subcommands
         if (cmd.subcommands.len > 0) {
-            std.debug.print("\n{s}Subcommands:{s}\n", .{ blue, reset });
+            std.debug.print("\n{s}Subcommands:{s}\n", .{ section_c, reset });
             for (cmd.subcommands) |sub| {
-                std.debug.print("  {s:<17}{s}\n", .{ sub.name, sub.description });
+                std.debug.print("  {s}{s:<17}{s}{s}{s}{s}\n", .{ cmd_c, sub.name, reset, desc_c, sub.description, reset });
             }
             if (parent_name.len > 0) {
-                std.debug.print("\nRun '{s} {s} {s} <subcommand> --help' for details.\n", .{ self.name, parent_name, cmd.name });
+                std.debug.print("\n{s}Run '{s} {s} {s} <subcommand> --help' for details.{s}\n", .{ desc_c, self.name, parent_name, cmd.name, reset });
             } else {
-                std.debug.print("\nRun '{s} {s} <subcommand> --help' for details.\n", .{ self.name, cmd.name });
+                std.debug.print("\n{s}Run '{s} {s} <subcommand> --help' for details.{s}\n", .{ desc_c, self.name, cmd.name, reset });
             }
             return;
         }
 
         // Arguments
         if (cmd.args.len > 0) {
-            std.debug.print("\n{s}Arguments:{s}\n", .{ blue, reset });
+            std.debug.print("\n{s}Arguments:{s}\n", .{ section_c, reset });
             for (cmd.args) |a| {
                 var label_buf: [64]u8 = undefined;
                 const label = fmtArgLabel(a, &label_buf);
-                std.debug.print("  {s:<28}{s}\n", .{ label, a.description });
+                std.debug.print("  {s}{s:<28}{s}{s}{s}{s}\n", .{ cmd_c, label, reset, desc_c, a.description, reset });
             }
         }
 
         // Flags
         if (cmd.flags.len > 0) {
-            std.debug.print("\n{s}Flags:{s}\n", .{ blue, reset });
+            std.debug.print("\n{s}Flags:{s}\n", .{ section_c, reset });
             for (cmd.flags) |f| {
                 var left_buf: [64]u8 = undefined;
                 const left = fmtFlagLeft(f, &left_buf);
                 if (f.default) |def| {
-                    std.debug.print("  {s}{s:<28}{s}{s} {s}(default: {s}){s}\n", .{ blue, left, reset, f.description, dim, def, reset });
+                    std.debug.print("  {s}{s:<28}{s}{s}{s}{s} {s}(default: {s}){s}\n", .{ flag_c, left, reset, flag_desc_c, f.description, reset, flag_desc_c, def, reset });
                 } else {
-                    std.debug.print("  {s}{s:<28}{s}{s}\n", .{ blue, left, reset, f.description });
+                    std.debug.print("  {s}{s:<28}{s}{s}{s}{s}\n", .{ flag_c, left, reset, flag_desc_c, f.description, reset });
                 }
             }
         }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ever = @import("ever");
 const cli = @import("cli.zig");
+const readline = @import("readline.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -758,18 +759,7 @@ fn handleHookNew(ctx: *cli.Context) !void {
 }
 
 fn readLine(allocator: std.mem.Allocator) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    while (true) {
-        var byte: [1]u8 = undefined;
-        const rc = std.os.linux.read(0, &byte, 1);
-        const n: isize = @bitCast(rc);
-        if (n <= 0) break; // EOF or error
-        if (byte[0] == '\n') break;
-        if (byte[0] == '\r') continue;
-        try buf.append(allocator, byte[0]);
-    }
-    return buf.toOwnedSlice(allocator);
+    return readline.readLine(allocator);
 }
 
 fn handleStart(ctx: *cli.Context) !void {
@@ -873,14 +863,16 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
         }
     }
 
-    std.debug.print("Ever store listening on {s}:{d}\n", .{ if (address.len > 0) address else "127.0.0.1", port });
+    const actual_addr = if (address.len > 0) address else "127.0.0.1";
+    logTimestamped("Ever store starting...");
+    logTimestampedFmt("TCP server listening on {s}:{d}", .{ actual_addr, port });
     if (!no_http) {
-        std.debug.print("HTTP API listening on {s}:{d}\n", .{ if (address.len > 0) address else "127.0.0.1", http_port });
+        logTimestampedFmt("HTTP API listening on {s}:{d}", .{ actual_addr, http_port });
     }
-    std.debug.print("Data directory: {s}\n", .{actual_data_dir});
-    std.debug.print("Hook daemon started.\n", .{});
-    std.debug.print("Timer daemon started.\n", .{});
-    std.debug.print("Press Ctrl-C to stop.\n", .{});
+    logTimestampedFmt("Data directory: {s}", .{actual_data_dir});
+    logTimestampedFmt("Hook daemon started ({d} hooks loaded)", .{hook_table.hooks.items.len});
+    logTimestampedFmt("Timer daemon started ({d} timers loaded)", .{timer_table.timers.items.len});
+    logTimestamped("Ready. Press Ctrl-C to stop.");
     server.installSignalHandlers();
     server.run() catch |err| {
         if (!server.shutdown_requested.load(.acquire))
@@ -973,6 +965,53 @@ fn appendShellEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s:
             try list.append(allocator, c);
         }
     }
+}
+
+// ── Timestamped logging ────────────────────────────────────────────────
+
+fn getTimestamp() struct { year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8 } {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    const secs: u64 = @intCast(ts.sec);
+
+    // Convert epoch seconds to date/time
+    const SECS_PER_DAY = 86400;
+    const days = secs / SECS_PER_DAY;
+    const day_secs = secs % SECS_PER_DAY;
+    const hour: u8 = @intCast(day_secs / 3600);
+    const minute: u8 = @intCast((day_secs % 3600) / 60);
+    const second: u8 = @intCast(day_secs % 60);
+
+    // Days since 1970-01-01 to Y-M-D
+    var y: u16 = 1970;
+    var remaining = days;
+    while (true) {
+        const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+        const year_days: u64 = if (is_leap) 366 else 365;
+        if (remaining < year_days) break;
+        remaining -= year_days;
+        y += 1;
+    }
+    const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+    const month_days = [12]u8{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var m: u8 = 0;
+    while (m < 12) : (m += 1) {
+        if (remaining < month_days[m]) break;
+        remaining -= month_days[m];
+    }
+    return .{ .year = y, .month = m + 1, .day = @intCast(remaining + 1), .hour = hour, .minute = minute, .second = second };
+}
+
+fn logTimestamped(msg: []const u8) void {
+    const t = getTimestamp();
+    std.debug.print("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}] {s}\n", .{ t.year, t.month, t.day, t.hour, t.minute, t.second, msg });
+}
+
+fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
+    const t = getTimestamp();
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "<fmt error>";
+    std.debug.print("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}] {s}\n", .{ t.year, t.month, t.day, t.hour, t.minute, t.second, msg });
 }
 
 const app = cli.App{
