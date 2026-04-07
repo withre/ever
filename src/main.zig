@@ -994,7 +994,11 @@ const app = cli.App{
                 .{
                     .name = "add",
                     .description = "Add a recurring timer",
-                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .args = &.{
+                        .{ .name = "name", .required = true, .description = "Timer name" },
+                        .{ .name = "topic", .required = true, .description = "Topic to publish to" },
+                        .{ .name = "payload", .required = false, .description = "JSON payload" },
+                    },
                     .flags = &.{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
