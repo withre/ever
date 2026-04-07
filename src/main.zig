@@ -886,6 +886,7 @@ const app = cli.App{
             .subcommands = &.{
                 .{
                     .name = "create",
+                    .aliases = &.{"add"},
                     .description = "Create a new topic",
                     .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
                     .flags = &.{
@@ -905,6 +906,7 @@ const app = cli.App{
                 },
                 .{
                     .name = "delete",
+                    .aliases = &.{ "rm", "remove" },
                     .description = "Delete a topic",
                     .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
                     .flags = &.{
@@ -942,6 +944,7 @@ const app = cli.App{
                 },
                 .{
                     .name = "rm",
+                    .aliases = &.{ "remove", "delete" },
                     .description = "Remove a hook by ID",
                     .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
                     .flags = &.{
@@ -1005,6 +1008,7 @@ const app = cli.App{
                 },
                 .{
                     .name = "rm",
+                    .aliases = &.{ "remove", "delete" },
                     .description = "Remove a timer by name",
                     .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
                     .flags = &.{

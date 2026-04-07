@@ -31,10 +31,20 @@ pub const FlagDef = struct {
 pub const Command = struct {
     name: []const u8,
     description: []const u8 = "",
+    aliases: []const []const u8 = &.{},
     args: []const ArgDef = &.{},
     flags: []const FlagDef = &.{},
     subcommands: []const Command = &.{},
     run: ?*const fn (*Context) anyerror!void = null,
+
+    /// Check if this command matches the given name (primary or alias).
+    fn matches(self: *const Command, input: []const u8) bool {
+        if (std.mem.eql(u8, self.name, input)) return true;
+        for (self.aliases) |alias| {
+            if (std.mem.eql(u8, alias, input)) return true;
+        }
+        return false;
+    }
 };
 
 pub const HelpSection = struct {
@@ -241,12 +251,12 @@ pub const App = struct {
         const first = raw[0];
 
         for (self.commands) |cmd| {
-            if (std.mem.eql(u8, cmd.name, first)) {
+            if (cmd.matches(first)) {
                 // Check for subcommand
                 if (cmd.subcommands.len > 0 and raw.len >= 2) {
                     const second = raw[1];
                     for (cmd.subcommands) |sub| {
-                        if (std.mem.eql(u8, sub.name, second)) {
+                        if (sub.matches(second)) {
                             return .{
                                 .cmd = sub,
                                 .parent_name = cmd.name,
@@ -527,4 +537,17 @@ test "fmtFlagLeft long only no value" {
     var buf: [64]u8 = undefined;
     const left = App.fmtFlagLeft(.{ .name = "no-persist", .takes_value = false, .description = "Don't persist" }, &buf);
     try std.testing.expectEqualStrings("    --no-persist", left);
+}
+
+test "command matches primary name" {
+    const cmd = Command{ .name = "create", .aliases = &.{ "add" } };
+    try std.testing.expect(cmd.matches("create"));
+    try std.testing.expect(cmd.matches("add"));
+    try std.testing.expect(!cmd.matches("delete"));
+}
+
+test "command matches without aliases" {
+    const cmd = Command{ .name = "list" };
+    try std.testing.expect(cmd.matches("list"));
+    try std.testing.expect(!cmd.matches("ls"));
 }
