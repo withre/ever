@@ -675,8 +675,13 @@ pub const TimerDaemon = struct {
 
     fn shouldFire(self: *TimerDaemon, timer: Timer, now_secs: i64) bool {
         _ = self;
-        const last_secs = @divFloor(timer.last_fired_at, 1000);
-        const next = timer.schedule.nextFire(if (last_secs > 0) last_secs else now_secs - 1);
+        const base_secs = if (timer.last_fired_at > 0)
+            @divFloor(timer.last_fired_at, 1000)
+        else
+            // Never fired — use created_at as the base so first fire
+            // happens created_at + interval seconds after creation.
+            @divFloor(timer.created_at, 1000);
+        const next = timer.schedule.nextFire(base_secs);
         return next <= now_secs;
     }
 
