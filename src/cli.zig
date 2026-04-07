@@ -1,41 +1,15 @@
 //! CLI Argument Parsing Library for Zig v0.16
+//!
+//! A clean, reusable CLI library with:
+//! - Subcommand dispatch (nested: "timer add")
+//! - Full command path tracking for help output
+//! - --help works anywhere in the arg list
+//! - Grouped help sections for the root command
+//! - TTY-aware coloured output
 
 const std = @import("std");
 
-pub const Colour = struct {
-    r: u8,
-    g: u8,
-    b: u8,
-
-    pub fn hex(comptime s: []const u8) Colour {
-        comptime {
-            if (s.len != 7 or s[0] != '#') @compileError("Invalid hex");
-        }
-        return .{
-            .r = std.fmt.parseInt(u8, s[1..3], 16) catch unreachable,
-            .g = std.fmt.parseInt(u8, s[3..5], 16) catch unreachable,
-            .b = std.fmt.parseInt(u8, s[5..7], 16) catch unreachable,
-        };
-    }
-};
-
-pub const Palette = struct {
-    name: Colour,
-    description: Colour,
-    flag: Colour,
-    separator: Colour,
-    subtle: Colour,
-    error_colour: Colour,
-
-    pub const default_palette = Palette{
-        .name = Colour.hex("#82AAFF"),
-        .description = Colour.hex("#C0C0C0"),
-        .flag = Colour.hex("#C3E88D"),
-        .separator = Colour.hex("#546E7A"),
-        .subtle = Colour.hex("#666666"),
-        .error_colour = Colour.hex("#FF5370"),
-    };
-};
+// ── Types ──────────────────────────────────────────────────────────────
 
 pub const ArgDef = struct {
     name: []const u8,
@@ -48,6 +22,10 @@ pub const FlagDef = struct {
     short: ?u8 = null,
     default: ?[]const u8 = null,
     description: []const u8 = "",
+    /// If true, flag takes a value argument; if false, it's boolean.
+    takes_value: bool = true,
+    /// Custom placeholder name for the value (e.g. "INTERVAL"). If empty, derived from flag name.
+    value_name: []const u8 = "",
 };
 
 pub const Command = struct {
@@ -61,7 +39,12 @@ pub const Command = struct {
 
 pub const HelpSection = struct {
     title: []const u8,
-    commands: []const []const u8,
+    entries: []const HelpEntry,
+};
+
+pub const HelpEntry = struct {
+    label: []const u8,
+    description: []const u8,
 };
 
 pub const Context = struct {
@@ -70,7 +53,8 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     envp: [*:null]const ?[*:0]const u8,
-    command_name: []const u8,
+    /// Full command path, e.g. "timer add"
+    command_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, envp: [*:null]const ?[*:0]const u8) Context {
         return .{
@@ -79,7 +63,7 @@ pub const Context = struct {
             .allocator = allocator,
             .io = io,
             .envp = envp,
-            .command_name = "",
+            .command_path = "",
         };
     }
 
@@ -105,10 +89,6 @@ pub const Context = struct {
     pub fn arg(self: *const Context, name: []const u8) []const u8 {
         return self.positional.get(name) orelse "";
     }
-
-    pub fn hasHelp(self: *const Context) bool {
-        return self.flags.contains("help");
-    }
 };
 
 pub const App = struct {
@@ -119,217 +99,391 @@ pub const App = struct {
     help_sections: ?[]const HelpSection = null,
 
     pub fn run(self: *const App, allocator: std.mem.Allocator, io: std.Io, args: []const []const u8, env_block: [*:null]const ?[*:0]const u8) !void {
-        if (args.len < 2) {
-            self.printHelp();
+        // Skip argv[0]
+        const raw = if (args.len > 1) args[1..] else args[0..0];
+
+        // No args → root help
+        if (raw.len == 0) {
+            self.printRootHelp();
             return;
         }
 
-        const command_name = args[1];
+        // Check for --help anywhere in args (before command resolution)
+        // We'll handle it after resolving the command for proper context.
 
-        if (std.mem.eql(u8, command_name, "help")) {
-            self.printHelp();
+        const first = raw[0];
+
+        // "help" as first word
+        if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
+            // "ever help" → root help
+            // "ever help timer" → same as "ever timer --help"
+            // "ever help timer add" → same as "ever timer add --help"
+            if (raw.len == 1) {
+                self.printRootHelp();
+                return;
+            }
+            // Resolve remaining words as command path
+            if (self.resolveCommand(raw[1..])) |res| {
+                self.printCommandHelp(res.cmd, res.parent_name);
+            } else {
+                std.debug.print("unknown command. Run '{s} help'.\n", .{self.name});
+                std.process.exit(1);
+            }
             return;
         }
 
-        if (std.mem.eql(u8, command_name, "version")) {
-            std.debug.print("{s} {s}\n", .{ self.name, self.version });
+        if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version")) {
+            std.debug.print("{s}\n", .{self.version});
             return;
         }
 
-        // Find the command - check for parent+subcommand pattern
-        var parent_cmd: ?Command = null;
-        var sub_cmd: ?Command = null;
-        var full_cmd_name: []const u8 = command_name;
+        // Resolve command (possibly with subcommand)
+        const resolved = self.resolveCommand(raw) orelse {
+            std.debug.print("unknown command '{s}'. Run '{s} help'.\n", .{ first, self.name });
+            std.process.exit(1);
+        };
 
-        // First try to find as a simple command
-        const simple_cmd = self.findCommand(command_name);
-        if (simple_cmd) |cmd_found| {
-            if (cmd_found.subcommands.len > 0) {
-                // This is a parent command - check if there's a subcommand
-                if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) {
-                    const sub_name = args[2];
-                    for (cmd_found.subcommands) |sub| {
-                        if (std.mem.eql(u8, sub.name, sub_name)) {
-                            parent_cmd = cmd_found;
-                            sub_cmd = sub;
-                            full_cmd_name = std.fmt.allocPrint(std.heap.page_allocator, "{s} {s}", .{ command_name, sub_name }) catch sub_name;
-                            break;
-                        }
-                    }
-                }
-                if (sub_cmd == null) {
-                    // Parent command without valid subcommand
-                    parent_cmd = cmd_found;
-                }
+        const cmd = resolved.cmd;
+        const arg_start = resolved.args_start;
+
+        // Check if --help appears anywhere in remaining args
+        for (raw[arg_start..]) |a| {
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                self.printCommandHelp(cmd, resolved.parent_name);
+                return;
             }
         }
 
-        const cmd = sub_cmd orelse simple_cmd;
-        if (cmd == null) {
-            std.debug.print("unknown command '{s}'. Run '{s} help'.\n", .{ command_name, self.name });
-            std.process.exit(1);
+        // If this is a parent command (has subcommands, no run fn), show its help
+        if (cmd.subcommands.len > 0 and cmd.run == null) {
+            self.printCommandHelp(cmd, resolved.parent_name);
+            return;
         }
 
+        // Build context
         var ctx = Context.init(allocator, io, env_block);
         defer ctx.deinit();
-        ctx.command_name = if (parent_cmd != null and sub_cmd != null) full_cmd_name else command_name;
+        // Store parent + command name as path for handlers
+        ctx.command_path = if (resolved.parent_name.len > 0) resolved.parent_name else cmd.name;
 
-        // Initialize defaults
-        for (cmd.?.flags) |flag| {
-            if (flag.default) |def| {
-                try ctx.flags.put(flag.name, def);
+        // Initialize flag defaults
+        for (cmd.flags) |f| {
+            if (f.default) |def| {
+                try ctx.flags.put(f.name, def);
             }
         }
 
-        // Parse flags and positionals
-        var i: usize = if (parent_cmd != null and sub_cmd != null) 3 else 2;
+        // Parse remaining args
+        var i: usize = arg_start;
         var positional_idx: usize = 0;
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-            if (std.mem.startsWith(u8, arg, "--")) {
-                const flag_name = arg[2..];
-                if (std.mem.indexOfScalar(u8, flag_name, '=')) |eq| {
-                    try ctx.flags.put(flag_name[0..eq], arg[eq + 1 ..]);
-                } else if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                    i += 1;
-                    try ctx.flags.put(flag_name, args[i]);
-                } else {
-                    try ctx.flags.put(flag_name, "true");
+        while (i < raw.len) : (i += 1) {
+            const a = raw[i];
+            if (std.mem.eql(u8, a, "--")) {
+                // Everything after -- is positional
+                i += 1;
+                while (i < raw.len) : (i += 1) {
+                    if (positional_idx < cmd.args.len) {
+                        try ctx.positional.put(cmd.args[positional_idx].name, raw[i]);
+                        positional_idx += 1;
+                    }
                 }
-            } else if (std.mem.startsWith(u8, arg, "-") and arg.len == 2) {
-                const short = arg[1];
-                for (cmd.?.flags) |flag| {
-                    if (flag.short == short) {
-                        if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                            i += 1;
-                            try ctx.flags.put(flag.name, args[i]);
-                        } else {
-                            try ctx.flags.put(flag.name, "true");
-                        }
-                        break;
+                break;
+            } else if (std.mem.startsWith(u8, a, "--")) {
+                const flag_name = a[2..];
+                if (std.mem.indexOfScalar(u8, flag_name, '=')) |eq| {
+                    try ctx.flags.put(flag_name[0..eq], flag_name[eq + 1 ..]);
+                } else {
+                    // Look up flag definition to check if it takes a value
+                    const fdef = findFlagDef(cmd.flags, flag_name);
+                    if (fdef != null and !fdef.?.takes_value) {
+                        try ctx.flags.put(flag_name, "true");
+                    } else if (i + 1 < raw.len and !std.mem.startsWith(u8, raw[i + 1], "-")) {
+                        i += 1;
+                        try ctx.flags.put(flag_name, raw[i]);
+                    } else {
+                        try ctx.flags.put(flag_name, "true");
+                    }
+                }
+            } else if (std.mem.startsWith(u8, a, "-") and a.len == 2) {
+                const short = a[1];
+                if (findFlagByShort(cmd.flags, short)) |fdef| {
+                    if (!fdef.takes_value) {
+                        try ctx.flags.put(fdef.name, "true");
+                    } else if (i + 1 < raw.len and !std.mem.startsWith(u8, raw[i + 1], "-")) {
+                        i += 1;
+                        try ctx.flags.put(fdef.name, raw[i]);
+                    } else {
+                        try ctx.flags.put(fdef.name, "true");
                     }
                 }
             } else {
-                if (positional_idx < cmd.?.args.len) {
-                    try ctx.positional.put(cmd.?.args[positional_idx].name, arg);
+                // Positional argument
+                if (positional_idx < cmd.args.len) {
+                    try ctx.positional.put(cmd.args[positional_idx].name, a);
                     positional_idx += 1;
                 }
             }
         }
 
-        if (ctx.hasHelp()) {
-            self.printCommandHelp(cmd.?);
-            return;
-        }
-
-        if (cmd.?.run) |run_fn| {
+        if (cmd.run) |run_fn| {
             try run_fn(&ctx);
         }
     }
 
-    fn findCommand(self: *const App, name: []const u8) ?Command {
+    const ResolveResult = struct {
+        cmd: Command,
+        parent_name: []const u8, // "" for top-level commands
+        args_start: usize, // index into raw (after argv[0])
+    };
+
+    fn resolveCommand(self: *const App, raw: []const []const u8) ?ResolveResult {
+        if (raw.len == 0) return null;
+        const first = raw[0];
+
         for (self.commands) |cmd| {
-            if (std.mem.eql(u8, cmd.name, name)) return cmd;
-            for (cmd.subcommands) |sub| {
-                const full = std.fmt.allocPrint(std.heap.page_allocator, "{s} {s}", .{ cmd.name, sub.name }) catch continue;
-                defer std.heap.page_allocator.free(full);
-                if (std.mem.eql(u8, full, name)) return sub;
+            if (std.mem.eql(u8, cmd.name, first)) {
+                // Check for subcommand
+                if (cmd.subcommands.len > 0 and raw.len >= 2) {
+                    const second = raw[1];
+                    for (cmd.subcommands) |sub| {
+                        if (std.mem.eql(u8, sub.name, second)) {
+                            return .{
+                                .cmd = sub,
+                                .parent_name = cmd.name,
+                                .args_start = 2,
+                            };
+                        }
+                    }
+                }
+                // Return parent command itself
+                return .{
+                    .cmd = cmd,
+                    .parent_name = "",
+                    .args_start = 1,
+                };
             }
         }
         return null;
     }
 
-    fn printHelp(self: *const App) void {
-        const is_tty = std.c.isatty(std.posix.STDERR_FILENO) != 0;
-        
-        // Title line with color
-        if (is_tty) {
-            std.debug.print("\x1b[38;2;130;170;255m{s}\x1b[0m — {s}\n\n", .{ self.name, self.description });
-        } else {
-            std.debug.print("{s} — {s}\n\n", .{ self.name, self.description });
-        }
-        
-        std.debug.print("Usage: {s} <command> [options]\n\n", .{self.name});
-        
-        // Color for section headers
-        const header_color = "\x1b[38;2;130;170;255m";
-        const reset = "\x1b[0m";
-        
-        if (is_tty) {
-            std.debug.print("{s}Commands:{s}\n", .{ header_color, reset });
-        } else {
-            std.debug.print("Commands:\n", .{});
-        }
-        
-        if (self.help_sections) |sections| {
-            for (sections) |sec| {
-                for (sec.commands) |cmd_name| {
-                    const cmd = self.findCommand(cmd_name);
-                    if (cmd) |c| {
-                        // Build flags string
-                        var flags_buf: [256]u8 = undefined;
-                        var flags_len: usize = 0;
-                        if (c.flags.len > 0) {
-                            var first = true;
-                            for (c.flags) |flag| {
-                                if (flag.description.len > 0) {
-                                    if (!first) {
-                                        flags_buf[flags_len] = ',';
-                                        flags_len += 1;
-                                        flags_buf[flags_len] = ' ';
-                                        flags_len += 1;
-                                    }
-                                    const result = std.fmt.bufPrint(flags_buf[flags_len..], "--{s}", .{flag.name}) catch break;
-                                    flags_len += result.len;
-                                    first = false;
-                                    if (flags_len > 250) break;
-                                }
-                            }
-                        }
-                        
-                        if (flags_len > 0) {
-                            std.debug.print("  {s:<15} {s} ({s})\n", .{ cmd_name, c.description, flags_buf[0..flags_len] });
-                        } else {
-                            std.debug.print("  {s:<15} {s}\n", .{ cmd_name, c.description });
-                        }
-                    }
-                }
-            }
-        }
-        
-        std.debug.print("\nRun '{s} <command> --help' for more information.\n", .{ self.name });
+    // ── Help Printing ──────────────────────────────────────────────────
+
+    fn isTty() bool {
+        return std.c.isatty(std.posix.STDERR_FILENO) != 0;
     }
 
-    fn printCommandHelp(self: *const App, cmd: Command) void {
-        std.debug.print("{s} {s}\n{s}\n\n", .{ self.name, cmd.name, cmd.description });
-        std.debug.print("Usage:\n  {s} {s} [options]\n\n", .{ self.name, cmd.name });
+    fn printRootHelp(self: *const App) void {
+        const tty = isTty();
+        const blue = if (tty) "\x1b[38;2;130;170;255m" else "";
+        const reset = if (tty) "\x1b[0m" else "";
 
+        std.debug.print("{s}{s}{s} — {s}\n\n", .{ blue, self.name, reset, self.description });
+        std.debug.print("Usage: {s} <command> [options]\n", .{self.name});
+
+        if (self.help_sections) |sections| {
+            for (sections) |sec| {
+                std.debug.print("\n{s}{s}:{s}\n", .{ blue, sec.title, reset });
+                for (sec.entries) |entry| {
+                    std.debug.print("  {s:<17}{s}\n", .{ entry.label, entry.description });
+                }
+            }
+        }
+
+        std.debug.print("\nRun '{s} <command> --help' for more information.\n", .{self.name});
+    }
+
+    fn printCommandHelp(self: *const App, cmd: Command, parent_name: []const u8) void {
+        // Description line
+        std.debug.print("{s}\n", .{cmd.description});
+
+        // Usage line
+        std.debug.print("\nUsage:\n", .{});
+        if (cmd.subcommands.len > 0) {
+            if (parent_name.len > 0) {
+                std.debug.print("  {s} {s} {s} <subcommand> [OPTIONS]\n", .{ self.name, parent_name, cmd.name });
+            } else {
+                std.debug.print("  {s} {s} <subcommand> [OPTIONS]\n", .{ self.name, cmd.name });
+            }
+        } else {
+            if (parent_name.len > 0) {
+                std.debug.print("  {s} {s} {s}", .{ self.name, parent_name, cmd.name });
+            } else {
+                std.debug.print("  {s} {s}", .{ self.name, cmd.name });
+            }
+            if (cmd.flags.len > 0) std.debug.print(" [OPTIONS]", .{});
+            for (cmd.args) |a| {
+                if (a.required) {
+                    printArgUpper(a.name);
+                } else {
+                    std.debug.print(" [", .{});
+                    printArgUpperBare(a.name);
+                    std.debug.print("]", .{});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+
+        // Subcommands
+        if (cmd.subcommands.len > 0) {
+            std.debug.print("\nSubcommands:\n", .{});
+            for (cmd.subcommands) |sub| {
+                std.debug.print("  {s:<17}{s}\n", .{ sub.name, sub.description });
+            }
+            if (parent_name.len > 0) {
+                std.debug.print("\nRun '{s} {s} {s} <subcommand> --help' for details.\n", .{ self.name, parent_name, cmd.name });
+            } else {
+                std.debug.print("\nRun '{s} {s} <subcommand> --help' for details.\n", .{ self.name, cmd.name });
+            }
+            return;
+        }
+
+        // Arguments
         if (cmd.args.len > 0) {
-            std.debug.print("Arguments:\n", .{});
-            for (cmd.args) |arg| {
-                std.debug.print("  {s:<12} {s}\n", .{ arg.name, arg.description });
+            std.debug.print("\nArguments:\n", .{});
+            for (cmd.args) |a| {
+                // Build "<UPPER>" label
+                var label_buf: [64]u8 = undefined;
+                const label = fmtArgLabel(a, &label_buf);
+                std.debug.print("  {s:<28}{s}\n", .{ label, a.description });
             }
         }
 
+        // Flags
         if (cmd.flags.len > 0) {
-            std.debug.print("Flags:\n", .{});
-            for (cmd.flags) |flag| {
-                if (flag.short) |s| {
-                    std.debug.print("  -{c}, --{s:<12}", .{ s, flag.name });
+            std.debug.print("\nFlags:\n", .{});
+            for (cmd.flags) |f| {
+                var left_buf: [64]u8 = undefined;
+                const left = fmtFlagLeft(f, &left_buf);
+                if (f.default) |def| {
+                    std.debug.print("  {s:<28}{s} (default: {s})\n", .{ left, f.description, def });
                 } else {
-                    std.debug.print("      --{s:<12}", .{flag.name});
-                }
-                if (flag.default) |def| {
-                    std.debug.print("{s} (default: {s})\n", .{ flag.description, def });
-                } else {
-                    std.debug.print("{s}\n", .{flag.description});
+                    std.debug.print("  {s:<28}{s}\n", .{ left, f.description });
                 }
             }
         }
+    }
+
+    // ── Formatting helpers ─────────────────────────────────────────────
+
+    fn printArgUpper(name: []const u8) void {
+        std.debug.print(" <", .{});
+        printArgUpperBare(name);
+        std.debug.print(">", .{});
+    }
+
+    fn printArgUpperBare(name: []const u8) void {
+        for (name) |c| {
+            if (c >= 'a' and c <= 'z')
+                std.debug.print("{c}", .{c - 32})
+            else
+                std.debug.print("{c}", .{c});
+        }
+    }
+
+    fn fmtArgLabel(a: ArgDef, buf: []u8) []const u8 {
+        var pos: usize = 0;
+        if (a.required) {
+            buf[pos] = '<';
+            pos += 1;
+        } else {
+            buf[pos] = '[';
+            pos += 1;
+        }
+        for (a.name) |c| {
+            if (c >= 'a' and c <= 'z') {
+                buf[pos] = c - 32;
+            } else {
+                buf[pos] = c;
+            }
+            pos += 1;
+        }
+        if (a.required) {
+            buf[pos] = '>';
+            pos += 1;
+        } else {
+            buf[pos] = ']';
+            pos += 1;
+        }
+        return buf[0..pos];
+    }
+
+    fn fmtFlagLeft(f: FlagDef, buf: []u8) []const u8 {
+        var pos: usize = 0;
+        if (f.short) |s| {
+            buf[pos] = '-';
+            pos += 1;
+            buf[pos] = s;
+            pos += 1;
+            buf[pos] = ',';
+            pos += 1;
+            buf[pos] = ' ';
+            pos += 1;
+        } else {
+            // 4 spaces to align with "-X, "
+            buf[pos] = ' ';
+            pos += 1;
+            buf[pos] = ' ';
+            pos += 1;
+            buf[pos] = ' ';
+            pos += 1;
+            buf[pos] = ' ';
+            pos += 1;
+        }
+        buf[pos] = '-';
+        pos += 1;
+        buf[pos] = '-';
+        pos += 1;
+        for (f.name) |c| {
+            buf[pos] = c;
+            pos += 1;
+        }
+        // If flag takes a value, add " <UPPER_NAME>"
+        if (f.takes_value) {
+            buf[pos] = ' ';
+            pos += 1;
+            buf[pos] = '<';
+            pos += 1;
+            if (f.value_name.len > 0) {
+                for (f.value_name) |c| {
+                    buf[pos] = c;
+                    pos += 1;
+                }
+            } else {
+                for (f.name) |c| {
+                    if (c >= 'a' and c <= 'z') {
+                        buf[pos] = c - 32;
+                    } else if (c == '-') {
+                        buf[pos] = '_';
+                    } else {
+                        buf[pos] = c;
+                    }
+                    pos += 1;
+                }
+            }
+            buf[pos] = '>';
+            pos += 1;
+        }
+        return buf[0..pos];
+    }
+
+    fn findFlagDef(flags: []const FlagDef, name: []const u8) ?FlagDef {
+        for (flags) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f;
+        }
+        return null;
+    }
+
+    fn findFlagByShort(flags: []const FlagDef, short: u8) ?FlagDef {
+        for (flags) |f| {
+            if (f.short == short) return f;
+        }
+        return null;
     }
 };
 
-test "cli basics" {
+// ── Tests ──────────────────────────────────────────────────────────────
+
+test "context basics" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
@@ -338,4 +492,39 @@ test "cli basics" {
     try ctx.flags.put("port", "8080");
     try std.testing.expectEqualStrings("8080", ctx.flag("port"));
     try std.testing.expectEqual(@as(u16, 8080), ctx.flagInt(u16, "port"));
+}
+
+test "context flagBool" {
+    const allocator = std.testing.allocator;
+    const envp: [*:null]const ?[*:0]const u8 = &.{};
+    var ctx = Context.init(allocator, std.testing.io, envp);
+    defer ctx.deinit();
+
+    try ctx.flags.put("verbose", "true");
+    try std.testing.expect(ctx.flagBool("verbose"));
+    try std.testing.expect(!ctx.flagBool("missing"));
+}
+
+test "fmtArgLabel required" {
+    var buf: [64]u8 = undefined;
+    const label = App.fmtArgLabel(.{ .name = "topic", .required = true }, &buf);
+    try std.testing.expectEqualStrings("<TOPIC>", label);
+}
+
+test "fmtArgLabel optional" {
+    var buf: [64]u8 = undefined;
+    const label = App.fmtArgLabel(.{ .name = "payload", .required = false }, &buf);
+    try std.testing.expectEqualStrings("[PAYLOAD]", label);
+}
+
+test "fmtFlagLeft with short and default" {
+    var buf: [64]u8 = undefined;
+    const left = App.fmtFlagLeft(.{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" }, &buf);
+    try std.testing.expectEqualStrings("-p, --port <PORT>", left);
+}
+
+test "fmtFlagLeft long only no value" {
+    var buf: [64]u8 = undefined;
+    const left = App.fmtFlagLeft(.{ .name = "no-persist", .takes_value = false, .description = "Don't persist" }, &buf);
+    try std.testing.expectEqualStrings("    --no-persist", left);
 }

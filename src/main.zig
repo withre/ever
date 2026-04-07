@@ -44,7 +44,7 @@ pub fn parseStoreAddress(ctx: *const cli.Context, env_block: [*:null]const ?[*:0
     };
 }
 
-fn handlePub(ctx: *const cli.Context) !void {
+fn handlePub(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
@@ -60,15 +60,14 @@ fn handlePub(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
     var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     const offset = try c.publish(topic, null, data);
     std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
 }
 
-fn handleSub(ctx: *const cli.Context) !void {
+fn handleSub(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
@@ -83,8 +82,7 @@ fn handleSub(ctx: *const cli.Context) !void {
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
 
     var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
@@ -122,7 +120,7 @@ fn handleSub(ctx: *const cli.Context) !void {
     }
 }
 
-fn handleWait(ctx: *const cli.Context) !void {
+fn handleWait(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
@@ -137,8 +135,7 @@ fn handleWait(ctx: *const cli.Context) !void {
     const from_offset = ctx.flagInt(u64, "from");
     const json_values = ctx.flagBool("json-values");
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
 
     var client = ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port) catch
         std.process.fatal("cannot connect to store at {s}:{d}.", .{ addr_info.address, addr_info.port });
@@ -176,7 +173,7 @@ fn handleWait(ctx: *const cli.Context) !void {
     }
 }
 
-fn handleOn(ctx: *const cli.Context) !void {
+fn handleOn(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
     const envp = ctx.envp;
@@ -194,8 +191,7 @@ fn handleOn(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
     const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
         (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
@@ -315,328 +311,298 @@ fn handleOn(ctx: *const cli.Context) !void {
     }
 }
 
-fn handleTopic(ctx: *const cli.Context) !void {
+fn handleTopicCreate(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
-
-    // Extract subcommand from command_name (e.g. "topic list" -> "list")
-    const sub = blk: {
-        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
-            break :blk ctx.command_name[idx + 1..];
-        }
-        break :blk "";
-    };
     const name = ctx.arg("name");
 
-    if (sub.len == 0) {
-        std.debug.print("error: subcommand is required (create|list|delete)\n", .{});
+    if (name.len == 0) {
+        std.debug.print("error: topic name is required\n", .{});
         std.process.exit(1);
     }
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
-
-    if (std.mem.eql(u8, sub, "create")) {
-        if (name.len == 0) {
-            std.debug.print("error: topic name is required\n", .{});
-            std.process.exit(1);
-        }
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        try c.createTopic(name);
-        std.debug.print("Created topic: {s}\n", .{name});
-    } else if (std.mem.eql(u8, sub, "list")) {
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        const topics = try c.listTopics();
-        defer {
-            for (topics) |t| allocator.free(t);
-            allocator.free(topics);
-        }
-        if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
-    } else if (std.mem.eql(u8, sub, "delete")) {
-        if (name.len == 0) {
-            std.debug.print("error: topic name is required\n", .{});
-            std.process.exit(1);
-        }
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        try c.deleteTopic(name);
-        std.debug.print("Deleted topic: {s}\n", .{name});
-    } else {
-        std.debug.print("error: unknown topic subcommand\n", .{});
-        std.process.exit(1);
-    }
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.createTopic(name);
+    std.debug.print("Created topic: {s}\n", .{name});
 }
 
-fn handleHook(ctx: *const cli.Context) !void {
+fn handleTopicList(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    // Extract subcommand from command_name (e.g. "hook add" -> "add")
-    const sub = blk: {
-        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
-            break :blk ctx.command_name[idx + 1..];
-        }
-        break :blk "";
-    };
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    const topics = try c.listTopics();
+    defer {
+        for (topics) |t| allocator.free(t);
+        allocator.free(topics);
+    }
+    if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
+}
 
-    if (sub.len == 0) {
-        std.debug.print("error: subcommand is required (add|list|rm)\n", .{});
+fn handleTopicDelete(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const name = ctx.arg("name");
+
+    if (name.len == 0) {
+        std.debug.print("error: topic name is required\n", .{});
         std.process.exit(1);
     }
 
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.deleteTopic(name);
+    std.debug.print("Deleted topic: {s}\n", .{name});
+}
 
-    if (std.mem.eql(u8, sub, "add")) {
-        const pattern = ctx.arg("pattern");
-        const once = ctx.flagBool("once");
-        const cmd = ctx.flag("cmd");
+fn handleHookAdd(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const pattern = ctx.arg("pattern");
+    const once = ctx.flagBool("once");
+    const cmd = ctx.flag("cmd");
 
-        if (pattern.len == 0) {
-            std.debug.print("error: pattern is required\n", .{});
-            std.process.exit(1);
-        }
-        if (cmd.len == 0) {
-            std.debug.print("error: command is required after --\n", .{});
-            std.process.exit(1);
-        }
-
-        var cmd_list: std.ArrayList([]const u8) = .empty;
-        defer cmd_list.deinit(allocator);
-        var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
-        while (cmd_iter.next()) |arg| {
-            if (arg.len > 0) try cmd_list.append(allocator, arg);
-        }
-
-        var cwd_buf: [4096]u8 = undefined;
-        const cwd_z: [*:0]const u8 = "/proc/self/cwd";
-        const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
-        const cwd_i: isize = @bitCast(cwd_len);
-        const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
-
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
-
-        var cmd_display: std.ArrayList(u8) = .empty;
-        defer cmd_display.deinit(allocator);
-        for (cmd_list.items, 0..) |arg, j| {
-            if (j > 0) try cmd_display.append(allocator, ' ');
-            try cmd_display.appendSlice(allocator, arg);
-        }
-        if (once) {
-            std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern, cmd_display.items });
-        } else {
-            std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern, cmd_display.items });
-        }
-    } else if (std.mem.eql(u8, sub, "list")) {
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        var result = try c.listHooks();
-        defer result.deinit();
-
-        if (result.hooks.len == 0) {
-            std.debug.print("No hooks registered.\n", .{});
-        } else {
-            std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
-            for (result.hooks) |hook| {
-                var cmd_display: std.ArrayList(u8) = .empty;
-                defer cmd_display.deinit(allocator);
-                for (hook.command, 0..) |arg, j| {
-                    if (j > 0) try cmd_display.append(allocator, ' ');
-                    try cmd_display.appendSlice(allocator, arg);
-                }
-
-                var id_buf: [20]u8 = undefined;
-                const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
-                var cursor_buf: [20]u8 = undefined;
-                const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
-
-                std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
-                    id_str,
-                    hook.pattern,
-                    cmd_display.items,
-                    cursor_str,
-                });
-            }
-        }
-    } else if (std.mem.eql(u8, sub, "rm")) {
-        const id_str = ctx.arg("id");
-        if (id_str.len == 0) {
-            std.debug.print("error: hook ID is required\n", .{});
-            std.process.exit(1);
-        }
-        const id = std.fmt.parseInt(u64, id_str, 10) catch
-            std.process.fatal("invalid hook ID '{s}'.", .{id_str});
-
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        try c.removeHook(id);
-        std.debug.print("Hook #{d} removed.\n", .{id});
-    } else {
-        std.debug.print("error: unknown hook subcommand\n", .{});
+    if (pattern.len == 0) {
+        std.debug.print("error: pattern is required\n", .{});
         std.process.exit(1);
+    }
+    if (cmd.len == 0) {
+        std.debug.print("error: command is required after --\n", .{});
+        std.process.exit(1);
+    }
+
+    var cmd_list: std.ArrayList([]const u8) = .empty;
+    defer cmd_list.deinit(allocator);
+    var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
+    while (cmd_iter.next()) |arg| {
+        if (arg.len > 0) try cmd_list.append(allocator, arg);
+    }
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_z: [*:0]const u8 = "/proc/self/cwd";
+    const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
+    const cwd_i: isize = @bitCast(cwd_len);
+    const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
+
+    var cmd_display: std.ArrayList(u8) = .empty;
+    defer cmd_display.deinit(allocator);
+    for (cmd_list.items, 0..) |arg, j| {
+        if (j > 0) try cmd_display.append(allocator, ' ');
+        try cmd_display.appendSlice(allocator, arg);
+    }
+    if (once) {
+        std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern, cmd_display.items });
+    } else {
+        std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern, cmd_display.items });
     }
 }
 
-fn handleTimer(ctx: *const cli.Context) !void {
+fn handleHookList(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    // Extract subcommand from command_name (e.g. "timer add" -> "add")
-    const sub = blk: {
-        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
-            break :blk ctx.command_name[idx + 1..];
-        }
-        break :blk "";
-    };
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    var result = try c.listHooks();
+    defer result.deinit();
 
-    if (sub.len == 0) {
-        std.debug.print("error: subcommand is required (add|list|rm|info)\n", .{});
-        std.process.exit(1);
-    }
-
-    const env_block = ctx.envp;
-    const addr_info = parseStoreAddress(ctx, env_block);
-
-    if (std.mem.eql(u8, sub, "add")) {
-        const name = ctx.arg("name");
-        const every = ctx.flag("every");
-        const cron = ctx.flag("cron");
-        const topic = ctx.arg("topic");
-        const payload = ctx.arg("payload");
-        const persistent = !ctx.flagBool("no-persist");
-
-        if (name.len == 0) {
-            std.debug.print("error: timer name is required\n", .{});
-            std.process.exit(1);
-        }
-        if (every.len == 0 and cron.len == 0) {
-            std.debug.print("error: either --every or --cron is required\n", .{});
-            std.process.exit(1);
-        }
-        if (every.len > 0 and cron.len > 0) {
-            std.debug.print("error: cannot specify both --every and --cron\n", .{});
-            std.process.exit(1);
-        }
-        if (topic.len == 0) {
-            std.debug.print("error: topic is required\n", .{});
-            std.process.exit(1);
-        }
-
-        const schedule_type = if (every.len > 0) "interval" else "cron";
-        const schedule_value = if (every.len > 0) every else cron;
-        const actual_payload = if (payload.len > 0) payload else "{}";
-
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, persistent);
-
-        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (every.len > 0) "every" else "cron", schedule_value, topic });
-    } else if (std.mem.eql(u8, sub, "list")) {
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        var result = try c.listTimers();
-        defer result.deinit();
-
-        if (result.timers.len == 0) {
-            std.debug.print("No timers registered.\n", .{});
-        } else {
-            std.debug.print("{s:<20} {s:<15} {s:<25} {s:<10}\n", .{ "NAME", "SCHEDULE", "TOPIC", "FIRES" });
-            for (result.timers) |timer| {
-                std.debug.print("{s:<20} {s:<15} {s:<25} {d:<10}\n", .{
-                    timer.name,
-                    timer.schedule,
-                    timer.topic,
-                    timer.fire_count,
-                });
-            }
-        }
-    } else if (std.mem.eql(u8, sub, "rm")) {
-        const name = ctx.arg("name");
-        if (name.len == 0) {
-            std.debug.print("error: timer name is required\n", .{});
-            std.process.exit(1);
-        }
-
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        try c.removeTimer(name);
-        std.debug.print("Timer '{s}' removed.\n", .{name});
-    } else if (std.mem.eql(u8, sub, "info")) {
-        const name = ctx.arg("name");
-        if (name.len == 0) {
-            std.debug.print("error: timer name is required\n", .{});
-            std.process.exit(1);
-        }
-
-        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
-        defer c.deinit();
-        const timer = try c.timerInfo(name);
-        defer {
-            allocator.free(timer.name);
-            allocator.free(timer.schedule);
-            allocator.free(timer.topic);
-            allocator.free(timer.payload);
-        }
-
-        std.debug.print("Name:        {s}\n", .{timer.name});
-        std.debug.print("Schedule:    {s}\n", .{timer.schedule});
-        std.debug.print("Topic:       {s}\n", .{timer.topic});
-        std.debug.print("Payload:     {s}\n", .{timer.payload});
-        std.debug.print("Last fired:  ", .{});
-        if (timer.last_fired_at > 0) {
-            std.debug.print("{d}\n", .{timer.last_fired_at});
-        } else {
-            std.debug.print("never\n", .{});
-        }
-        std.debug.print("Next fire:   (calculated on server)\n", .{});
-        std.debug.print("Fire count:  {d}\n", .{timer.fire_count});
-        std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
+    if (result.hooks.len == 0) {
+        std.debug.print("No hooks registered.\n", .{});
     } else {
-        std.debug.print("error: unknown timer subcommand\n", .{});
-        std.process.exit(1);
+        std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
+        for (result.hooks) |hook| {
+            var cmd_display: std.ArrayList(u8) = .empty;
+            defer cmd_display.deinit(allocator);
+            for (hook.command, 0..) |arg, j| {
+                if (j > 0) try cmd_display.append(allocator, ' ');
+                try cmd_display.appendSlice(allocator, arg);
+            }
+
+            var id_buf: [20]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
+            var cursor_buf: [20]u8 = undefined;
+            const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
+
+            std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
+                id_str,
+                hook.pattern,
+                cmd_display.items,
+                cursor_str,
+            });
+        }
     }
 }
 
-fn handleStore(ctx: *const cli.Context) !void {
+fn handleHookRm(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const id_str = ctx.arg("id");
+
+    if (id_str.len == 0) {
+        std.debug.print("error: hook ID is required\n", .{});
+        std.process.exit(1);
+    }
+    const id = std.fmt.parseInt(u64, id_str, 10) catch
+        std.process.fatal("invalid hook ID '{s}'.", .{id_str});
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.removeHook(id);
+    std.debug.print("Hook #{d} removed.\n", .{id});
+}
+
+fn handleTimerAdd(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const name = ctx.arg("name");
+    const every = ctx.flag("every");
+    const cron = ctx.flag("cron");
+    const topic = ctx.arg("topic");
+    const payload = ctx.arg("payload");
+    const persistent = !ctx.flagBool("no-persist");
+
+    if (name.len == 0) {
+        std.debug.print("error: timer name is required\n", .{});
+        std.process.exit(1);
+    }
+    if (every.len == 0 and cron.len == 0) {
+        std.debug.print("error: either --every or --cron is required\n", .{});
+        std.process.exit(1);
+    }
+    if (every.len > 0 and cron.len > 0) {
+        std.debug.print("error: cannot specify both --every and --cron\n", .{});
+        std.process.exit(1);
+    }
+    if (topic.len == 0) {
+        std.debug.print("error: topic is required\n", .{});
+        std.process.exit(1);
+    }
+
+    const schedule_type = if (every.len > 0) "interval" else "cron";
+    const schedule_value = if (every.len > 0) every else cron;
+    const actual_payload = if (payload.len > 0) payload else "{}";
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, persistent);
+
+    std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (every.len > 0) "every" else "cron", schedule_value, topic });
+}
+
+fn handleTimerList(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    var result = try c.listTimers();
+    defer result.deinit();
+
+    if (result.timers.len == 0) {
+        std.debug.print("No timers registered.\n", .{});
+    } else {
+        std.debug.print("{s:<20} {s:<15} {s:<25} {s:<10}\n", .{ "NAME", "SCHEDULE", "TOPIC", "FIRES" });
+        for (result.timers) |timer| {
+            std.debug.print("{s:<20} {s:<15} {s:<25} {d:<10}\n", .{
+                timer.name,
+                timer.schedule,
+                timer.topic,
+                timer.fire_count,
+            });
+        }
+    }
+}
+
+fn handleTimerRm(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const name = ctx.arg("name");
+
+    if (name.len == 0) {
+        std.debug.print("error: timer name is required\n", .{});
+        std.process.exit(1);
+    }
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    try c.removeTimer(name);
+    std.debug.print("Timer '{s}' removed.\n", .{name});
+}
+
+fn handleTimerInfo(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const name = ctx.arg("name");
+
+    if (name.len == 0) {
+        std.debug.print("error: timer name is required\n", .{});
+        std.process.exit(1);
+    }
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    const timer = try c.timerInfo(name);
+    defer {
+        allocator.free(timer.name);
+        allocator.free(timer.schedule);
+        allocator.free(timer.topic);
+        allocator.free(timer.payload);
+    }
+
+    std.debug.print("Name:        {s}\n", .{timer.name});
+    std.debug.print("Schedule:    {s}\n", .{timer.schedule});
+    std.debug.print("Topic:       {s}\n", .{timer.topic});
+    std.debug.print("Payload:     {s}\n", .{timer.payload});
+    std.debug.print("Last fired:  ", .{});
+    if (timer.last_fired_at > 0) {
+        std.debug.print("{d}\n", .{timer.last_fired_at});
+    } else {
+        std.debug.print("never\n", .{});
+    }
+    std.debug.print("Next fire:   (calculated on server)\n", .{});
+    std.debug.print("Fire count:  {d}\n", .{timer.fire_count});
+    std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
+}
+
+fn handleStart(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
     const envp = ctx.envp;
+    try startServer(allocator, io, ctx, envp);
+}
 
-    // Extract subcommand from command_name (e.g., "store start" -> "start")
-    const sub = if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |space|
-        ctx.command_name[space + 1 ..]
-    else
-        ctx.arg("subcommand");
+fn handleStatus(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
 
-    if (sub.len == 0) {
-        std.debug.print("error: subcommand is required (start)\n", .{});
-        std.process.exit(1);
-    }
+    const data_dir = ctx.flag("data-dir");
+    const json_output = ctx.flagBool("json");
+    const actual_dir = if (data_dir.len > 0) data_dir else "./data";
 
-    if (std.mem.eql(u8, sub, "start")) {
-        try startServer(allocator, io, ctx, envp);
-    } else if (std.mem.eql(u8, sub, "status")) {
-        const data_dir = ctx.flag("data-dir");
-        const json_output = ctx.flagBool("json");
-        const actual_dir = if (data_dir.len > 0) data_dir else "./data";
+    var store_status = ever.status.getStatus(allocator, ctx.io, actual_dir) catch |err| {
+        std.process.fatal("failed to get store status: {}", .{err});
+    };
+    defer store_status.deinit(allocator);
 
-        var store_status = ever.status.getStatus(allocator, io, actual_dir) catch |err| {
-            std.process.fatal("failed to get store status: {}", .{err});
-        };
-        defer store_status.deinit(allocator);
-
-        if (json_output) {
-            ever.status.printJson(&store_status, allocator);
-        } else {
-            ever.status.printHuman(&store_status);
-        }
+    if (json_output) {
+        ever.status.printJson(&store_status, allocator);
     } else {
-        std.debug.print("error: unknown store subcommand\n", .{});
-        std.process.exit(1);
+        ever.status.printHuman(&store_status);
     }
 }
 
@@ -822,11 +788,37 @@ const app = cli.App{
     .description = "lightweight event storage",
     .version = "0.1.0",
     .help_sections = &.{
-        .{ .title = "Core", .commands = &.{ "store start", "store status", "version", "help" } },
-        .{ .title = "Topics", .commands = &.{ "topic create", "topic list", "topic delete" } },
-        .{ .title = "Events", .commands = &.{ "pub", "sub", "wait", "on" } },
-        .{ .title = "Hooks", .commands = &.{ "hook add", "hook list", "hook rm" } },
-        .{ .title = "Timers", .commands = &.{ "timer add", "timer list", "timer rm", "timer info" } },
+        .{
+            .title = "Store Setup",
+            .entries = &.{
+                .{ .label = "start", .description = "Start the storage server" },
+                .{ .label = "status", .description = "Show store statistics" },
+            },
+        },
+        .{
+            .title = "Topic",
+            .entries = &.{
+                .{ .label = "topic create", .description = "Create a new topic" },
+                .{ .label = "topic list", .description = "List all topics" },
+                .{ .label = "topic delete", .description = "Delete a topic" },
+            },
+        },
+        .{
+            .title = "Access",
+            .entries = &.{
+                .{ .label = "pub", .description = "Publish an event" },
+                .{ .label = "sub", .description = "Subscribe to events" },
+                .{ .label = "wait", .description = "Block until events arrive" },
+                .{ .label = "on", .description = "Watch events and run command" },
+            },
+        },
+        .{
+            .title = "Other Subcommands",
+            .entries = &.{
+                .{ .label = "hook", .description = "Manage hooks triggered by events" },
+                .{ .label = "timer", .description = "Manage timer-based event generation" },
+            },
+        },
     },
     .commands = &.{
         .{
@@ -853,8 +845,8 @@ const app = cli.App{
                 .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                 .{ .name = "from", .default = "0", .description = "Start offset" },
                 .{ .name = "max", .default = "100", .description = "Max events" },
-                .{ .name = "follow", .description = "Follow new events" },
-                .{ .name = "json-values", .description = "Print only JSON values" },
+                .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
+                .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
             },
             .run = handleSub,
         },
@@ -870,7 +862,7 @@ const app = cli.App{
                 .{ .name = "count", .default = "1", .description = "Events to wait for" },
                 .{ .name = "timeout", .default = "0", .description = "Timeout in seconds" },
                 .{ .name = "from", .default = "0", .description = "Start offset" },
-                .{ .name = "json-values", .description = "Print only JSON values" },
+                .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
             },
             .run = handleWait,
         },
@@ -883,7 +875,7 @@ const app = cli.App{
             .flags = &.{
                 .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                 .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                .{ .name = "once", .description = "Exit after first event" },
+                .{ .name = "once", .takes_value = false, .description = "Exit after first event" },
                 .{ .name = "cmd", .description = "Command to execute" },
             },
             .run = handleOn,
@@ -900,7 +892,7 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTopic,
+                    .run = handleTopicCreate,
                 },
                 .{
                     .name = "list",
@@ -909,7 +901,7 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTopic,
+                    .run = handleTopicList,
                 },
                 .{
                     .name = "delete",
@@ -919,13 +911,13 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTopic,
+                    .run = handleTopicDelete,
                 },
             },
         },
         .{
             .name = "hook",
-            .description = "Manage server-side hooks",
+            .description = "Manage hooks triggered by events",
             .subcommands = &.{
                 .{
                     .name = "add",
@@ -934,10 +926,10 @@ const app = cli.App{
                     .flags = &.{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                        .{ .name = "once", .description = "Remove after first trigger" },
+                        .{ .name = "once", .takes_value = false, .description = "Remove after first trigger" },
                         .{ .name = "cmd", .description = "Command to execute" },
                     },
-                    .run = handleHook,
+                    .run = handleHookAdd,
                 },
                 .{
                     .name = "list",
@@ -946,7 +938,7 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleHook,
+                    .run = handleHookList,
                 },
                 .{
                     .name = "rm",
@@ -956,40 +948,34 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleHook,
+                    .run = handleHookRm,
                 },
             },
         },
         .{
-            .name = "store",
-            .description = "Manage the storage server",
-            .subcommands = &.{
-                .{
-                    .name = "start",
-                    .description = "Start the storage server",
-                    .flags = &.{
-                        .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
-                        .{ .name = "port", .default = "7890", .description = "Bind port" },
-                        .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
-                        .{ .name = "http-port", .default = "8890", .description = "HTTP API port" },
-                        .{ .name = "no-http", .description = "Disable HTTP server" },
-                    },
-                    .run = handleStore,
-                },
-                .{
-                    .name = "status",
-                    .description = "Show store statistics",
-                    .flags = &.{
-                        .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
-                        .{ .name = "json", .description = "Output as JSON" },
-                    },
-                    .run = handleStore,
-                },
+            .name = "start",
+            .description = "Start the storage server",
+            .flags = &.{
+                .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
+                .{ .name = "port", .default = "7890", .description = "Bind port" },
+                .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                .{ .name = "http-port", .default = "8890", .description = "HTTP API port" },
+                .{ .name = "no-http", .takes_value = false, .description = "Disable HTTP server" },
             },
+            .run = handleStart,
+        },
+        .{
+            .name = "status",
+            .description = "Show store statistics",
+            .flags = &.{
+                .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                .{ .name = "json", .takes_value = false, .description = "Output as JSON" },
+            },
+            .run = handleStatus,
         },
         .{
             .name = "timer",
-            .description = "Manage recurring timers",
+            .description = "Manage timer-based event generation",
             .subcommands = &.{
                 .{
                     .name = "add",
@@ -997,16 +983,16 @@ const app = cli.App{
                     .args = &.{
                         .{ .name = "name", .required = true, .description = "Timer name" },
                         .{ .name = "topic", .required = true, .description = "Topic to publish to" },
-                        .{ .name = "payload", .required = false, .description = "JSON payload" },
+                        .{ .name = "payload", .required = false, .description = "JSON payload (optional)" },
                     },
                     .flags = &.{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                        .{ .name = "every", .description = "Interval (e.g., 5s, 1m)" },
-                        .{ .name = "cron", .description = "Cron expression" },
-                        .{ .name = "cmd", .description = "Command to execute" },
+                        .{ .name = "every", .value_name = "INTERVAL", .description = "Interval (e.g. 5s, 1m, 2h)" },
+                        .{ .name = "cron", .value_name = "EXPR", .description = "Cron expression" },
+                        .{ .name = "no-persist", .takes_value = false, .description = "Don't catch up missed fires" },
                     },
-                    .run = handleTimer,
+                    .run = handleTimerAdd,
                 },
                 .{
                     .name = "list",
@@ -1015,7 +1001,7 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTimer,
+                    .run = handleTimerList,
                 },
                 .{
                     .name = "rm",
@@ -1025,7 +1011,7 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTimer,
+                    .run = handleTimerRm,
                 },
                 .{
                     .name = "info",
@@ -1035,11 +1021,10 @@ const app = cli.App{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
-                    .run = handleTimer,
+                    .run = handleTimerInfo,
                 },
             },
         },
-
     },
 };
 
