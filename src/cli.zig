@@ -208,29 +208,64 @@ pub const App = struct {
     }
 
     fn printHelp(self: *const App) void {
-        std.debug.print("╭ {s} — {s}", .{ self.name, self.description });
-        var p: usize = 64 - self.name.len - self.description.len - 5;
-        while (p > 0) : (p -= 1) std.debug.print("─", .{});
-        std.debug.print(" ╮\n", .{});
-
+        const is_tty = std.c.isatty(std.posix.STDERR_FILENO) != 0;
+        
+        // Title line with color
+        if (is_tty) {
+            std.debug.print("\x1b[38;2;130;170;255m{s}\x1b[0m — {s}\n\n", .{ self.name, self.description });
+        } else {
+            std.debug.print("{s} — {s}\n\n", .{ self.name, self.description });
+        }
+        
+        std.debug.print("Usage: {s} <command> [options]\n\n", .{self.name});
+        
+        // Color for section headers
+        const header_color = "\x1b[38;2;130;170;255m";
+        const reset = "\x1b[0m";
+        
+        if (is_tty) {
+            std.debug.print("{s}Commands:{s}\n", .{ header_color, reset });
+        } else {
+            std.debug.print("Commands:\n", .{});
+        }
+        
         if (self.help_sections) |sections| {
             for (sections) |sec| {
-                std.debug.print("│  {s}:\n", .{sec.title});
                 for (sec.commands) |cmd_name| {
                     const cmd = self.findCommand(cmd_name);
                     if (cmd) |c| {
-                        std.debug.print("│    {s:<16} {s}\n", .{ c.name, c.description });
+                        // Build flags string
+                        var flags_buf: [256]u8 = undefined;
+                        var flags_len: usize = 0;
+                        if (c.flags.len > 0) {
+                            var first = true;
+                            for (c.flags) |flag| {
+                                if (flag.description.len > 0) {
+                                    if (!first) {
+                                        flags_buf[flags_len] = ',';
+                                        flags_len += 1;
+                                        flags_buf[flags_len] = ' ';
+                                        flags_len += 1;
+                                    }
+                                    const result = std.fmt.bufPrint(flags_buf[flags_len..], "--{s}", .{flag.name}) catch break;
+                                    flags_len += result.len;
+                                    first = false;
+                                    if (flags_len > 250) break;
+                                }
+                            }
+                        }
+                        
+                        if (flags_len > 0) {
+                            std.debug.print("  {s:<15} {s} ({s})\n", .{ cmd_name, c.description, flags_buf[0..flags_len] });
+                        } else {
+                            std.debug.print("  {s:<15} {s}\n", .{ cmd_name, c.description });
+                        }
                     }
                 }
             }
         }
-
-        std.debug.print("│  Flags:\n", .{});
-        std.debug.print("│    -h, --help       Show help\n", .{});
-        std.debug.print("╰", .{});
-        var b: usize = 0;
-        while (b < 66) : (b += 1) std.debug.print("─", .{});
-        std.debug.print("╯\n", .{});
+        
+        std.debug.print("\nRun '{s} <command> --help' for more information.\n", .{ self.name });
     }
 
     fn printCommandHelp(self: *const App, cmd: Command) void {

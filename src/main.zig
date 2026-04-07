@@ -504,6 +504,18 @@ fn handleStore(ctx: *const cli.Context) !void {
     }
 }
 
+fn handleTimer(ctx: *const cli.Context) !void {
+    const sub = ctx.arg("subcommand");
+
+    if (sub.len == 0) {
+        std.debug.print("error: subcommand is required (add|list|rm|info)\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("error: timer commands not yet implemented\n", .{});
+    std.process.exit(1);
+}
+
 fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, envp: [*:null]const ?[*:0]const u8) !void {
     const address = ctx.flag("address");
     const port_str = ctx.flag("port");
@@ -675,11 +687,11 @@ const app = cli.App{
     .description = "lightweight event storage",
     .version = "0.1.0",
     .help_sections = &.{
-        .{ .title = "Event Commands", .commands = &.{ "pub", "sub", "wait", "on" } },
-        .{ .title = "Store Management", .commands = &.{ "store start" } },
+        .{ .title = "Core", .commands = &.{ "store start", "store status", "version", "help" } },
         .{ .title = "Topics", .commands = &.{ "topic create", "topic list", "topic delete" } },
+        .{ .title = "Events", .commands = &.{ "pub", "sub", "wait", "on" } },
         .{ .title = "Hooks", .commands = &.{ "hook add", "hook list", "hook rm" } },
-        .{ .title = "Information", .commands = &.{ "version", "help" } },
+        .{ .title = "Timers", .commands = &.{ "timer add", "timer list", "timer rm", "timer info" } },
     },
     .commands = &.{
         .{
@@ -824,8 +836,67 @@ const app = cli.App{
                         .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
                         .{ .name = "port", .default = "7890", .description = "Bind port" },
                         .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                        .{ .name = "http-port", .default = "4280", .description = "HTTP API port" },
+                        .{ .name = "no-http", .description = "Disable HTTP server" },
                     },
                     .run = handleStore,
+                },
+                .{
+                    .name = "status",
+                    .description = "Show store statistics",
+                    .flags = &.{
+                        .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                        .{ .name = "json", .description = "Output as JSON" },
+                    },
+                    .run = handleStore,
+                },
+            },
+        },
+        .{
+            .name = "timer",
+            .description = "Manage recurring timers",
+            .subcommands = &.{
+                .{
+                    .name = "add",
+                    .description = "Add a recurring timer",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                        .{ .name = "every", .description = "Interval (e.g., 5s, 1m)" },
+                        .{ .name = "cron", .description = "Cron expression" },
+                        .{ .name = "cmd", .description = "Command to execute" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "list",
+                    .description = "List registered timers",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "rm",
+                    .description = "Remove a timer by name",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "info",
+                    .description = "Show timer details",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
                 },
             },
         },
