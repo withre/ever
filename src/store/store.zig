@@ -111,7 +111,7 @@ pub const Log = struct {
     segments: std.ArrayList(Segment) = .empty,
     next_offset: u64 = 0,
     config: Config,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.atomic.Mutex ,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !Log {
         var log = Log{
@@ -119,6 +119,7 @@ pub const Log = struct {
             .io = io,
             .dir = dir,
             .config = config,
+            .mutex = .unlocked,
         };
         try log.recover();
         return log;

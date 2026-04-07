@@ -37,7 +37,7 @@ pub const TopicManager = struct {
     allocator: Allocator,
     log: Log,
     topics: std.StringArrayHashMap(TopicIndex),
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.atomic.Mutex ,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !TopicManager {
         const log = try Log.init(allocator, io, dir, .{
@@ -49,6 +49,7 @@ pub const TopicManager = struct {
             .allocator = allocator,
             .log = log,
             .topics = std.StringArrayHashMap(TopicIndex).init(allocator),
+            .mutex = .unlocked,
         };
 
         // Rebuild topic index from log contents

@@ -46,7 +46,7 @@ pub fn parseStoreAddress(ctx: *const cli.Context, env_block: [*:null]const ?[*:0
 
 fn handlePub(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const topic = ctx.arg("topic");
     const data = ctx.arg("data");
@@ -60,7 +60,7 @@ fn handlePub(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
     var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
@@ -70,7 +70,7 @@ fn handlePub(ctx: *const cli.Context) !void {
 
 fn handleSub(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
     if (topic_name.len == 0) {
@@ -83,7 +83,7 @@ fn handleSub(ctx: *const cli.Context) !void {
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
 
     var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
@@ -124,7 +124,7 @@ fn handleSub(ctx: *const cli.Context) !void {
 
 fn handleWait(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
     if (topic_name.len == 0) {
@@ -137,7 +137,7 @@ fn handleWait(ctx: *const cli.Context) !void {
     const from_offset = ctx.flagInt(u64, "from");
     const json_values = ctx.flagBool("json-values");
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
 
     var client = ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port) catch
@@ -178,8 +178,8 @@ fn handleWait(ctx: *const cli.Context) !void {
 
 fn handleOn(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
-    const envp: [*:null]const ?[*:0]const u8 = undefined;
+    const io = ctx.io;
+    const envp = ctx.envp;
 
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
@@ -194,7 +194,7 @@ fn handleOn(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
     const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
         (pattern.len > 0 and pattern[pattern.len - 1] == '.');
@@ -317,7 +317,7 @@ fn handleOn(ctx: *const cli.Context) !void {
 
 fn handleTopic(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const sub = ctx.arg("subcommand");
     const name = ctx.arg("name");
@@ -327,7 +327,7 @@ fn handleTopic(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
 
     if (std.mem.eql(u8, sub, "create")) {
@@ -365,7 +365,7 @@ fn handleTopic(ctx: *const cli.Context) !void {
 
 fn handleHook(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const sub = ctx.arg("subcommand");
 
@@ -374,7 +374,7 @@ fn handleHook(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
 
     if (std.mem.eql(u8, sub, "add")) {
@@ -471,7 +471,7 @@ fn handleHook(ctx: *const cli.Context) !void {
 
 fn handleTimer(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
+    const io = ctx.io;
 
     const sub = ctx.arg("subcommand");
 
@@ -480,7 +480,7 @@ fn handleTimer(ctx: *const cli.Context) !void {
         std.process.exit(1);
     }
 
-    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const env_block = ctx.envp;
     const addr_info = parseStoreAddress(ctx, env_block);
 
     if (std.mem.eql(u8, sub, "add")) {
@@ -585,10 +585,14 @@ fn handleTimer(ctx: *const cli.Context) !void {
 
 fn handleStore(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
-    const io: std.Io = undefined; // Will be set from init
-    const envp: [*:null]const ?[*:0]const u8 = undefined;
+    const io = ctx.io;
+    const envp = ctx.envp;
 
-    const sub = ctx.arg("subcommand");
+    // Extract subcommand from command_name (e.g., "store start" -> "start")
+    const sub = if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |space|
+        ctx.command_name[space + 1 ..]
+    else
+        ctx.arg("subcommand");
 
     if (sub.len == 0) {
         std.debug.print("error: subcommand is required (start)\n", .{});

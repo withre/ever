@@ -69,13 +69,17 @@ pub const Context = struct {
     positional: std.StringHashMap([]const u8),
     allocator: std.mem.Allocator,
     io: std.Io,
+    envp: [*:null]const ?[*:0]const u8,
+    command_name: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) Context {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, envp: [*:null]const ?[*:0]const u8) Context {
         return .{
             .flags = std.StringHashMap([]const u8).init(allocator),
             .positional = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
             .io = io,
+            .envp = envp,
+            .command_name = "",
         };
     }
 
@@ -132,14 +136,43 @@ pub const App = struct {
             return;
         }
 
-        const cmd = self.findCommand(command_name);
+        // Find the command - check for parent+subcommand pattern
+        var parent_cmd: ?Command = null;
+        var sub_cmd: ?Command = null;
+        var full_cmd_name: []const u8 = command_name;
+
+        // First try to find as a simple command
+        const simple_cmd = self.findCommand(command_name);
+        if (simple_cmd) |cmd_found| {
+            if (cmd_found.subcommands.len > 0) {
+                // This is a parent command - check if there's a subcommand
+                if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) {
+                    const sub_name = args[2];
+                    for (cmd_found.subcommands) |sub| {
+                        if (std.mem.eql(u8, sub.name, sub_name)) {
+                            parent_cmd = cmd_found;
+                            sub_cmd = sub;
+                            full_cmd_name = std.fmt.allocPrint(std.heap.page_allocator, "{s} {s}", .{ command_name, sub_name }) catch sub_name;
+                            break;
+                        }
+                    }
+                }
+                if (sub_cmd == null) {
+                    // Parent command without valid subcommand
+                    parent_cmd = cmd_found;
+                }
+            }
+        }
+
+        const cmd = sub_cmd orelse simple_cmd;
         if (cmd == null) {
             std.debug.print("unknown command '{s}'. Run '{s} help'.\n", .{ command_name, self.name });
             std.process.exit(1);
         }
 
-        var ctx = Context.init(allocator, io);
+        var ctx = Context.init(allocator, io, env_block);
         defer ctx.deinit();
+        ctx.command_name = if (parent_cmd != null and sub_cmd != null) full_cmd_name else command_name;
 
         // Initialize defaults
         for (cmd.?.flags) |flag| {
@@ -149,7 +182,7 @@ pub const App = struct {
         }
 
         // Parse flags and positionals
-        var i: usize = 2;
+        var i: usize = if (parent_cmd != null and sub_cmd != null) 3 else 2;
         var positional_idx: usize = 0;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
@@ -189,7 +222,6 @@ pub const App = struct {
             return;
         }
 
-        _ = env_block;
         if (cmd.?.run) |run_fn| {
             try run_fn(&ctx);
         }
@@ -299,7 +331,8 @@ pub const App = struct {
 
 test "cli basics" {
     const allocator = std.testing.allocator;
-    var ctx = Context.init(allocator, std.testing.io);
+    const envp: [*:null]const ?[*:0]const u8 = &.{};
+    var ctx = Context.init(allocator, std.testing.io, envp);
     defer ctx.deinit();
 
     try ctx.flags.put("port", "8080");
