@@ -13,6 +13,7 @@ const Event = @import("store.zig").Event;
 pub const TopicInfo = struct {
     name: []const u8,
     events: u64,
+    deleted: bool = false,
 };
 
 pub const HookInfo = struct {
@@ -81,6 +82,9 @@ fn getStatusFromDirWithPath(alloc: Allocator, io_: Io, dir: Dir, data_dir_path: 
         for (topic_counts.keys()) |k| alloc.free(k);
         topic_counts.deinit();
     }
+    // Track which topics have been soft-deleted (tombstone marker)
+    var deleted_set = std.StringHashMap(void).init(alloc);
+    defer deleted_set.deinit(); // keys point into topic_counts, no separate free
 
     var total_events: u64 = 0;
     {
@@ -138,6 +142,17 @@ fn getStatusFromDirWithPath(alloc: Allocator, io_: Io, dir: Dir, data_dir_path: 
                             gop.value_ptr.* += 1;
                             total_events += 1;
                         }
+
+                        // Check for deletion tombstone marker:
+                        // key == "__ever_tombstone__" and val_len == 0
+                        if (val_len == 0 and key_len == 18) {
+                            const tombstone_key = "__ever_tombstone__";
+                            var key_buf: [18]u8 = undefined;
+                            const kn = file.readPositionalAll(io_, &key_buf, pos + Event.header_size + topic_len) catch break;
+                            if (kn == 18 and std.mem.eql(u8, &key_buf, tombstone_key)) {
+                                try deleted_set.put(gop.key_ptr.*, {});
+                            }
+                        }
                     }
                 }
 
@@ -151,7 +166,7 @@ fn getStatusFromDirWithPath(alloc: Allocator, io_: Io, dir: Dir, data_dir_path: 
     const values = topic_counts.values();
     const topics = try alloc.alloc(TopicInfo, keys.len);
     for (keys, values, 0..) |k, v, i| {
-        topics[i] = .{ .name = try alloc.dupe(u8, k), .events = v };
+        topics[i] = .{ .name = try alloc.dupe(u8, k), .events = v, .deleted = deleted_set.contains(k) };
     }
 
     // 3. Read hooks.json
@@ -320,10 +335,11 @@ pub fn printHuman(status: *const StoreStatus) void {
         for (status.topics) |t| {
             var evt_buf: [32]u8 = undefined;
             const evt_str = formatNumber(&evt_buf, t.events);
+            const marker: []const u8 = if (t.deleted) " (deleted)" else "";
             if (t.events == 1) {
-                std.debug.print("    {s:<25} {s:>10} event\n", .{ t.name, evt_str });
+                std.debug.print("    {s}{s:<25} {s:>10} event\n", .{ t.name, marker, evt_str });
             } else {
-                std.debug.print("    {s:<25} {s:>10} events\n", .{ t.name, evt_str });
+                std.debug.print("    {s}{s:<25} {s:>10} events\n", .{ t.name, marker, evt_str });
             }
         }
     }
@@ -367,7 +383,11 @@ pub fn printJson(status: *const StoreStatus, alloc: Allocator) void {
     for (status.topics, 0..) |t, i| {
         json.appendSlice(alloc, "    {\"name\": \"") catch return;
         json.appendSlice(alloc, t.name) catch return;
-        appendFmt(&json, alloc, "\", \"events\": {d}}}", .{t.events});
+        appendFmt(&json, alloc, "\", \"events\": {d}", .{t.events});
+        if (t.deleted) {
+            json.appendSlice(alloc, ", \"deleted\": true") catch return;
+        }
+        json.appendSlice(alloc, "}") catch return;
         if (i + 1 < status.topics.len) {
             json.appendSlice(alloc, ",\n") catch return;
         } else {

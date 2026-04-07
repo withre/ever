@@ -166,6 +166,7 @@ pub const Server = struct {
 
         const offset = self.topic_manager.publish(req.topic, req.key, req.value) catch |err| return switch (err) {
             error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
+            error.TopicDeleted => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "topic is deleted"),
             else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "publish failed"),
         };
 
@@ -263,8 +264,15 @@ pub const Server = struct {
     fn handleListTopics(self: *Server, fd: std.posix.fd_t) !void {
         const topics = self.topic_manager.listTopics(self.allocator) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "list topics failed");
-        defer { for (topics) |t| self.allocator.free(t); self.allocator.free(topics); }
-        const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTopicsResponse{ .topics = topics });
+        defer { for (topics) |t| self.allocator.free(t.name); self.allocator.free(topics); }
+
+        const topic_infos = try self.allocator.alloc(protocol.TopicInfoItem, topics.len);
+        defer self.allocator.free(topic_infos);
+        for (topics, 0..) |t, i| {
+            topic_infos[i] = .{ .name = t.name, .deleted = t.deleted };
+        }
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTopicsResponse{ .topics = topic_infos });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .list_topics_ok, resp_body);
     }

@@ -92,8 +92,13 @@ pub const TopicRequest = struct {
     topic: []const u8,
 };
 
+pub const TopicInfoItem = struct {
+    name: []const u8,
+    deleted: bool = false,
+};
+
 pub const ListTopicsResponse = struct {
-    topics: []const []const u8,
+    topics: []const TopicInfoItem,
 };
 
 pub const AckRequest = struct {

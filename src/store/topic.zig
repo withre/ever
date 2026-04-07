@@ -16,11 +16,21 @@ pub const TopicError = error{
     AlreadyExists,
     NotFound,
     InvalidName,
+    TopicDeleted,
 };
+
+/// Sentinel key written to the log to mark a topic as soft-deleted.
+const deletion_marker_key = "__ever_tombstone__";
 
 pub const Config = struct {
     max_segment_size: u64 = 64 * 1024 * 1024,
     sync_on_append: bool = true,
+};
+
+/// Information about a topic for listing purposes.
+pub const TopicListEntry = struct {
+    name: []const u8,
+    deleted: bool,
 };
 
 /// Per-topic index: tracks which global offsets belong to this topic.
@@ -37,6 +47,7 @@ pub const TopicManager = struct {
     allocator: Allocator,
     log: Log,
     topics: std.StringArrayHashMap(TopicIndex),
+    deleted_topics: std.StringHashMap(void),
     mutex: std.atomic.Mutex ,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !TopicManager {
@@ -49,6 +60,7 @@ pub const TopicManager = struct {
             .allocator = allocator,
             .log = log,
             .topics = std.StringArrayHashMap(TopicIndex).init(allocator),
+            .deleted_topics = std.StringHashMap(void).init(allocator),
             .mutex = .unlocked,
         };
 
@@ -59,6 +71,7 @@ pub const TopicManager = struct {
     }
 
     pub fn deinit(self: *TopicManager) void {
+        self.deleted_topics.deinit();
         var iter = self.topics.iterator();
         while (iter.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -89,36 +102,55 @@ pub const TopicManager = struct {
         try self.topics.put(owned, idx);
     }
 
-    /// Remove a topic from the index. Log data stays (no compaction yet).
+    /// Soft-delete a topic. The topic stays in the index but is marked as
+    /// deleted. Historical events remain readable; new publishes are rejected.
+    /// A tombstone marker is written to the log so the state survives restart.
     pub fn deleteTopic(self: *TopicManager, name: []const u8) !void {
         self.lock();
         defer self.mutex.unlock();
-        const entry = self.topics.fetchSwapRemove(name) orelse return TopicError.NotFound;
-        var idx = entry.value;
-        idx.deinit(self.allocator);
-        self.allocator.free(entry.key);
+        if (!self.topics.contains(name)) return TopicError.NotFound;
+        if (self.deleted_topics.contains(name)) return TopicError.NotFound;
+
+        // Write a tombstone marker to the log so rebuildIndex picks it up.
+        const idx = self.topics.getPtr(name).?;
+        const offset = try self.log.append(name, deletion_marker_key, "");
+        try idx.offsets.append(self.allocator, offset);
+
+        // Mark as deleted (key points to the owned string inside `topics`).
+        const owned_key = self.topics.getKey(name).?;
+        try self.deleted_topics.put(owned_key, {});
     }
 
-    /// Check if a topic exists.
+    /// Check if a topic exists (including soft-deleted topics).
     pub fn hasTopic(self: *TopicManager, name: []const u8) bool {
         self.lock();
         defer self.mutex.unlock();
         return self.topics.contains(name);
     }
 
+    /// Check if a topic is soft-deleted.
+    pub fn isTopicDeleted(self: *TopicManager, name: []const u8) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.deleted_topics.contains(name);
+    }
+
     /// List all topic names. Caller owns the returned slice and strings.
-    pub fn listTopics(self: *TopicManager, allocator: Allocator) ![][]const u8 {
+    pub fn listTopics(self: *TopicManager, allocator: Allocator) ![]TopicListEntry {
         self.lock();
         defer self.mutex.unlock();
         const keys = self.topics.keys();
-        const result = try allocator.alloc([]const u8, keys.len);
+        const result = try allocator.alloc(TopicListEntry, keys.len);
         var initialized: usize = 0;
         errdefer {
-            for (result[0..initialized]) |s| allocator.free(s);
+            for (result[0..initialized]) |e| allocator.free(e.name);
             allocator.free(result);
         }
         for (keys, 0..) |key, i| {
-            result[i] = try allocator.dupe(u8, key);
+            result[i] = .{
+                .name = try allocator.dupe(u8, key),
+                .deleted = self.deleted_topics.contains(key),
+            };
             initialized = i + 1;
         }
         return result;
@@ -138,9 +170,11 @@ pub const TopicManager = struct {
     }
 
     /// Publish an event to a topic. Returns the global offset.
+    /// Returns TopicDeleted if the topic has been soft-deleted.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
         self.lock();
         defer self.mutex.unlock();
+        if (self.deleted_topics.contains(topic_name)) return TopicError.TopicDeleted;
         const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
         const offset = try self.log.append(topic_name, key, value);
         try idx.offsets.append(self.allocator, offset);
@@ -162,7 +196,7 @@ pub const TopicManager = struct {
         var i: usize = 0;
         while (i < offsets.len and events.items.len < max_count) : (i += 1) {
             const event = (try self.log.read(allocator, offsets[i])) orelse continue;
-            // Skip marker events (empty value from createTopic)
+            // Skip marker events (creation markers and tombstones)
             if (event.value.len == 0) {
                 if (skipped < start) skipped += 1;
                 store.freeEvent(allocator, event);
@@ -176,7 +210,7 @@ pub const TopicManager = struct {
     }
 
     /// Fetch events across all topics matching a pattern.
-    /// Skips internal marker events (empty value from createTopic).
+    /// Skips internal marker events (creation markers and tombstones).
     pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
         self.lock();
         defer self.mutex.unlock();
@@ -192,6 +226,7 @@ pub const TopicManager = struct {
             var i: usize = 0;
             while (i < offsets.len and events.items.len < max_count) : (i += 1) {
                 const event = (try self.log.read(allocator, offsets[i])) orelse continue;
+                // Skip marker events (creation markers and tombstones)
                 if (event.value.len == 0) {
                     if (skipped < start) skipped += 1;
                     store.freeEvent(allocator, event);
@@ -221,6 +256,15 @@ pub const TopicManager = struct {
                 gop.value_ptr.* = .{};
             }
             try gop.value_ptr.offsets.append(self.allocator, offset);
+
+            // Detect deletion tombstone markers
+            if (event.key) |key| {
+                if (std.mem.eql(u8, key, deletion_marker_key) and event.value.len == 0) {
+                    const owned_key = gop.key_ptr.*;
+                    try self.deleted_topics.put(owned_key, {});
+                }
+            }
+
             offset += 1;
         }
     }
@@ -374,10 +418,94 @@ test "TopicManager create delete list" {
     try tm.createTopic("b");
     try std.testing.expectError(TopicError.AlreadyExists, tm.createTopic("a"));
     const list = try tm.listTopics(std.testing.allocator);
-    defer { for (list) |l| std.testing.allocator.free(l); std.testing.allocator.free(list); }
+    defer { for (list) |l| std.testing.allocator.free(l.name); std.testing.allocator.free(list); }
     try std.testing.expectEqual(@as(usize, 2), list.len);
 
+    // Soft-delete: topic still exists but is marked deleted
     try tm.deleteTopic("a");
-    try std.testing.expect(!tm.hasTopic("a"));
+    try std.testing.expect(tm.hasTopic("a"));
+    try std.testing.expect(tm.isTopicDeleted("a"));
+    // Cannot delete again
     try std.testing.expectError(TopicError.NotFound, tm.deleteTopic("a"));
+}
+
+test "TopicManager soft-delete blocks publish but allows fetch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t1");
+    _ = try tm.publish("t1", "k", "before-delete");
+    try tm.deleteTopic("t1");
+
+    // Publish should fail
+    try std.testing.expectError(TopicError.TopicDeleted, tm.publish("t1", null, "after-delete"));
+
+    // Fetch should still work and return the pre-deletion event
+    const events = try tm.fetch(std.testing.allocator, "t1", 0, 10);
+    defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("before-delete", events[0].value);
+}
+
+test "TopicManager soft-delete survives restart" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try tm.createTopic("persist");
+        _ = try tm.publish("persist", null, "data");
+        try tm.deleteTopic("persist");
+    }
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try std.testing.expect(tm.hasTopic("persist"));
+        try std.testing.expect(tm.isTopicDeleted("persist"));
+
+        // Should still be readable
+        const events = try tm.fetch(std.testing.allocator, "persist", 0, 10);
+        defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+        try std.testing.expectEqual(@as(usize, 1), events.len);
+        try std.testing.expectEqualStrings("data", events[0].value);
+
+        // Should not be publishable
+        try std.testing.expectError(TopicError.TopicDeleted, tm.publish("persist", null, "nope"));
+    }
+}
+
+test "TopicManager listTopics shows deleted flag" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("alive");
+    try tm.createTopic("dead");
+    try tm.deleteTopic("dead");
+
+    const list = try tm.listTopics(std.testing.allocator);
+    defer { for (list) |l| std.testing.allocator.free(l.name); std.testing.allocator.free(list); }
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+
+    var found_alive = false;
+    var found_dead = false;
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry.name, "alive")) {
+            try std.testing.expect(!entry.deleted);
+            found_alive = true;
+        }
+        if (std.mem.eql(u8, entry.name, "dead")) {
+            try std.testing.expect(entry.deleted);
+            found_dead = true;
+        }
+    }
+    try std.testing.expect(found_alive);
+    try std.testing.expect(found_dead);
 }

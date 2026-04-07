@@ -393,7 +393,17 @@ pub const Client = struct {
         }
 
         for (parsed.value.topics, 0..) |t, i| {
-            result[i] = try self.allocator.dupe(u8, t);
+            if (t.deleted) {
+                // Append " (deleted)" marker to the name for display
+                const name_len = t.name.len;
+                const suffix = " (deleted)";
+                const buf = try self.allocator.alloc(u8, name_len + suffix.len);
+                @memcpy(buf[0..name_len], t.name);
+                @memcpy(buf[name_len..], suffix);
+                result[i] = buf;
+            } else {
+                result[i] = try self.allocator.dupe(u8, t.name);
+            }
             initialized = i + 1;
         }
 

@@ -223,11 +223,19 @@ pub const HttpServer = struct {
             return self.respondError(request, .internal_server_error, "list topics failed");
         };
         defer {
-            for (topics) |t| self.allocator.free(t);
+            for (topics) |t| self.allocator.free(t.name);
             self.allocator.free(topics);
         }
 
-        const resp = protocol.ListTopicsResponse{ .topics = topics };
+        const topic_infos = self.allocator.alloc(protocol.TopicInfoItem, topics.len) catch {
+            return self.respondError(request, .internal_server_error, "encoding failed");
+        };
+        defer self.allocator.free(topic_infos);
+        for (topics, 0..) |t, i| {
+            topic_infos[i] = .{ .name = t.name, .deleted = t.deleted };
+        }
+
+        const resp = protocol.ListTopicsResponse{ .topics = topic_infos };
         const json = protocol.encodeBody(self.allocator, resp) catch {
             return self.respondError(request, .internal_server_error, "encoding failed");
         };
@@ -256,6 +264,7 @@ pub const HttpServer = struct {
 
         const offset = self.topic_manager.publish(topic_name, parsed.value.key, parsed.value.value) catch |err| return switch (err) {
             error.NotFound => self.respondError(request, .not_found, "topic not found"),
+            error.TopicDeleted => self.respondError(request, .conflict, "topic is deleted"),
             else => self.respondError(request, .internal_server_error, "publish failed"),
         };
 
