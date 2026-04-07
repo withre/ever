@@ -319,7 +319,13 @@ fn handleTopic(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const sub = ctx.arg("subcommand");
+    // Extract subcommand from command_name (e.g. "topic list" -> "list")
+    const sub = blk: {
+        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
+            break :blk ctx.command_name[idx + 1..];
+        }
+        break :blk "";
+    };
     const name = ctx.arg("name");
 
     if (sub.len == 0) {
@@ -367,7 +373,13 @@ fn handleHook(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const sub = ctx.arg("subcommand");
+    // Extract subcommand from command_name (e.g. "hook add" -> "add")
+    const sub = blk: {
+        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
+            break :blk ctx.command_name[idx + 1..];
+        }
+        break :blk "";
+    };
 
     if (sub.len == 0) {
         std.debug.print("error: subcommand is required (add|list|rm)\n", .{});
@@ -473,7 +485,13 @@ fn handleTimer(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const sub = ctx.arg("subcommand");
+    // Extract subcommand from command_name (e.g. "timer add" -> "add")
+    const sub = blk: {
+        if (std.mem.indexOfScalar(u8, ctx.command_name, ' ')) |idx| {
+            break :blk ctx.command_name[idx + 1..];
+        }
+        break :blk "";
+    };
 
     if (sub.len == 0) {
         std.debug.print("error: subcommand is required (add|list|rm|info)\n", .{});
@@ -1017,56 +1035,7 @@ const app = cli.App{
                 },
             },
         },
-        .{
-            .name = "timer",
-            .description = "Manage scheduled timers",
-            .subcommands = &.{
-                .{
-                    .name = "add",
-                    .description = "Add a new timer",
-                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                        .{ .name = "every", .description = "Interval (e.g., 5m, 1h, 1d)" },
-                        .{ .name = "cron", .description = "Cron expression (e.g., \"0 3 * * *\")" },
-                        .{ .name = "topic", .description = "Topic to publish to" },
-                        .{ .name = "payload", .description = "JSON payload" },
-                        .{ .name = "no-persist", .description = "Don't persist timer" },
-                    },
-                    .run = handleTimer,
-                },
-                .{
-                    .name = "list",
-                    .description = "List all timers",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
-                    .run = handleTimer,
-                },
-                .{
-                    .name = "rm",
-                    .description = "Remove a timer by name",
-                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
-                    .run = handleTimer,
-                },
-                .{
-                    .name = "info",
-                    .description = "Show timer details",
-                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
-                    .run = handleTimer,
-                },
-            },
-        },
+
     },
 };
 
