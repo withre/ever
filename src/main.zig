@@ -974,7 +974,6 @@ fn getTimestamp() struct { year: u16, month: u8, day: u8, hour: u8, minute: u8, 
     _ = std.os.linux.clock_gettime(.REALTIME, &ts);
     const secs: u64 = @intCast(ts.sec);
 
-    // Convert epoch seconds to date/time
     const SECS_PER_DAY = 86400;
     const days = secs / SECS_PER_DAY;
     const day_secs = secs % SECS_PER_DAY;
@@ -982,7 +981,6 @@ fn getTimestamp() struct { year: u16, month: u8, day: u8, hour: u8, minute: u8, 
     const minute: u8 = @intCast((day_secs % 3600) / 60);
     const second: u8 = @intCast(day_secs % 60);
 
-    // Days since 1970-01-01 to Y-M-D
     var y: u16 = 1970;
     var remaining = days;
     while (true) {

@@ -486,7 +486,7 @@ pub const HookDaemon = struct {
 
         for (hooks) |hook| {
             self.processHook(hook) catch |err| {
-                std.debug.print("Hook #{d} error: {}\n", .{ hook.id, err });
+                logTimestampedFmt("Hook #{d} error: {}", .{ hook.id, err });
             };
         }
     }
@@ -513,14 +513,14 @@ pub const HookDaemon = struct {
         // updateCursor briefly acquires hook_table mutex only for the cursor write.
         for (events, 0..) |event, i| {
             self.executeHookCommand(hook, event) catch |err| {
-                std.debug.print("Hook #{d} command failed: {}\n", .{ hook.id, err });
+                logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
             };
             self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
 
             // One-shot hooks: remove after first event execution
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
-                std.debug.print("Hook #{d} (once) auto-removed after firing.\n", .{hook.id});
+                logTimestampedFmt("Hook #{d} (once) auto-removed after firing.", .{hook.id});
                 return;
             }
         }
@@ -651,7 +651,7 @@ pub const HookDaemon = struct {
         _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
         const exit_code = (status >> 8) & 0xFF;
         if (exit_code != 0) {
-            std.debug.print("Hook #{d} command exited with status {d}\n", .{ hook.id, exit_code });
+            logTimestampedFmt("Hook #{d} command exited with status {d}", .{ hook.id, exit_code });
         }
     }
 };
@@ -728,6 +728,40 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: Allocator, s: []const 
             }
         },
     };
+}
+
+fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    const secs: u64 = @intCast(ts.sec);
+
+    const SECS_PER_DAY = 86400;
+    const days = secs / SECS_PER_DAY;
+    const day_secs = secs % SECS_PER_DAY;
+    const hour: u8 = @intCast(day_secs / 3600);
+    const minute: u8 = @intCast((day_secs % 3600) / 60);
+    const second: u8 = @intCast(day_secs % 60);
+
+    var y: u16 = 1970;
+    var remaining = days;
+    while (true) {
+        const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+        const year_days: u64 = if (is_leap) 366 else 365;
+        if (remaining < year_days) break;
+        remaining -= year_days;
+        y += 1;
+    }
+    const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+    const month_days = [12]u8{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var m: u8 = 0;
+    while (m < 12) : (m += 1) {
+        if (remaining < month_days[m]) break;
+        remaining -= month_days[m];
+    }
+
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "<fmt error>";
+    std.debug.print("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}] {s}\n", .{ y, m + 1, @as(u8, @intCast(remaining + 1)), hour, minute, second, msg });
 }
 
 fn getMilliTimestamp() i64 {

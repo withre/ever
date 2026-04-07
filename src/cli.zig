@@ -284,10 +284,10 @@ pub const App = struct {
 
     fn printRootHelp(self: *const App) void {
         const tty = isTty();
-        const title_c = if (tty) "\x1b[38;2;130;170;255m" else "";
-        const section_c = if (tty) "\x1b[38;2;200;180;80m\x1b[1m" else "";
-        const cmd_c = if (tty) "\x1b[38;2;120;180;200m" else "";
-        const desc_c = if (tty) "\x1b[38;2;140;140;140m" else "";
+        const title_c = if (tty) "\x1b[38;2;140;170;210m" else "";
+        const section_c = if (tty) "\x1b[38;2;150;165;100m\x1b[1m" else "";
+        const cmd_c = if (tty) "\x1b[38;2;130;155;170m" else "";
+        const desc_c = if (tty) "\x1b[38;2;130;135;140m" else "";
         const reset = if (tty) "\x1b[0m" else "";
 
         std.debug.print("{s}{s}{s} — {s}{s}{s}\n\n", .{ title_c, self.name, reset, desc_c, self.description, reset });
@@ -307,11 +307,11 @@ pub const App = struct {
 
     fn printCommandHelp(self: *const App, cmd: Command, parent_name: []const u8) void {
         const tty = isTty();
-        const cmd_c = if (tty) "\x1b[38;2;120;180;200m" else "";
-        const section_c = if (tty) "\x1b[38;2;200;180;80m\x1b[1m" else "";
-        const desc_c = if (tty) "\x1b[38;2;140;140;140m" else "";
-        const flag_c = if (tty) "\x1b[38;2;140;140;140m" else "";
-        const flag_desc_c = if (tty) "\x1b[38;2;110;110;110m" else "";
+        const cmd_c = if (tty) "\x1b[38;2;130;155;170m" else "";
+        const section_c = if (tty) "\x1b[38;2;150;165;100m\x1b[1m" else "";
+        const desc_c = if (tty) "\x1b[38;2;130;135;140m" else "";
+        const flag_c = if (tty) "\x1b[38;2;120;130;140m" else "";
+        const flag_desc_c = if (tty) "\x1b[38;2;100;105;110m" else "";
         const reset = if (tty) "\x1b[0m" else "";
 
         // Description line with command name highlighted
