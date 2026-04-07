@@ -564,7 +564,7 @@ pub const TimerTable = struct {
     }
 };
 
-fn formatIntervalStr(allocator: Allocator, secs: u64) ![]u8 {
+pub fn formatIntervalStr(allocator: Allocator, secs: u64) ![]u8 {
     if (secs % 86400 == 0 and secs >= 86400) {
         return std.fmt.allocPrint(allocator, "every {d}d", .{secs / 86400});
     } else if (secs % 3600 == 0 and secs >= 3600) {
@@ -731,13 +731,22 @@ pub const TimerDaemon = struct {
         if (timer.payload.len > 0 and timer.payload[0] == '{') {
             // Merge user payload with _timer metadata
             // User payload is a JSON object — inject _timer field
-            // Remove trailing '}', append _timer, close
-            const trimmed = std.mem.trimRight(u8, timer.payload, " \t\r\n");
+            // Remove trailing whitespace and '}', append _timer, close
+            var trimmed = timer.payload;
+            while (trimmed.len > 0 and isWhitespace(trimmed[trimmed.len - 1])) {
+                trimmed = trimmed[0 .. trimmed.len - 1];
+            }
             if (trimmed.len > 1 and trimmed[trimmed.len - 1] == '}') {
                 const inner = trimmed[0 .. trimmed.len - 1];
                 try json.appendSlice(self.allocator, inner);
                 // Check if there's content (not just "{")
-                const content = std.mem.trimRight(u8, inner[1..], " \t\r\n");
+                var content = inner[1..];
+                while (content.len > 0 and isWhitespace(content[0])) {
+                    content = content[1..];
+                }
+                while (content.len > 0 and isWhitespace(content[content.len - 1])) {
+                    content = content[0 .. content.len - 1];
+                }
                 if (content.len > 0) {
                     try json.appendSlice(self.allocator, ",\"_timer\":{\"name\":\"");
                 } else {
@@ -785,6 +794,10 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: Allocator, s: []const 
             }
         },
     };
+}
+
+fn isWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
 fn getMilliTimestamp() i64 {

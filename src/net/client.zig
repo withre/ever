@@ -62,6 +62,32 @@ pub const ListHooksResult = struct {
     }
 };
 
+pub const TimerInfo = struct {
+    name: []const u8,
+    schedule: []const u8,
+    topic: []const u8,
+    payload: []const u8,
+    last_fired_at: i64,
+    fire_count: u64,
+    persistent: bool,
+    created_at: i64,
+};
+
+pub const ListTimersResult = struct {
+    timers: []TimerInfo,
+    allocator: Allocator,
+
+    pub fn deinit(self: *ListTimersResult) void {
+        for (self.timers) |t| {
+            self.allocator.free(t.name);
+            self.allocator.free(t.schedule);
+            self.allocator.free(t.topic);
+            self.allocator.free(t.payload);
+        }
+        self.allocator.free(self.timers);
+    }
+};
+
 /// Unified client for publishing and subscribing to the Ever store.
 pub const Client = struct {
     allocator: Allocator,
@@ -361,6 +387,118 @@ pub const Client = struct {
         }
 
         return result;
+    }
+
+    /// Add a timer to the server.
+    pub fn addTimer(self: *Client, name: []const u8, schedule_type: []const u8, schedule_value: []const u8, topic: []const u8, payload: []const u8, persistent: bool) !void {
+        const req = protocol.AddTimerRequest{
+            .name = name,
+            .schedule_type = schedule_type,
+            .schedule_value = schedule_value,
+            .topic = topic,
+            .payload = payload,
+            .persistent = persistent,
+        };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .add_timer, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .add_timer_ok) return error.UnexpectedResponse;
+    }
+
+    /// Remove a timer from the server.
+    pub fn removeTimer(self: *Client, name: []const u8) !void {
+        const req = protocol.RemoveTimerRequest{ .name = name };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .remove_timer, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .remove_timer_ok) return error.UnexpectedResponse;
+    }
+
+    /// List all timers on the server.
+    pub fn listTimers(self: *Client) !ListTimersResult {
+        try protocol.writeFrame(self.fd(), .list_timers, "{}");
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .list_timers_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.ListTimersResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        // Deep copy the timers
+        const timers = try self.allocator.alloc(TimerInfo, parsed.value.timers.len);
+        errdefer self.allocator.free(timers);
+
+        var initialized: usize = 0;
+        errdefer {
+            for (timers[0..initialized]) |t| {
+                self.allocator.free(t.name);
+                self.allocator.free(t.schedule);
+                self.allocator.free(t.topic);
+                self.allocator.free(t.payload);
+            }
+        }
+
+        for (parsed.value.timers, 0..) |t, i| {
+            timers[i] = .{
+                .name = try self.allocator.dupe(u8, t.name),
+                .schedule = try self.allocator.dupe(u8, t.schedule),
+                .topic = try self.allocator.dupe(u8, t.topic),
+                .payload = try self.allocator.dupe(u8, t.payload),
+                .last_fired_at = t.last_fired_at,
+                .fire_count = t.fire_count,
+                .persistent = t.persistent,
+                .created_at = t.created_at,
+            };
+            initialized = i + 1;
+        }
+
+        return .{ .timers = timers, .allocator = self.allocator };
+    }
+
+    /// Get info about a specific timer.
+    pub fn timerInfo(self: *Client, name: []const u8) !TimerInfo {
+        const req = protocol.TimerInfoRequest{ .name = name };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .timer_info, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return error.ServerError;
+        if (frame.msg_type != .timer_info_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.TimerInfoResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        const t = parsed.value.timer;
+        return .{
+            .name = try self.allocator.dupe(u8, t.name),
+            .schedule = try self.allocator.dupe(u8, t.schedule),
+            .topic = try self.allocator.dupe(u8, t.topic),
+            .payload = try self.allocator.dupe(u8, t.payload),
+            .last_fired_at = t.last_fired_at,
+            .fire_count = t.fire_count,
+            .persistent = t.persistent,
+            .created_at = t.created_at,
+        };
     }
 };
 

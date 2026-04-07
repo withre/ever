@@ -10,6 +10,8 @@ const TopicManager = topic_mod.TopicManager;
 const store = @import("../store/store.zig");
 const hooks_mod = @import("../store/hooks.zig");
 const HookTable = hooks_mod.HookTable;
+const timers_mod = @import("../store/timers.zig");
+const TimerTable = timers_mod.TimerTable;
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
@@ -25,6 +27,7 @@ pub const Server = struct {
     io: Io,
     topic_manager: *TopicManager,
     hook_table: ?*HookTable,
+    timer_table: ?*TimerTable,
     config: Config,
     net_server: ?net.Server,
     shutdown_requested: std.atomic.Value(bool),
@@ -37,6 +40,7 @@ pub const Server = struct {
             .io = io,
             .topic_manager = topic_manager,
             .hook_table = null,
+            .timer_table = null,
             .config = config,
             .net_server = null,
             .shutdown_requested = std.atomic.Value(bool).init(false),
@@ -47,6 +51,11 @@ pub const Server = struct {
     /// Attach a hook table for server-side hook management.
     pub fn setHookTable(self: *Server, ht: *HookTable) void {
         self.hook_table = ht;
+    }
+
+    /// Attach a timer table for server-side timer management.
+    pub fn setTimerTable(self: *Server, tt: *TimerTable) void {
+        self.timer_table = tt;
     }
 
     /// Release server resources (closes the listener socket).
@@ -141,6 +150,10 @@ pub const Server = struct {
             .register_hook => try self.handleRegisterHook(frame.body, fd),
             .unregister_hook => try self.handleUnregisterHook(frame.body, fd),
             .list_hooks => try self.handleListHooks(fd),
+            .add_timer => try self.handleAddTimer(frame.body, fd),
+            .remove_timer => try self.handleRemoveTimer(frame.body, fd),
+            .list_timers => try self.handleListTimers(fd),
+            .timer_info => try self.handleTimerInfo(frame.body, fd),
             else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
         }
     }
@@ -313,6 +326,111 @@ pub const Server = struct {
         const resp_body = try protocol.encodeBody(self.allocator, protocol.ListHooksResponse{ .hooks = hook_infos });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .list_hooks_ok, resp_body);
+    }
+
+    fn handleAddTimer(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        const tt = self.timer_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
+
+        const parsed = protocol.decodeBody(protocol.AddTimerRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid add timer request");
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Parse schedule
+        const schedule: timers_mod.Schedule = if (std.mem.eql(u8, req.schedule_type, "interval")) blk: {
+            const secs = timers_mod.parseDuration(req.schedule_value) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid duration format");
+            break :blk .{ .interval = secs };
+        } else if (std.mem.eql(u8, req.schedule_type, "cron")) blk: {
+            const expr = timers_mod.CronExpr.parse(req.schedule_value) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid cron expression");
+            break :blk .{ .cron = expr };
+        } else
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid schedule type");
+
+        // Build schedule_str for display
+        const schedule_str = if (std.mem.eql(u8, req.schedule_type, "interval"))
+            try timers_mod.formatIntervalStr(self.allocator, schedule.interval)
+        else
+            try self.allocator.dupe(u8, req.schedule_value);
+        defer self.allocator.free(schedule_str);
+
+        tt.add(req.name, schedule, schedule_str, req.topic, req.payload, req.persistent) catch |err| return switch (err) {
+            error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "timer name already exists"),
+            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "add timer failed"),
+        };
+
+        try protocol.writeFrame(fd, .add_timer_ok, "{}");
+    }
+
+    fn handleRemoveTimer(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        const tt = self.timer_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
+
+        const parsed = protocol.decodeBody(protocol.RemoveTimerRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid remove timer request");
+        defer parsed.deinit();
+
+        tt.remove(parsed.value.name) catch |err| return switch (err) {
+            error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "timer not found"),
+            else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "remove timer failed"),
+        };
+
+        try protocol.writeFrame(fd, .remove_timer_ok, "{}");
+    }
+
+    fn handleListTimers(self: *Server, fd: std.posix.fd_t) !void {
+        const tt = self.timer_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
+
+        const timers = tt.list();
+        const timer_infos = try self.allocator.alloc(protocol.TimerInfoData, timers.len);
+        defer self.allocator.free(timer_infos);
+
+        for (timers, 0..) |timer, i| {
+            timer_infos[i] = .{
+                .name = timer.name,
+                .schedule = timer.schedule_str,
+                .topic = timer.topic,
+                .payload = timer.payload,
+                .last_fired_at = timer.last_fired_at,
+                .fire_count = timer.fire_count,
+                .persistent = timer.persistent,
+                .created_at = timer.created_at,
+            };
+        }
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTimersResponse{ .timers = timer_infos });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .list_timers_ok, resp_body);
+    }
+
+    fn handleTimerInfo(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        const tt = self.timer_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
+
+        const parsed = protocol.decodeBody(protocol.TimerInfoRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid timer info request");
+        defer parsed.deinit();
+
+        const timer = tt.find(parsed.value.name) orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "timer not found");
+
+        const timer_info = protocol.TimerInfoData{
+            .name = timer.name,
+            .schedule = timer.schedule_str,
+            .topic = timer.topic,
+            .payload = timer.payload,
+            .last_fired_at = timer.last_fired_at,
+            .fire_count = timer.fire_count,
+            .persistent = timer.persistent,
+            .created_at = timer.created_at,
+        };
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.TimerInfoResponse{ .timer = timer_info });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .timer_info_ok, resp_body);
     }
 };
 

@@ -469,6 +469,120 @@ fn handleHook(ctx: *const cli.Context) !void {
     }
 }
 
+fn handleTimer(ctx: *const cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io: std.Io = undefined; // Will be set from init
+
+    const sub = ctx.arg("subcommand");
+
+    if (sub.len == 0) {
+        std.debug.print("error: subcommand is required (add|list|rm|info)\n", .{});
+        std.process.exit(1);
+    }
+
+    const env_block: [*:null]const ?[*:0]const u8 = undefined;
+    const addr_info = parseStoreAddress(ctx, env_block);
+
+    if (std.mem.eql(u8, sub, "add")) {
+        const name = ctx.arg("name");
+        const every = ctx.flag("every");
+        const cron = ctx.flag("cron");
+        const topic = ctx.arg("topic");
+        const payload = ctx.arg("payload");
+        const persistent = !ctx.flagBool("no-persist");
+
+        if (name.len == 0) {
+            std.debug.print("error: timer name is required\n", .{});
+            std.process.exit(1);
+        }
+        if (every.len == 0 and cron.len == 0) {
+            std.debug.print("error: either --every or --cron is required\n", .{});
+            std.process.exit(1);
+        }
+        if (every.len > 0 and cron.len > 0) {
+            std.debug.print("error: cannot specify both --every and --cron\n", .{});
+            std.process.exit(1);
+        }
+        if (topic.len == 0) {
+            std.debug.print("error: topic is required\n", .{});
+            std.process.exit(1);
+        }
+
+        const schedule_type = if (every.len > 0) "interval" else "cron";
+        const schedule_value = if (every.len > 0) every else cron;
+        const actual_payload = if (payload.len > 0) payload else "{}";
+
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, persistent);
+
+        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (every.len > 0) "every" else "cron", schedule_value, topic });
+    } else if (std.mem.eql(u8, sub, "list")) {
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        var result = try c.listTimers();
+        defer result.deinit();
+
+        if (result.timers.len == 0) {
+            std.debug.print("No timers registered.\n", .{});
+        } else {
+            std.debug.print("{s:<20} {s:<15} {s:<25} {s:<10}\n", .{ "NAME", "SCHEDULE", "TOPIC", "FIRES" });
+            for (result.timers) |timer| {
+                std.debug.print("{s:<20} {s:<15} {s:<25} {d:<10}\n", .{
+                    timer.name,
+                    timer.schedule,
+                    timer.topic,
+                    timer.fire_count,
+                });
+            }
+        }
+    } else if (std.mem.eql(u8, sub, "rm")) {
+        const name = ctx.arg("name");
+        if (name.len == 0) {
+            std.debug.print("error: timer name is required\n", .{});
+            std.process.exit(1);
+        }
+
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        try c.removeTimer(name);
+        std.debug.print("Timer '{s}' removed.\n", .{name});
+    } else if (std.mem.eql(u8, sub, "info")) {
+        const name = ctx.arg("name");
+        if (name.len == 0) {
+            std.debug.print("error: timer name is required\n", .{});
+            std.process.exit(1);
+        }
+
+        var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+        defer c.deinit();
+        const timer = try c.timerInfo(name);
+        defer {
+            allocator.free(timer.name);
+            allocator.free(timer.schedule);
+            allocator.free(timer.topic);
+            allocator.free(timer.payload);
+        }
+
+        std.debug.print("Name:        {s}\n", .{timer.name});
+        std.debug.print("Schedule:    {s}\n", .{timer.schedule});
+        std.debug.print("Topic:       {s}\n", .{timer.topic});
+        std.debug.print("Payload:     {s}\n", .{timer.payload});
+        std.debug.print("Last fired:  ", .{});
+        if (timer.last_fired_at > 0) {
+            std.debug.print("{d}\n", .{timer.last_fired_at});
+        } else {
+            std.debug.print("never\n", .{});
+        }
+        std.debug.print("Next fire:   (calculated on server)\n", .{});
+        std.debug.print("Fire count:  {d}\n", .{timer.fire_count});
+        std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
+    } else {
+        std.debug.print("error: unknown timer subcommand\n", .{});
+        std.process.exit(1);
+    }
+}
+
 fn handleStore(ctx: *const cli.Context) !void {
     const allocator = ctx.allocator;
     const io: std.Io = undefined; // Will be set from init
@@ -504,18 +618,6 @@ fn handleStore(ctx: *const cli.Context) !void {
     }
 }
 
-fn handleTimer(ctx: *const cli.Context) !void {
-    const sub = ctx.arg("subcommand");
-
-    if (sub.len == 0) {
-        std.debug.print("error: subcommand is required (add|list|rm|info)\n", .{});
-        std.process.exit(1);
-    }
-
-    std.debug.print("error: timer commands not yet implemented\n", .{});
-    std.process.exit(1);
-}
-
 fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, envp: [*:null]const ?[*:0]const u8) !void {
     const address = ctx.flag("address");
     const port_str = ctx.flag("port");
@@ -544,15 +646,25 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     var hook_table = try ever.hooks.HookTable.init(allocator, actual_data_dir);
     defer hook_table.deinit();
 
+    var timer_table = try ever.timers.TimerTable.init(allocator, actual_data_dir);
+    defer timer_table.deinit();
+
     var server = try ever.net.Server.init(allocator, io, &topic_manager, .{ .address = if (address.len > 0) address else "127.0.0.1", .port = port });
     defer server.deinit();
     server.setHookTable(&hook_table);
+    server.setTimerTable(&timer_table);
 
     var hook_daemon = ever.hooks.HookDaemon.init(allocator, &hook_table, &topic_manager, envp);
     hook_daemon.start() catch |err| {
         std.debug.print("Warning: failed to start hook daemon: {}\n", .{err});
     };
     defer hook_daemon.stop();
+
+    var timer_daemon = ever.timers.TimerDaemon.init(allocator, &timer_table, &topic_manager);
+    timer_daemon.start() catch |err| {
+        std.debug.print("Warning: failed to start timer daemon: {}\n", .{err});
+    };
+    defer timer_daemon.stop();
 
     // Start HTTP server unless --no-http
     var http_server_inst: ?ever.http.HttpServer = null;
@@ -587,6 +699,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     }
     std.debug.print("Data directory: {s}\n", .{actual_data_dir});
     std.debug.print("Hook daemon started.\n", .{});
+    std.debug.print("Timer daemon started.\n", .{});
     std.debug.print("Press Ctrl-C to stop.\n", .{});
     server.installSignalHandlers();
     server.run() catch |err| {
@@ -872,6 +985,56 @@ const app = cli.App{
                 .{
                     .name = "list",
                     .description = "List registered timers",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "rm",
+                    .description = "Remove a timer by name",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "info",
+                    .description = "Show timer details",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleTimer,
+                },
+            },
+        },
+        .{
+            .name = "timer",
+            .description = "Manage scheduled timers",
+            .subcommands = &.{
+                .{
+                    .name = "add",
+                    .description = "Add a new timer",
+                    .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                        .{ .name = "every", .description = "Interval (e.g., 5m, 1h, 1d)" },
+                        .{ .name = "cron", .description = "Cron expression (e.g., \"0 3 * * *\")" },
+                        .{ .name = "topic", .description = "Topic to publish to" },
+                        .{ .name = "payload", .description = "JSON payload" },
+                        .{ .name = "no-persist", .description = "Don't persist timer" },
+                    },
+                    .run = handleTimer,
+                },
+                .{
+                    .name = "list",
+                    .description = "List all timers",
                     .flags = &.{
                         .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
