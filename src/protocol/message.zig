@@ -30,6 +30,8 @@ pub const MessageType = enum(u8) {
     remove_timer = 0x0B,
     list_timers = 0x0C,
     timer_info = 0x0D,
+    hook_ps = 0x0E,
+    hook_logs = 0x0F,
 
     // Responses
     publish_ok = 0x81,
@@ -45,6 +47,8 @@ pub const MessageType = enum(u8) {
     remove_timer_ok = 0x8B,
     list_timers_ok = 0x8C,
     timer_info_ok = 0x8D,
+    hook_ps_ok = 0x8E,
+    hook_logs_ok = 0x8F,
 
     // Error
     error_response = 0xFF,
@@ -180,6 +184,36 @@ pub const ListTimersResponse = struct {
 
 pub const TimerInfoResponse = struct {
     timer: TimerInfoData,
+};
+
+// --- Hook process/log request/response types ---
+
+pub const HookPsRequest = struct {
+    _unused: u8 = 0,
+};
+
+pub const HookProcessInfo = struct {
+    hook_id: u64,
+    pid: i32,
+    pattern: []const u8,
+    command: []const u8,
+    start_time: i64,
+    log_path: []const u8,
+};
+
+pub const HookPsResponse = struct {
+    processes: []const HookProcessInfo,
+};
+
+pub const HookLogsRequest = struct {
+    hook_id: u64,
+    max_bytes: u32 = 65536,
+};
+
+pub const HookLogsResponse = struct {
+    hook_id: u64,
+    log_path: []const u8,
+    content: []const u8,
 };
 
 // --- Encoding/Decoding ---

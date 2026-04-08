@@ -65,6 +65,8 @@ pub const Context = struct {
     envp: [*:null]const ?[*:0]const u8,
     /// Full command path, e.g. "timer add"
     command_path: []const u8,
+    /// Owned string from `--` joining (freed on deinit)
+    owned_cmd: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, envp: [*:null]const ?[*:0]const u8) Context {
         return .{
@@ -78,6 +80,7 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        if (self.owned_cmd) |cmd| self.allocator.free(cmd);
         self.flags.deinit();
         self.positional.deinit();
     }
@@ -189,12 +192,29 @@ pub const App = struct {
         while (i < raw.len) : (i += 1) {
             const a = raw[i];
             if (std.mem.eql(u8, a, "--")) {
-                // Everything after -- is positional
+                // If the command has a "cmd" flag, join remaining args
+                // with spaces and store as the "cmd" flag value.
+                // Otherwise, treat remaining args as positional.
                 i += 1;
-                while (i < raw.len) : (i += 1) {
-                    if (positional_idx < cmd.args.len) {
-                        try ctx.positional.put(cmd.args[positional_idx].name, raw[i]);
-                        positional_idx += 1;
+                if (findFlagDef(cmd.flags, "cmd") != null and i < raw.len) {
+                    // Join remaining args with spaces
+                    var joined: std.ArrayList(u8) = .empty;
+                    defer joined.deinit(allocator);
+                    while (i < raw.len) : (i += 1) {
+                        if (joined.items.len > 0) try joined.append(allocator, ' ');
+                        try joined.appendSlice(allocator, raw[i]);
+                    }
+                    if (joined.items.len > 0) {
+                        const owned = try joined.toOwnedSlice(allocator);
+                        ctx.owned_cmd = owned;
+                        try ctx.flags.put("cmd", owned);
+                    }
+                } else {
+                    while (i < raw.len) : (i += 1) {
+                        if (positional_idx < cmd.args.len) {
+                            try ctx.positional.put(cmd.args[positional_idx].name, raw[i]);
+                            positional_idx += 1;
+                        }
                     }
                 }
                 break;

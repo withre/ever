@@ -62,6 +62,43 @@ pub const ListHooksResult = struct {
     }
 };
 
+pub const HookProcessInfoOwned = struct {
+    hook_id: u64,
+    pid: i32,
+    pattern: []const u8,
+    command: []const u8,
+    start_time: i64,
+    log_path: []const u8,
+
+    pub fn deinit(self: HookProcessInfoOwned, allocator: Allocator) void {
+        allocator.free(self.pattern);
+        allocator.free(self.command);
+        allocator.free(self.log_path);
+    }
+};
+
+pub const HookPsResult = struct {
+    processes: []HookProcessInfoOwned,
+    allocator: Allocator,
+
+    pub fn deinit(self: *HookPsResult) void {
+        for (self.processes) |p| p.deinit(self.allocator);
+        self.allocator.free(self.processes);
+    }
+};
+
+pub const HookLogsResult = struct {
+    hook_id: u64,
+    log_path: []const u8,
+    content: []const u8,
+    allocator: Allocator,
+
+    pub fn deinit(self: *HookLogsResult) void {
+        self.allocator.free(self.log_path);
+        self.allocator.free(self.content);
+    }
+};
+
 pub const TimerInfo = struct {
     name: []const u8,
     schedule: []const u8,
@@ -490,6 +527,66 @@ pub const Client = struct {
         }
 
         return .{ .timers = timers, .allocator = self.allocator };
+    }
+
+    /// List running hook processes.
+    pub fn hookPs(self: *Client) !HookPsResult {
+        try protocol.writeFrame(self.fd(), .hook_ps, "{}");
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return self.handleErrorResponse(frame.body);
+        if (frame.msg_type != .hook_ps_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.HookPsResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        const procs = try self.allocator.alloc(HookProcessInfoOwned, parsed.value.processes.len);
+        errdefer self.allocator.free(procs);
+
+        var initialized: usize = 0;
+        errdefer for (procs[0..initialized]) |p| p.deinit(self.allocator);
+
+        for (parsed.value.processes, 0..) |p, i| {
+            procs[i] = .{
+                .hook_id = p.hook_id,
+                .pid = p.pid,
+                .pattern = try self.allocator.dupe(u8, p.pattern),
+                .command = try self.allocator.dupe(u8, p.command),
+                .start_time = p.start_time,
+                .log_path = try self.allocator.dupe(u8, p.log_path),
+            };
+            initialized = i + 1;
+        }
+
+        return .{ .processes = procs, .allocator = self.allocator };
+    }
+
+    /// Get log output for a hook by ID (most recent execution).
+    pub fn hookLogs(self: *Client, hook_id: u64) !HookLogsResult {
+        const req = protocol.HookLogsRequest{ .hook_id = hook_id };
+        const body = try protocol.encodeBody(self.allocator, req);
+        defer self.allocator.free(body);
+        try protocol.writeFrame(self.fd(), .hook_logs, body);
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return self.handleErrorResponse(frame.body);
+        if (frame.msg_type != .hook_logs_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.HookLogsResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        return .{
+            .hook_id = parsed.value.hook_id,
+            .log_path = try self.allocator.dupe(u8, parsed.value.log_path),
+            .content = try self.allocator.dupe(u8, parsed.value.content),
+            .allocator = self.allocator,
+        };
     }
 
     /// Get info about a specific timer.

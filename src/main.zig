@@ -445,6 +445,66 @@ fn handleHookList(ctx: *cli.Context) !void {
     }
 }
 
+fn handleHookPs(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    var result = try c.hookPs();
+    defer result.deinit();
+
+    if (result.processes.len == 0) {
+        std.debug.print("No running hook processes.\n", .{});
+    } else {
+        std.debug.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{ "HOOK", "PID", "PATTERN", "COMMAND", "ELAPSED" });
+        const now = getMilliTimestamp();
+        for (result.processes) |p| {
+            var hook_buf: [20]u8 = undefined;
+            const hook_str = std.fmt.bufPrint(&hook_buf, "#{d}", .{p.hook_id}) catch "?";
+            var pid_buf: [20]u8 = undefined;
+            const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{p.pid}) catch "?";
+            const elapsed_s = @divTrunc(now - p.start_time, 1000);
+            var elapsed_buf: [20]u8 = undefined;
+            const elapsed_str = std.fmt.bufPrint(&elapsed_buf, "{d}s", .{elapsed_s}) catch "?";
+            std.debug.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{
+                hook_str, pid_str, p.pattern, p.command, elapsed_str,
+            });
+        }
+    }
+}
+
+fn handleHookLogs(ctx: *cli.Context) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const id_str = ctx.arg("id");
+
+    if (id_str.len == 0) {
+        std.debug.print("error: hook ID is required\n", .{});
+        std.process.exit(1);
+    }
+    const id = std.fmt.parseInt(u64, id_str, 10) catch
+        std.process.fatal("invalid hook ID '{s}'.", .{id_str});
+
+    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    defer c.deinit();
+    var result = try c.hookLogs(id);
+    defer result.deinit();
+
+    std.debug.print("Log file: {s}\n---\n", .{result.log_path});
+    if (result.content.len > 0) {
+        std.debug.print("{s}", .{result.content});
+        // Ensure trailing newline
+        if (result.content[result.content.len - 1] != '\n') {
+            std.debug.print("\n", .{});
+        }
+    } else {
+        std.debug.print("(empty)\n", .{});
+    }
+}
+
 fn handleHookRm(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
@@ -825,6 +885,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     server.setTimerTable(&timer_table);
 
     var hook_daemon = ever.hooks.HookDaemon.init(allocator, &hook_table, &topic_manager, envp);
+    server.setHookDaemon(&hook_daemon);
     hook_daemon.start() catch |err| {
         std.debug.print("Warning: failed to start hook daemon: {}\n", .{err});
     };
@@ -968,6 +1029,13 @@ fn appendShellEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s:
 }
 
 // ── Timestamped logging ────────────────────────────────────────────────
+
+fn getMilliTimestamp() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
 
 fn getTimestamp() struct { year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8 } {
     var ts: std.os.linux.timespec = undefined;
@@ -1190,6 +1258,25 @@ const app = cli.App{
                         .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                     },
                     .run = handleHookRm,
+                },
+                .{
+                    .name = "ps",
+                    .description = "Show running hook processes",
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleHookPs,
+                },
+                .{
+                    .name = "logs",
+                    .description = "Show recent hook execution output",
+                    .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
+                    .flags = &.{
+                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
+                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                    },
+                    .run = handleHookLogs,
                 },
             },
         },

@@ -10,6 +10,7 @@ const TopicManager = topic_mod.TopicManager;
 const store = @import("../store/store.zig");
 const hooks_mod = @import("../store/hooks.zig");
 const HookTable = hooks_mod.HookTable;
+const HookDaemon = hooks_mod.HookDaemon;
 const timers_mod = @import("../store/timers.zig");
 const TimerTable = timers_mod.TimerTable;
 
@@ -27,6 +28,7 @@ pub const Server = struct {
     io: Io,
     topic_manager: *TopicManager,
     hook_table: ?*HookTable,
+    hook_daemon: ?*HookDaemon,
     timer_table: ?*TimerTable,
     config: Config,
     net_server: ?net.Server,
@@ -40,6 +42,7 @@ pub const Server = struct {
             .io = io,
             .topic_manager = topic_manager,
             .hook_table = null,
+            .hook_daemon = null,
             .timer_table = null,
             .config = config,
             .net_server = null,
@@ -51,6 +54,11 @@ pub const Server = struct {
     /// Attach a hook table for server-side hook management.
     pub fn setHookTable(self: *Server, ht: *HookTable) void {
         self.hook_table = ht;
+    }
+
+    /// Attach a hook daemon for process table access (hook ps/logs).
+    pub fn setHookDaemon(self: *Server, hd: *HookDaemon) void {
+        self.hook_daemon = hd;
     }
 
     /// Attach a timer table for server-side timer management.
@@ -154,6 +162,8 @@ pub const Server = struct {
             .remove_timer => try self.handleRemoveTimer(frame.body, fd),
             .list_timers => try self.handleListTimers(fd),
             .timer_info => try self.handleTimerInfo(frame.body, fd),
+            .hook_ps => try self.handleHookPs(fd),
+            .hook_logs => try self.handleHookLogs(frame.body, fd),
             else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
         }
     }
@@ -420,6 +430,141 @@ pub const Server = struct {
         const resp_body = try protocol.encodeBody(self.allocator, protocol.ListTimersResponse{ .timers = timer_infos });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .list_timers_ok, resp_body);
+    }
+
+    fn handleHookPs(self: *Server, fd: std.posix.fd_t) !void {
+        const hd = self.hook_daemon orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        var buf: [hooks_mod.MAX_CONCURRENT_HOOKS]hooks_mod.ProcessEntry = undefined;
+        const pt = hd.getProcessTable();
+        const n = pt.snapshot(&buf);
+
+        const infos = try self.allocator.alloc(protocol.HookProcessInfo, n);
+        defer self.allocator.free(infos);
+
+        for (buf[0..n], 0..) |entry, i| {
+            infos[i] = .{
+                .hook_id = entry.hook_id,
+                .pid = entry.pid,
+                .pattern = entry.pattern[0..entry.pattern_len],
+                .command = entry.command_display[0..entry.command_display_len],
+                .start_time = entry.start_time,
+                .log_path = entry.log_path[0..entry.log_path_len],
+            };
+        }
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.HookPsResponse{ .processes = infos });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .hook_ps_ok, resp_body);
+    }
+
+    fn handleHookLogs(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
+        _ = self.hook_daemon orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        const ht = self.hook_table orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "hooks not enabled");
+
+        const parsed = protocol.decodeBody(protocol.HookLogsRequest, self.allocator, body) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid hook logs request");
+        defer parsed.deinit();
+        const req = parsed.value;
+
+        // Find the most recent log file for this hook ID by scanning the hooks dir
+        const hooks_dir_path = std.fmt.allocPrint(self.allocator, "{s}/hooks", .{ht.data_dir}) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
+        defer self.allocator.free(hooks_dir_path);
+
+        const prefix = std.fmt.allocPrint(self.allocator, "{d}-", .{req.hook_id}) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
+        defer self.allocator.free(prefix);
+
+        // Find most recent log by scanning filenames (they contain timestamps)
+        var best_path: ?[]u8 = null;
+        defer if (best_path) |p| self.allocator.free(p);
+
+        const hooks_dir_z = self.allocator.allocSentinel(u8, hooks_dir_path.len, 0) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
+        defer self.allocator.free(hooks_dir_z);
+        @memcpy(hooks_dir_z[0..hooks_dir_path.len], hooks_dir_path);
+
+        // Use linux opendir via getdents
+        const dir_fd_rc = std.os.linux.open(hooks_dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        const dir_fd_i: isize = @bitCast(dir_fd_rc);
+        if (dir_fd_i < 0)
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "no hook logs directory");
+        const dir_fd: i32 = @intCast(dir_fd_rc);
+        defer _ = std.os.linux.close(dir_fd);
+
+        var dirent_buf: [4096]u8 = undefined;
+        var best_ts: i64 = -1;
+
+        outer: while (true) {
+            const nread = std.os.linux.getdents64(dir_fd, &dirent_buf, dirent_buf.len);
+            const nread_i: isize = @bitCast(nread);
+            if (nread_i <= 0) break;
+
+            var offset: usize = 0;
+            while (offset < nread) {
+                const dirent: *align(1) const std.os.linux.dirent64 = @ptrCast(@alignCast(&dirent_buf[offset]));
+                offset += dirent.reclen;
+
+                const name_ptr: [*:0]const u8 = @ptrCast(&dirent.name);
+                const name = std.mem.sliceTo(name_ptr, 0);
+
+                if (!std.mem.startsWith(u8, name, prefix)) continue;
+                if (!std.mem.endsWith(u8, name, ".log")) continue;
+
+                // Extract timestamp from filename: <id>-<timestamp>.log
+                const after_prefix = name[prefix.len..];
+                const dot_pos = std.mem.indexOfScalar(u8, after_prefix, '.') orelse continue;
+                const ts = std.fmt.parseInt(i64, after_prefix[0..dot_pos], 10) catch continue;
+                if (ts > best_ts) {
+                    best_ts = ts;
+                    if (best_path) |p| self.allocator.free(p);
+                    best_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ hooks_dir_path, name }) catch
+                        break :outer;
+                }
+            }
+        }
+
+        const log_file_path = best_path orelse
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "no logs found for this hook");
+
+        // Read the log file content
+        const log_z = self.allocator.allocSentinel(u8, log_file_path.len, 0) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
+        defer self.allocator.free(log_z);
+        @memcpy(log_z[0..log_file_path.len], log_file_path);
+
+        const log_fd_rc = std.os.linux.open(log_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+        const log_fd_i: isize = @bitCast(log_fd_rc);
+        if (log_fd_i < 0)
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "cannot open log file");
+        const log_fd: i32 = @intCast(log_fd_rc);
+        defer _ = std.os.linux.close(log_fd);
+
+        const max_bytes = @min(req.max_bytes, 1024 * 1024); // cap at 1MB
+        const content_buf = self.allocator.alloc(u8, max_bytes) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
+        defer self.allocator.free(content_buf);
+
+        var total: usize = 0;
+        while (total < content_buf.len) {
+            const rc = std.os.linux.read(log_fd, content_buf[total..].ptr, content_buf[total..].len);
+            const n_i: isize = @bitCast(rc);
+            if (n_i <= 0) break;
+            total += @intCast(n_i);
+        }
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.HookLogsResponse{
+            .hook_id = req.hook_id,
+            .log_path = log_file_path,
+            .content = content_buf[0..total],
+        });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .hook_logs_ok, resp_body);
     }
 
     fn handleTimerInfo(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {

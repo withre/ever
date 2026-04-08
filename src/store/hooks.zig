@@ -421,11 +421,120 @@ fn freeHookCopy(allocator: Allocator, hook: Hook) void {
 
 // ── Hook Daemon ─────────────────────────────────────────────────────────────
 
+/// Maximum number of concurrently running hook processes.
+pub const MAX_CONCURRENT_HOOKS: usize = 16;
+/// Default per-hook timeout in seconds. Processes running longer are killed.
+const DEFAULT_HOOK_TIMEOUT_SECS: i64 = 300; // 5 minutes
+/// Seconds to wait after SIGTERM before sending SIGKILL on shutdown.
+const SHUTDOWN_GRACE_SECS: i64 = 5;
+
+/// Tracks a running child process spawned by the hook daemon.
+pub const ProcessEntry = struct {
+    hook_id: u64,
+    pid: i32,
+    pgid: i32,
+    start_time: i64,
+    log_path: [256]u8,
+    log_path_len: u8,
+    pattern: [128]u8,
+    pattern_len: u8,
+    command_display: [128]u8,
+    command_display_len: u8,
+};
+
+/// Thread-safe table of running hook processes.
+/// The daemon owns this; server reads it via snapshot for `hook ps`.
+pub const ProcessTable = struct {
+    entries: [MAX_CONCURRENT_HOOKS]?ProcessEntry,
+    count: usize,
+    mutex: std.atomic.Mutex,
+
+    pub fn init() ProcessTable {
+        return .{
+            .entries = [_]?ProcessEntry{null} ** MAX_CONCURRENT_HOOKS,
+            .count = 0,
+            .mutex = .unlocked,
+        };
+    }
+
+    fn lock(self: *ProcessTable) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Register a running child. Returns false if table is full.
+    pub fn add(self: *ProcessTable, entry: ProcessEntry) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (slot.* == null) {
+                slot.* = entry;
+                self.count += 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove the entry for a given PID. Returns the removed entry or null.
+    pub fn removeByPid(self: *ProcessTable, pid: i32) ?ProcessEntry {
+        self.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (slot.*) |e| {
+                if (e.pid == pid) {
+                    const result = e;
+                    slot.* = null;
+                    self.count -= 1;
+                    return result;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Return the number of active processes (lock-free snapshot for limit check).
+    pub fn activeCount(self: *ProcessTable) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.count;
+    }
+
+    /// Copy all active entries into caller-provided buffer.
+    /// Returns the number copied.
+    pub fn snapshot(self: *ProcessTable, out: []ProcessEntry) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.entries) |slot| {
+            if (slot) |e| {
+                if (n >= out.len) break;
+                out[n] = e;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Kill all tracked process groups with the given signal.
+    fn killAll(self: *ProcessTable, sig: std.os.linux.SIG) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.entries) |slot| {
+            if (slot) |e| {
+                // Kill entire process group
+                _ = std.os.linux.kill(-e.pgid, sig);
+            }
+        }
+    }
+};
+
 /// The hook daemon runs as a thread alongside the store. It polls the
 /// TopicManager for new events matching registered hooks and executes
-/// their commands via fork/exec.
-/// Background daemon that polls for new events and executes matching hooks
-/// via fork/exec. Runs on a dedicated thread.
+/// their commands via fork/exec in the background (non-blocking).
+///
+/// Child processes run in their own process groups so the daemon can
+/// signal an entire tree. stdout/stderr are redirected to log files
+/// under `<data-dir>/hooks/`.
 pub const HookDaemon = struct {
     allocator: Allocator,
     hook_table: *HookTable,
@@ -433,6 +542,7 @@ pub const HookDaemon = struct {
     shutdown: std.atomic.Value(bool),
     envp: [*:null]const ?[*:0]const u8,
     thread: ?std.Thread,
+    process_table: ProcessTable,
 
     /// Create a new HookDaemon. Call `start()` to begin polling.
     pub fn init(
@@ -448,25 +558,45 @@ pub const HookDaemon = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .envp = envp,
             .thread = null,
+            .process_table = ProcessTable.init(),
         };
     }
 
     /// Spawn the daemon polling thread.
     pub fn start(self: *HookDaemon) !void {
+        // Ensure hooks log directory exists
+        self.ensureLogDir();
         self.thread = try std.Thread.spawn(.{}, daemonLoop, .{self});
     }
 
-    /// Signal shutdown and join the daemon thread.
+    /// Signal shutdown, terminate all running hooks, and join the daemon thread.
     pub fn stop(self: *HookDaemon) void {
         self.shutdown.store(true, .release);
+        self.shutdownChildren();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
     }
 
+    /// Return a pointer to the process table so the server can read it.
+    pub fn getProcessTable(self: *HookDaemon) *ProcessTable {
+        return &self.process_table;
+    }
+
+    fn ensureLogDir(self: *HookDaemon) void {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/hooks", .{self.hook_table.data_dir}) catch return;
+        defer self.allocator.free(path);
+        const path_z = self.allocator.allocSentinel(u8, path.len, 0) catch return;
+        defer self.allocator.free(path_z);
+        @memcpy(path_z[0..path.len], path);
+        _ = std.os.linux.mkdir(path_z.ptr, 0o755);
+    }
+
     fn daemonLoop(self: *HookDaemon) void {
         while (!self.shutdown.load(.acquire)) {
+            self.reapChildren();
+            self.checkTimeouts();
             self.pollAndExecute();
 
             // Sleep 500ms between polls
@@ -478,9 +608,73 @@ pub const HookDaemon = struct {
         }
     }
 
+    /// Reap any terminated children with WNOHANG. Updates process table.
+    fn reapChildren(self: *HookDaemon) void {
+        while (true) {
+            var status: u32 = 0;
+            const WNOHANG: u32 = 1;
+            const pid_raw = std.os.linux.waitpid(-1, &status, WNOHANG);
+            const pid_i: isize = @bitCast(pid_raw);
+            if (pid_i <= 0) break; // No more children to reap
+
+            const pid: i32 = @intCast(pid_i);
+            if (self.process_table.removeByPid(pid)) |entry| {
+                const exit_code = (status >> 8) & 0xFF;
+                if (exit_code != 0) {
+                    logTimestampedFmt("Hook #{d} (pid {d}) exited with status {d}", .{ entry.hook_id, pid, exit_code });
+                }
+            }
+        }
+    }
+
+    /// Kill processes that have exceeded the timeout.
+    fn checkTimeouts(self: *HookDaemon) void {
+        const now = getMilliTimestamp();
+        var buf: [MAX_CONCURRENT_HOOKS]ProcessEntry = undefined;
+        const n = self.process_table.snapshot(&buf);
+        for (buf[0..n]) |entry| {
+            const elapsed_ms = now - entry.start_time;
+            if (elapsed_ms > DEFAULT_HOOK_TIMEOUT_SECS * 1000) {
+                logTimestampedFmt("Hook #{d} (pid {d}) timed out after {d}s, killing", .{
+                    entry.hook_id, entry.pid, @divTrunc(elapsed_ms, 1000),
+                });
+                _ = std.os.linux.kill(-entry.pgid, .TERM);
+                // Give it 1 second then SIGKILL
+                const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
+                _ = std.os.linux.nanosleep(&ts, null);
+                _ = std.os.linux.kill(-entry.pgid, .KILL);
+            }
+        }
+    }
+
+    /// SIGTERM all children → wait grace period → SIGKILL stragglers → reap.
+    fn shutdownChildren(self: *HookDaemon) void {
+        if (self.process_table.activeCount() == 0) return;
+
+        logTimestampedFmt("Shutting down {d} running hook(s)...", .{self.process_table.activeCount()});
+        self.process_table.killAll(.TERM);
+
+        // Wait up to SHUTDOWN_GRACE_SECS for children to exit
+        var waited: i64 = 0;
+        while (waited < SHUTDOWN_GRACE_SECS * 1000) {
+            self.reapChildren();
+            if (self.process_table.activeCount() == 0) return;
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            waited += 100;
+        }
+
+        // Force kill remaining
+        if (self.process_table.activeCount() > 0) {
+            logTimestampedFmt("Force-killing {d} remaining hook(s)", .{self.process_table.activeCount()});
+            self.process_table.killAll(.KILL);
+            const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            self.reapChildren();
+        }
+    }
+
     fn pollAndExecute(self: *HookDaemon) void {
-        // Take a snapshot — copies id/pattern/cursor values so we don't hold the
-        // hook_table mutex during fetch or fork/exec.
         const hooks = self.hook_table.snapshot(self.allocator) catch return;
         defer freeHookSnapshot(self.allocator, hooks);
 
@@ -496,8 +690,6 @@ pub const HookDaemon = struct {
         const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
             (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
-        // Fetch new events from the hook's cursor.
-        // TopicManager mutex is acquired/released internally — not held across fork/exec.
         const events = if (is_pattern)
             try self.topic_manager.fetchPattern(self.allocator, pattern, hook.cursor, 100)
         else
@@ -509,15 +701,12 @@ pub const HookDaemon = struct {
 
         if (events.len == 0) return;
 
-        // Execute commands and update cursor — no mutex held during fork/exec.
-        // updateCursor briefly acquires hook_table mutex only for the cursor write.
         for (events, 0..) |event, i| {
             self.executeHookCommand(hook, event) catch |err| {
                 logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
             };
             self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
 
-            // One-shot hooks: remove after first event execution
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
                 logTimestampedFmt("Hook #{d} (once) auto-removed after firing.", .{hook.id});
@@ -527,11 +716,15 @@ pub const HookDaemon = struct {
     }
 
     fn executeHookCommand(self: *HookDaemon, hook: Hook, event: store.Event) !void {
-        // Build event JSON for stdin
+        // Enforce concurrent limit
+        if (self.process_table.activeCount() >= MAX_CONCURRENT_HOOKS) {
+            logTimestampedFmt("Hook #{d}: concurrent limit ({d}) reached, skipping", .{ hook.id, MAX_CONCURRENT_HOOKS });
+            return;
+        }
+
         const json = try buildEventJsonFromStore(self.allocator, event);
         defer self.allocator.free(json);
 
-        // Build env vars + command string
         var offset_buf: [20]u8 = undefined;
         const offset_str = std.fmt.bufPrint(&offset_buf, "{d}", .{event.offset}) catch "0";
         var ts_buf: [20]u8 = undefined;
@@ -540,47 +733,21 @@ pub const HookDaemon = struct {
         var shell_cmd: std.ArrayList(u8) = .empty;
         defer shell_cmd.deinit(self.allocator);
 
-        // cd to hook's cwd first
+        // cd to hook's cwd
         try shell_cmd.appendSlice(self.allocator, "cd '");
-        for (hook.cwd) |c| {
-            if (c == '\'') {
-                try shell_cmd.appendSlice(self.allocator, "'\\''");
-            } else {
-                try shell_cmd.append(self.allocator, c);
-            }
-        }
+        try appendShellEscaped(&shell_cmd, self.allocator, hook.cwd);
         try shell_cmd.appendSlice(self.allocator, "' && ");
 
-        // Prepend custom env vars from hook config
+        // Custom env vars
         if (hook.env) |env| {
             for (env) |env_pair| {
-                // env_pair is "KEY=VAL" — validate KEY, shell-escape the value
                 if (std.mem.indexOfScalar(u8, env_pair, '=')) |eq_pos| {
                     const key = env_pair[0..eq_pos];
-                    // Validate key: must be non-empty, alphanumeric + underscore
                     if (key.len == 0) continue;
-                    var valid_key = true;
-                    for (key) |kc| {
-                        if (!((kc >= 'a' and kc <= 'z') or (kc >= 'A' and kc <= 'Z') or
-                            (kc >= '0' and kc <= '9') or kc == '_'))
-                        {
-                            valid_key = false;
-                            break;
-                        }
-                    }
-                    if (!valid_key) continue;
-                    // First char must not be a digit
-                    if (key[0] >= '0' and key[0] <= '9') continue;
-
+                    if (!isValidEnvKey(key)) continue;
                     try shell_cmd.appendSlice(self.allocator, key);
                     try shell_cmd.appendSlice(self.allocator, "='");
-                    for (env_pair[eq_pos + 1 ..]) |c| {
-                        if (c == '\'') {
-                            try shell_cmd.appendSlice(self.allocator, "'\\''");
-                        } else {
-                            try shell_cmd.append(self.allocator, c);
-                        }
-                    }
+                    try appendShellEscaped(&shell_cmd, self.allocator, env_pair[eq_pos + 1 ..]);
                     try shell_cmd.appendSlice(self.allocator, "' ");
                 }
             }
@@ -598,41 +765,66 @@ pub const HookDaemon = struct {
 
         for (hook.command) |arg| {
             try shell_cmd.append(self.allocator, '\'');
-            for (arg) |c| {
-                if (c == '\'') {
-                    try shell_cmd.appendSlice(self.allocator, "'\\''");
-                } else {
-                    try shell_cmd.append(self.allocator, c);
-                }
-            }
+            try appendShellEscaped(&shell_cmd, self.allocator, arg);
             try shell_cmd.appendSlice(self.allocator, "' ");
         }
 
-        // Null-terminate the shell command for execve
         const cmd_z = try self.allocator.allocSentinel(u8, shell_cmd.items.len, 0);
         defer self.allocator.free(cmd_z);
         @memcpy(cmd_z[0..shell_cmd.items.len], shell_cmd.items);
 
+        // Build log file path: <data-dir>/hooks/<hook-id>-<timestamp>.log
+        const now_ms = getMilliTimestamp();
+        var log_path_buf: [256]u8 = undefined;
+        const log_path = std.fmt.bufPrint(&log_path_buf, "{s}/hooks/{d}-{d}.log", .{
+            self.hook_table.data_dir, hook.id, now_ms,
+        }) catch return error.PathTooLong;
+        const log_path_z = try self.allocator.allocSentinel(u8, log_path.len, 0);
+        defer self.allocator.free(log_path_z);
+        @memcpy(log_path_z[0..log_path.len], log_path);
+
+        // Open log file for child stdout/stderr
+        const log_fd_rc = std.os.linux.open(
+            log_path_z.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            0o644,
+        );
+        const log_fd_i: isize = @bitCast(log_fd_rc);
+        if (log_fd_i < 0) return error.LogFileOpen;
+        const log_fd: i32 = @intCast(log_fd_rc);
+
         // Create pipe for stdin delivery
         var pipe_fds: [2]i32 = undefined;
         const pipe_rc = std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
-        if (@as(isize, @bitCast(pipe_rc)) < 0) return error.PipeFailed;
+        if (@as(isize, @bitCast(pipe_rc)) < 0) {
+            _ = std.os.linux.close(log_fd);
+            return error.PipeFailed;
+        }
 
-        // fork + exec
         const pid = std.os.linux.fork();
         const pid_i: isize = @bitCast(pid);
 
         if (pid_i < 0) {
             _ = std.os.linux.close(pipe_fds[0]);
             _ = std.os.linux.close(pipe_fds[1]);
+            _ = std.os.linux.close(log_fd);
             return error.ForkFailed;
         }
 
         if (pid_i == 0) {
-            // Child: redirect stdin from pipe read end
-            _ = std.os.linux.close(pipe_fds[1]); // close write end
-            _ = std.os.linux.dup2(pipe_fds[0], 0); // stdin = pipe read end
+            // ── Child process ──
+            // Own process group so we can signal the whole tree.
+            _ = std.os.linux.setpgid(0, 0);
+
+            // Redirect stdin from pipe
+            _ = std.os.linux.close(pipe_fds[1]);
+            _ = std.os.linux.dup2(pipe_fds[0], 0);
             _ = std.os.linux.close(pipe_fds[0]);
+
+            // Redirect stdout + stderr to log file
+            _ = std.os.linux.dup2(log_fd, 1);
+            _ = std.os.linux.dup2(log_fd, 2);
+            _ = std.os.linux.close(log_fd);
 
             const sh: [*:0]const u8 = "/bin/sh";
             const dash_c: [*:0]const u8 = "-c";
@@ -641,20 +833,72 @@ pub const HookDaemon = struct {
             std.os.linux.exit(127);
         }
 
-        // Parent: write JSON to pipe write end, then close for EOF
-        _ = std.os.linux.close(pipe_fds[0]); // close read end
-        writeAllFd(pipe_fds[1], json);
-        _ = std.os.linux.close(pipe_fds[1]); // EOF for child's stdin
+        // ── Parent process ──
+        _ = std.os.linux.close(pipe_fds[0]);
+        _ = std.os.linux.close(log_fd);
 
-        // Wait for child
-        var status: u32 = 0;
-        _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
-        const exit_code = (status >> 8) & 0xFF;
-        if (exit_code != 0) {
-            logTimestampedFmt("Hook #{d} command exited with status {d}", .{ hook.id, exit_code });
+        // Write JSON to stdin pipe, then close for EOF
+        writeAllFd(pipe_fds[1], json);
+        _ = std.os.linux.close(pipe_fds[1]);
+
+        const child_pid: i32 = @intCast(pid_i);
+
+        // Build display string for `hook ps`
+        var cmd_display: [128]u8 = undefined;
+        var cmd_display_len: u8 = 0;
+        for (hook.command) |arg| {
+            if (cmd_display_len > 0 and cmd_display_len < 127) {
+                cmd_display[cmd_display_len] = ' ';
+                cmd_display_len += 1;
+            }
+            const remaining = 127 - cmd_display_len;
+            const copy_len: u8 = @intCast(@min(arg.len, remaining));
+            @memcpy(cmd_display[cmd_display_len .. cmd_display_len + copy_len], arg[0..copy_len]);
+            cmd_display_len += copy_len;
+            if (cmd_display_len >= 127) break;
+        }
+
+        // Copy pattern into fixed buffer
+        var pat_buf: [128]u8 = undefined;
+        const pat_len: u8 = @intCast(@min(hook.pattern.len, 128));
+        @memcpy(pat_buf[0..pat_len], hook.pattern[0..pat_len]);
+
+        // Copy log path into fixed buffer
+        var lp_buf: [256]u8 = undefined;
+        const lp_len: u8 = @intCast(@min(log_path.len, 256));
+        @memcpy(lp_buf[0..lp_len], log_path[0..lp_len]);
+
+        const entry = ProcessEntry{
+            .hook_id = hook.id,
+            .pid = child_pid,
+            .pgid = child_pid, // setpgid(0,0) makes pgid == pid
+            .start_time = now_ms,
+            .log_path = lp_buf,
+            .log_path_len = lp_len,
+            .pattern = pat_buf,
+            .pattern_len = pat_len,
+            .command_display = cmd_display,
+            .command_display_len = cmd_display_len,
+        };
+
+        if (!self.process_table.add(entry)) {
+            // Table full — should not happen since we checked above, but be safe
+            logTimestampedFmt("Hook #{d}: process table full, killing pid {d}", .{ hook.id, child_pid });
+            _ = std.os.linux.kill(-child_pid, .KILL);
+        } else {
+            logTimestampedFmt("Hook #{d}: started pid {d}, log: {s}", .{ hook.id, child_pid, log_path });
         }
     }
 };
+
+fn isValidEnvKey(key: []const u8) bool {
+    if (key[0] >= '0' and key[0] <= '9') return false;
+    for (key) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_')) return false;
+    }
+    return true;
+}
 
 /// Write all bytes to a raw file descriptor, retrying on partial writes.
 fn writeAllFd(fd: i32, data: []const u8) void {
