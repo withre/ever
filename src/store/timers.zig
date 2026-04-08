@@ -372,6 +372,13 @@ pub const TimerTable = struct {
         return error.NotFound;
     }
 
+    /// Return the number of registered timers. Safe for cross-thread display.
+    pub fn count(self: *TimerTable) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.timers.items.len;
+    }
+
     /// List all timers (returns internal references, caller must not free).
     pub fn list(self: *TimerTable) []const Timer {
         self.lock();
@@ -385,6 +392,19 @@ pub const TimerTable = struct {
         defer self.mutex.unlock();
         for (self.timers.items) |timer| {
             if (std.mem.eql(u8, timer.name, name)) return timer;
+        }
+        return null;
+    }
+
+    /// Find a timer by name and return a deep copy safe for use outside the lock.
+    /// Caller must free with `freeTimerCopy`.
+    pub fn findCopy(self: *TimerTable, allocator: Allocator, name: []const u8) ?Timer {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.timers.items) |timer| {
+            if (std.mem.eql(u8, timer.name, name)) {
+                return deepCopyTimer(allocator, timer) catch return null;
+            }
         }
         return null;
     }
@@ -613,7 +633,7 @@ fn deepCopyTimer(allocator: Allocator, timer: Timer) !Timer {
     };
 }
 
-fn freeTimerCopy(allocator: Allocator, timer: Timer) void {
+pub fn freeTimerCopy(allocator: Allocator, timer: Timer) void {
     allocator.free(timer.name);
     allocator.free(timer.schedule_str);
     allocator.free(timer.topic);

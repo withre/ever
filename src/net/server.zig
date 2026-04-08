@@ -410,7 +410,12 @@ pub const Server = struct {
         const tt = self.timer_table orelse
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
 
-        const timers = tt.list();
+        // Use snapshot() to get a deep copy — list() returns internal references
+        // that can be invalidated by the daemon thread modifying the timer table.
+        const timers = tt.snapshot(self.allocator) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "list timers failed");
+        defer timers_mod.freeTimerSnapshot(self.allocator, timers);
+
         const timer_infos = try self.allocator.alloc(protocol.TimerInfoData, timers.len);
         defer self.allocator.free(timer_infos);
 
@@ -575,8 +580,12 @@ pub const Server = struct {
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid timer info request");
         defer parsed.deinit();
 
-        const timer = tt.find(parsed.value.name) orelse
+        // findCopy returns a deep-copied Timer that is safe to use after
+        // the mutex is released. find() returns internal string pointers
+        // that can be invalidated by concurrent timer daemon mutations.
+        const timer = tt.findCopy(self.allocator, parsed.value.name) orelse
             return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "timer not found");
+        defer timers_mod.freeTimerCopy(self.allocator, timer);
 
         const timer_info = protocol.TimerInfoData{
             .name = timer.name,

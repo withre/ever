@@ -931,8 +931,8 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
         logTimestampedFmt("HTTP API listening on {s}:{d}", .{ actual_addr, http_port });
     }
     logTimestampedFmt("Data directory: {s}", .{actual_data_dir});
-    logTimestampedFmt("Hook daemon started ({d} hooks loaded)", .{hook_table.hooks.items.len});
-    logTimestampedFmt("Timer daemon started ({d} timers loaded)", .{timer_table.timers.items.len});
+    logTimestampedFmt("Hook daemon started ({d} hooks loaded)", .{hook_table.count()});
+    logTimestampedFmt("Timer daemon started ({d} timers loaded)", .{timer_table.count()});
     logTimestamped("Ready. Press Ctrl-C to stop.");
     server.installSignalHandlers();
     server.run() catch |err| {

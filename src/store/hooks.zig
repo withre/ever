@@ -45,8 +45,7 @@ pub const HookTable = struct {
     next_id: u64,
     data_dir: []const u8,
     mutex: std.atomic.Mutex,
-    /// Flag to signal the daemon to reload hooks
-    reload_signal: std.atomic.Value(bool),
+
 
     pub fn init(allocator: Allocator, data_dir: []const u8) !HookTable {
         var table = HookTable{
@@ -55,7 +54,7 @@ pub const HookTable = struct {
             .next_id = 1,
             .data_dir = try allocator.dupe(u8, data_dir),
             .mutex = .unlocked,
-            .reload_signal = std.atomic.Value(bool).init(false),
+
         };
         try table.load();
         return table;
@@ -74,14 +73,7 @@ pub const HookTable = struct {
     }
 
     fn freeHook(self: *HookTable, hook: Hook) void {
-        self.allocator.free(hook.pattern);
-        for (hook.command) |arg| self.allocator.free(arg);
-        self.allocator.free(hook.command);
-        self.allocator.free(hook.cwd);
-        if (hook.env) |env| {
-            for (env) |e| self.allocator.free(e);
-            self.allocator.free(env);
-        }
+        freeHookCopy(self.allocator, hook);
     }
 
     /// Add a hook. Returns the assigned ID.
@@ -140,7 +132,6 @@ pub const HookTable = struct {
         });
 
         try self.saveLocked();
-        self.reload_signal.store(true, .release);
         return id;
     }
 
@@ -160,11 +151,11 @@ pub const HookTable = struct {
         return error.NotFound;
     }
 
-    /// List all hooks (returns references, caller must not free).
-    pub fn list(self: *HookTable) []const Hook {
+    /// Return the number of registered hooks. Safe for cross-thread display.
+    pub fn count(self: *HookTable) usize {
         self.lock();
         defer self.mutex.unlock();
-        return self.hooks.items;
+        return self.hooks.items.len;
     }
 
     /// Update a hook's cursor. Called by the daemon after processing events.
@@ -701,11 +692,13 @@ pub const HookDaemon = struct {
 
         if (events.len == 0) return;
 
-        for (events, 0..) |event, i| {
+        for (events) |event| {
             self.executeHookCommand(hook, event) catch |err| {
                 logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
             };
-            self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
+            // Use the event's own offset for cursor advancement.
+            // This is robust regardless of how fetch interprets the start parameter.
+            self.hook_table.updateCursor(hook.id, event.offset + 1);
 
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
@@ -975,7 +968,7 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: Allocator, s: []const 
 }
 
 fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
-    var ts: std.os.linux.timespec = undefined;
+    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
     _ = std.os.linux.clock_gettime(.REALTIME, &ts);
     const secs: u64 = @intCast(ts.sec);
 
@@ -1003,8 +996,8 @@ fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
         remaining -= month_days[m];
     }
 
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "<fmt error>";
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "<message truncated>";
     std.debug.print("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}] {s}\n", .{ y, m + 1, @as(u8, @intCast(remaining + 1)), hour, minute, second, msg });
 }
 
@@ -1044,13 +1037,15 @@ test "HookTable add, list, remove" {
     try std.testing.expectEqual(@as(u64, 1), id1);
     try std.testing.expectEqual(@as(u64, 2), id2);
 
-    const hooks = table.list();
-    try std.testing.expectEqual(@as(usize, 2), hooks.len);
+    try std.testing.expectEqual(@as(usize, 2), table.count());
 
     try table.remove(id1);
-    const hooks2 = table.list();
-    try std.testing.expectEqual(@as(usize, 1), hooks2.len);
-    try std.testing.expectEqual(@as(u64, 2), hooks2[0].id);
+    {
+        const snap = try table.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        try std.testing.expectEqual(@as(usize, 1), snap.len);
+        try std.testing.expectEqual(@as(u64, 2), snap[0].id);
+    }
 
     // Cleanup temp dir
     const hooks_json_z = try allocator.allocSentinel(u8, tmp_path.len + 11, 0);
