@@ -424,7 +424,7 @@ pub const ProcessEntry = struct {
     pgid: i32,
     start_time: i64,
     log_path: [256]u8,
-    log_path_len: u9,
+    log_path_len: u8,
     pattern: [128]u8,
     pattern_len: u8,
     command_display: [128]u8,
@@ -876,7 +876,7 @@ pub const HookDaemon = struct {
 
         // Copy log path into fixed buffer
         var lp_buf: [256]u8 = undefined;
-        const lp_len: u9 = @intCast(@min(log_path.len, 256));
+        const lp_len: u8 = @intCast(@min(log_path.len, 255));
         @memcpy(lp_buf[0..lp_len], log_path[0..lp_len]);
 
         const entry = ProcessEntry{
