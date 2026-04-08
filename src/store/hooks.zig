@@ -46,7 +46,6 @@ pub const HookTable = struct {
     data_dir: []const u8,
     mutex: std.atomic.Mutex,
 
-
     pub fn init(allocator: Allocator, data_dir: []const u8) !HookTable {
         var table = HookTable{
             .allocator = allocator,
@@ -54,7 +53,6 @@ pub const HookTable = struct {
             .next_id = 1,
             .data_dir = try allocator.dupe(u8, data_dir),
             .mutex = .unlocked,
-
         };
         try table.load();
         return table;
@@ -426,7 +424,7 @@ pub const ProcessEntry = struct {
     pgid: i32,
     start_time: i64,
     log_path: [256]u8,
-    log_path_len: u8,
+    log_path_len: u9,
     pattern: [128]u8,
     pattern_len: u8,
     command_display: [128]u8,
@@ -619,20 +617,33 @@ pub const HookDaemon = struct {
     }
 
     /// Kill processes that have exceeded the timeout.
+    /// Sends SIGTERM to all timed-out processes first, then one grace sleep,
+    /// then SIGKILL to any that remain — avoids N×1s blocking.
     fn checkTimeouts(self: *HookDaemon) void {
         const now = getMilliTimestamp();
         var buf: [MAX_CONCURRENT_HOOKS]ProcessEntry = undefined;
         const n = self.process_table.snapshot(&buf);
+
+        // Phase 1: SIGTERM all timed-out processes
+        var any_killed = false;
         for (buf[0..n]) |entry| {
             const elapsed_ms = now - entry.start_time;
             if (elapsed_ms > DEFAULT_HOOK_TIMEOUT_SECS * 1000) {
-                logTimestampedFmt("Hook #{d} (pid {d}) timed out after {d}s, killing", .{
+                logTimestampedFmt("Hook #{d} (pid {d}) timed out after {d}s, sending SIGTERM", .{
                     entry.hook_id, entry.pid, @divTrunc(elapsed_ms, 1000),
                 });
                 _ = std.os.linux.kill(-entry.pgid, .TERM);
-                // Give it 1 second then SIGKILL
-                const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
-                _ = std.os.linux.nanosleep(&ts, null);
+                any_killed = true;
+            }
+        }
+        if (!any_killed) return;
+
+        // Phase 2: One grace period, then SIGKILL stragglers
+        const ts = std.os.linux.timespec{ .sec = 1, .nsec = 0 };
+        _ = std.os.linux.nanosleep(&ts, null);
+        for (buf[0..n]) |entry| {
+            const elapsed_ms = now - entry.start_time;
+            if (elapsed_ms > DEFAULT_HOOK_TIMEOUT_SECS * 1000) {
                 _ = std.os.linux.kill(-entry.pgid, .KILL);
             }
         }
@@ -692,13 +703,20 @@ pub const HookDaemon = struct {
 
         if (events.len == 0) return;
 
-        for (events) |event| {
-            self.executeHookCommand(hook, event) catch |err| {
-                logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
+        for (events, 0..) |event, i| {
+            self.executeHookCommand(hook, event) catch |err| switch (err) {
+                error.ConcurrentLimitReached => {
+                    // Don't advance cursor — retry these events on next poll cycle.
+                    logTimestampedFmt("Hook #{d}: concurrent limit reached, will retry", .{hook.id});
+                    return;
+                },
+                else => {
+                    logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
+                },
             };
-            // Use the event's own offset for cursor advancement.
-            // This is robust regardless of how fetch interprets the start parameter.
-            self.hook_table.updateCursor(hook.id, event.offset + 1);
+            // Cursor is topic-local: fetch() interprets start as the number of
+            // events to skip within the topic, so we advance by batch index.
+            self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
 
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
@@ -709,10 +727,10 @@ pub const HookDaemon = struct {
     }
 
     fn executeHookCommand(self: *HookDaemon, hook: Hook, event: store.Event) !void {
-        // Enforce concurrent limit
+        // Enforce concurrent limit — return typed error so caller can stop
+        // advancing the cursor and retry on the next poll cycle.
         if (self.process_table.activeCount() >= MAX_CONCURRENT_HOOKS) {
-            logTimestampedFmt("Hook #{d}: concurrent limit ({d}) reached, skipping", .{ hook.id, MAX_CONCURRENT_HOOKS });
-            return;
+            return error.ConcurrentLimitReached;
         }
 
         const json = try buildEventJsonFromStore(self.allocator, event);
@@ -858,7 +876,7 @@ pub const HookDaemon = struct {
 
         // Copy log path into fixed buffer
         var lp_buf: [256]u8 = undefined;
-        const lp_len: u8 = @intCast(@min(log_path.len, 256));
+        const lp_len: u9 = @intCast(@min(log_path.len, 256));
         @memcpy(lp_buf[0..lp_len], log_path[0..lp_len]);
 
         const entry = ProcessEntry{
