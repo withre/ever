@@ -374,7 +374,9 @@ pub const Server = struct {
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid schedule type");
 
         // Build schedule_str for display
-        const schedule_str = if (std.mem.eql(u8, req.schedule_type, "interval") or is_one_shot)
+        const schedule_str = if (is_one_shot)
+            try timers_mod.formatOneShotStr(self.allocator, schedule.interval)
+        else if (std.mem.eql(u8, req.schedule_type, "interval"))
             try timers_mod.formatIntervalStr(self.allocator, schedule.interval)
         else
             try self.allocator.dupe(u8, req.schedule_value);

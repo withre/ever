@@ -496,7 +496,10 @@ pub const TimerTable = struct {
 
             // Build schedule_str for display
             const sched_str = if (std.mem.eql(u8, t.schedule.type, "interval"))
-                try formatIntervalStr(self.allocator, t.schedule.seconds)
+                if (t.one_shot)
+                    try formatOneShotStr(self.allocator, t.schedule.seconds)
+                else
+                    try formatIntervalStr(self.allocator, t.schedule.seconds)
             else
                 try self.allocator.dupe(u8, t.schedule.expression);
             errdefer self.allocator.free(sched_str);
@@ -598,14 +601,22 @@ pub const TimerTable = struct {
 };
 
 pub fn formatIntervalStr(allocator: Allocator, secs: u64) ![]u8 {
+    return formatIntervalStrPrefix(allocator, secs, "every");
+}
+
+pub fn formatOneShotStr(allocator: Allocator, secs: u64) ![]u8 {
+    return formatIntervalStrPrefix(allocator, secs, "in");
+}
+
+fn formatIntervalStrPrefix(allocator: Allocator, secs: u64, prefix: []const u8) ![]u8 {
     if (secs % 86400 == 0 and secs >= 86400) {
-        return std.fmt.allocPrint(allocator, "every {d}d", .{secs / 86400});
+        return std.fmt.allocPrint(allocator, "{s} {d}d", .{ prefix, secs / 86400 });
     } else if (secs % 3600 == 0 and secs >= 3600) {
-        return std.fmt.allocPrint(allocator, "every {d}h", .{secs / 3600});
+        return std.fmt.allocPrint(allocator, "{s} {d}h", .{ prefix, secs / 3600 });
     } else if (secs % 60 == 0 and secs >= 60) {
-        return std.fmt.allocPrint(allocator, "every {d}m", .{secs / 60});
+        return std.fmt.allocPrint(allocator, "{s} {d}m", .{ prefix, secs / 60 });
     } else {
-        return std.fmt.allocPrint(allocator, "every {d}s", .{secs});
+        return std.fmt.allocPrint(allocator, "{s} {d}s", .{ prefix, secs });
     }
 }
 
