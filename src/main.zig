@@ -45,6 +45,14 @@ pub fn parseStoreAddress(ctx: *const cli.Context, env_block: [*:null]const ?[*:0
     };
 }
 
+/// Connect to the store, printing a clean error and exiting on failure.
+fn connectToStore(allocator: std.mem.Allocator, io: std.Io, addr: []const u8, port: u16) ever.client.Client {
+    return ever.client.Client.connect(allocator, io, addr, port) catch {
+        std.debug.print("error: cannot connect to store at {s}:{d}\n", .{ addr, port });
+        std.process.exit(1);
+    };
+}
+
 fn handlePub(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
@@ -62,9 +70,12 @@ fn handlePub(ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const offset = try c.publish(topic, null, data);
+    const offset = c.publish(topic, null, data) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
 }
 
@@ -85,7 +96,7 @@ fn handleSub(ctx: *cli.Context) !void {
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
 
-    var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
@@ -96,22 +107,31 @@ fn handleSub(ctx: *cli.Context) !void {
         var did_initial = false;
         while (true) {
             var result = if (!did_initial)
-                (if (is_pattern) try client.fetchPattern(topic_name, offset, max_count) else try client.fetch(topic_name, offset, max_count))
+                (if (is_pattern) client.fetchPattern(topic_name, offset, max_count) else client.fetch(topic_name, offset, max_count)) catch |err| switch (err) {
+                    error.ServerError => std.process.exit(1),
+                    else => return err,
+                }
             else
-                try client.fetchBlocking(
+                client.fetchBlocking(
                     if (!is_pattern) topic_name else null,
                     if (is_pattern) topic_name else null,
                     offset,
                     100,
                     5000,
-                );
+                ) catch |err| switch (err) {
+                    error.ServerError => std.process.exit(1),
+                    else => return err,
+                };
             defer result.deinit();
             for (result.events) |event| printEvent(event, json_values);
             if (result.events.len > 0) offset += result.events.len;
             did_initial = true;
         }
     } else {
-        var result = if (is_pattern) try client.fetchPattern(topic_name, from_offset, max_count) else try client.fetch(topic_name, from_offset, max_count);
+        var result = (if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
+            error.ServerError => std.process.exit(1),
+            else => return err,
+        };
         defer result.deinit();
         if (result.events.len == 0) {
             std.debug.print("No events.\n", .{});
@@ -138,8 +158,7 @@ fn handleWait(ctx: *cli.Context) !void {
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
 
-    var client = ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port) catch
-        std.process.fatal("cannot connect to store at {s}:{d}.", .{ addr_info.address, addr_info.port });
+    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
@@ -196,13 +215,16 @@ fn handleOn(ctx: *cli.Context) !void {
     const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
         (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
-    var client = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
 
-    var probe = if (is_pattern)
-        try client.fetchBlocking(null, pattern, 0, 1_000_000, 0)
+    var probe = (if (is_pattern)
+        client.fetchBlocking(null, pattern, 0, 1_000_000, 0)
     else
-        try client.fetchBlocking(pattern, null, 0, 1_000_000, 0);
+        client.fetchBlocking(pattern, null, 0, 1_000_000, 0)) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     const next_offset: u64 = probe.events.len;
     probe.deinit();
 
@@ -210,10 +232,13 @@ fn handleOn(ctx: *cli.Context) !void {
 
     var offset = next_offset;
     while (true) {
-        var result = if (is_pattern)
-            try client.fetchBlocking(null, pattern, offset, 100, 5000)
+        var result = (if (is_pattern)
+            client.fetchBlocking(null, pattern, offset, 100, 5000)
         else
-            try client.fetchBlocking(pattern, null, offset, 100, 5000);
+            client.fetchBlocking(pattern, null, offset, 100, 5000)) catch |err| switch (err) {
+            error.ServerError => std.process.exit(1),
+            else => return err,
+        };
         defer result.deinit();
 
         if (result.events.len == 0) {
@@ -323,9 +348,12 @@ fn handleTopicCreate(ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.createTopic(name);
+    c.createTopic(name) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     std.debug.print("Created topic: {s}\n", .{name});
 }
 
@@ -334,9 +362,12 @@ fn handleTopicList(ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const topics = try c.listTopics();
+    const topics = c.listTopics() catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer {
         for (topics) |t| allocator.free(t);
         allocator.free(topics);
@@ -355,9 +386,12 @@ fn handleTopicDelete(ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.deleteTopic(name);
+    c.deleteTopic(name) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     std.debug.print("Deleted topic: {s}\n", .{name});
 }
 
@@ -391,9 +425,12 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
+    const id = c.registerHookFull(pattern, cmd_list.items, cwd, once, null) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
 
     var cmd_display: std.ArrayList(u8) = .empty;
     defer cmd_display.deinit(allocator);
@@ -413,9 +450,12 @@ fn handleHookList(ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    var result = try c.listHooks();
+    var result = c.listHooks() catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer result.deinit();
 
     if (result.hooks.len == 0) {
@@ -450,9 +490,12 @@ fn handleHookPs(ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    var result = try c.hookPs();
+    var result = c.hookPs() catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer result.deinit();
 
     if (result.processes.len == 0) {
@@ -488,9 +531,12 @@ fn handleHookLogs(ctx: *cli.Context) !void {
         std.process.fatal("invalid hook ID '{s}'.", .{id_str});
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    var result = try c.hookLogs(id);
+    var result = c.hookLogs(id) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer result.deinit();
 
     std.debug.print("Log file: {s}\n---\n", .{result.log_path});
@@ -518,9 +564,12 @@ fn handleHookRm(ctx: *cli.Context) !void {
         std.process.fatal("invalid hook ID '{s}'.", .{id_str});
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.removeHook(id);
+    c.removeHook(id) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     std.debug.print("Hook #{d} removed.\n", .{id});
 }
 
@@ -564,9 +613,12 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     const actual_payload = if (payload.len > 0) payload else "{}";
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent);
+    c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
 
     if (has_in) {
         std.debug.print("Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ name, in_flag, topic });
@@ -580,9 +632,12 @@ fn handleTimerList(ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    var result = try c.listTimers();
+    var result = c.listTimers() catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer result.deinit();
 
     if (result.timers.len == 0) {
@@ -611,9 +666,12 @@ fn handleTimerRm(ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.removeTimer(name);
+    c.removeTimer(name) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     std.debug.print("Timer '{s}' removed.\n", .{name});
 }
 
@@ -628,9 +686,12 @@ fn handleTimerInfo(ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const timer = try c.timerInfo(name);
+    const timer = c.timerInfo(name) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
     defer {
         allocator.free(timer.name);
         allocator.free(timer.schedule);
@@ -741,9 +802,12 @@ fn handleTimerNew(ctx: *cli.Context) !void {
     const schedule_type: []const u8 = if (is_in) "one_shot" else if (is_every) "interval" else "cron";
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    try c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent);
+    c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
 
     std.debug.print("\n", .{});
     if (is_in) {
@@ -806,9 +870,12 @@ fn handleHookNew(ctx: *cli.Context) !void {
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
     const addr_info = parseStoreAddress(ctx, ctx.envp);
-    var c = try ever.client.Client.connect(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = try c.registerHookFull(pattern, cmd_list.items, cwd, once, null);
+    const id = c.registerHookFull(pattern, cmd_list.items, cwd, once, null) catch |err| switch (err) {
+        error.ServerError => std.process.exit(1),
+        else => return err,
+    };
 
     std.debug.print("\n", .{});
     if (once) {
