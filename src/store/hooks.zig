@@ -515,6 +515,31 @@ pub const ProcessTable = struct {
             }
         }
     }
+
+    /// Kill all tracked process groups belonging to a specific hook.
+    fn killByHookId(self: *ProcessTable, hook_id: u64, sig: std.os.linux.SIG) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.entries) |slot| {
+            if (slot) |e| {
+                if (e.hook_id == hook_id) {
+                    _ = std.os.linux.kill(-e.pgid, sig);
+                }
+            }
+        }
+    }
+
+    /// Check whether any tracked process belongs to a specific hook.
+    fn hasHookId(self: *ProcessTable, hook_id: u64) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.entries) |slot| {
+            if (slot) |e| {
+                if (e.hook_id == hook_id) return true;
+            }
+        }
+        return false;
+    }
 };
 
 /// The hook daemon runs as a thread alongside the store. It polls the
@@ -571,6 +596,34 @@ pub const HookDaemon = struct {
     /// Return a pointer to the process table so the server can read it.
     pub fn getProcessTable(self: *HookDaemon) *ProcessTable {
         return &self.process_table;
+    }
+
+    /// Kill all running children belonging to a specific hook.
+    /// Sends SIGTERM, waits up to 3s, then SIGKILL any remaining.
+    pub fn killChildrenForHook(self: *HookDaemon, hook_id: u64) void {
+        if (!self.process_table.hasHookId(hook_id)) return;
+
+        logTimestampedFmt("Killing children for hook #{d}", .{hook_id});
+        self.process_table.killByHookId(hook_id, .TERM);
+
+        // Wait up to 3 seconds for graceful exit
+        var waited: i64 = 0;
+        while (waited < 3000) {
+            self.reapChildren();
+            if (!self.process_table.hasHookId(hook_id)) return;
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            waited += 100;
+        }
+
+        // Force kill remaining
+        if (self.process_table.hasHookId(hook_id)) {
+            logTimestampedFmt("Force-killing remaining children for hook #{d}", .{hook_id});
+            self.process_table.killByHookId(hook_id, .KILL);
+            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            self.reapChildren();
+        }
     }
 
     fn ensureLogDir(self: *HookDaemon) void {

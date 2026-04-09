@@ -312,6 +312,11 @@ pub const Server = struct {
             return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid unregister hook request");
         defer parsed.deinit();
 
+        // Kill running children for this hook before removing it
+        if (self.hook_daemon) |hd| {
+            hd.killChildrenForHook(parsed.value.id);
+        }
+
         ht.remove(parsed.value.id) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "hook not found");
 
