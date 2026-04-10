@@ -389,10 +389,7 @@ pub const App = struct {
                 const fd = fdef.?;
                 if (!fd.takes_value) {
                     try ctx.flags.put(fd.name, "true");
-                } else if (i + 1 < raw.len and !std.mem.startsWith(u8, raw[i + 1], "-")) {
-                    i += 1;
-                    try ctx.flags.put(fd.name, raw[i]);
-                } else if (i + 1 < raw.len and raw[i + 1].len > 0 and raw[i + 1][0] != '-') {
+                } else if (i + 1 < raw.len and !self.isKnownFlag(cmd, raw[i + 1])) {
                     i += 1;
                     try ctx.flags.put(fd.name, raw[i]);
                 } else {
@@ -991,6 +988,31 @@ pub const App = struct {
             pos += 1;
         }
         return buf[0..pos];
+    }
+
+    /// Check if a token looks like a recognized flag (long or short) for the given command.
+    /// Used to decide whether a token after a value-taking flag is a value or the next flag.
+    fn isKnownFlag(self: *const App, cmd: Command, token: []const u8) bool {
+        if (!std.mem.startsWith(u8, token, "-")) return false;
+        if (std.mem.startsWith(u8, token, "--")) {
+            const name = token[2..];
+            const bare = if (std.mem.indexOfScalar(u8, name, '=')) |eq| name[0..eq] else name;
+            if (bare.len == 0) return true; // "--" separator
+            if (findFlagDef(cmd.flags, bare) != null) return true;
+            if (findFlagDef(self.global_flags, bare) != null) return true;
+            if (negatedName(cmd.flags, bare) != null) return true;
+            if (negatedName(self.global_flags, bare) != null) return true;
+            if (std.mem.eql(u8, bare, "help")) return true;
+            return false;
+        }
+        // Short flag: -X (len 2) or -X... (attached value)
+        if (token.len >= 2) {
+            const short = token[1];
+            if (short == 'h') return true; // -h is always help
+            if (findFlagByShort(cmd.flags, short) != null) return true;
+            if (findFlagByShort(self.global_flags, short) != null) return true;
+        }
+        return false;
     }
 
     fn findFlagDef(flags: []const FlagDef, name: []const u8) ?FlagDef {

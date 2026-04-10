@@ -564,9 +564,9 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     }
 
     // Count how many schedule flags are set (use hasFlag to detect even empty values)
-    const has_every = ctx.hasFlag("every") and every.len > 0;
+    const has_every = ctx.hasFlag("every");
     const has_cron = ctx.hasFlag("cron");
-    const has_in = ctx.hasFlag("in") and in_flag.len > 0;
+    const has_in = ctx.hasFlag("in");
     const schedule_count = @as(u8, if (has_every) 1 else 0) + @as(u8, if (has_cron) 1 else 0) + @as(u8, if (has_in) 1 else 0);
 
     if (schedule_count == 0) {
@@ -577,9 +577,17 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
         std.debug.print("error: --every, --cron, and --in are mutually exclusive\n", .{});
         std.process.exit(1);
     }
-    // Validate non-empty for cron if flag was provided
+    // Validate non-empty values
+    if (has_every and every.len == 0) {
+        std.debug.print("error: invalid duration format\n", .{});
+        std.process.exit(1);
+    }
     if (has_cron and cron.len == 0) {
         std.debug.print("error: invalid cron expression\n", .{});
+        std.process.exit(1);
+    }
+    if (has_in and in_flag.len == 0) {
+        std.debug.print("error: invalid duration format\n", .{});
         std.process.exit(1);
     }
     if (topic.len == 0) {
@@ -1398,7 +1406,25 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const env_block = init.minimal.environ.block.slice.ptr;
-    try app.run(allocator, io, args_list.items, env_block);
+    app.run(allocator, io, args_list.items, env_block) catch |err| switch (err) {
+        error.UnsupportedVersion => {
+            std.debug.print("error: protocol version mismatch (is the server an Ever store?)\n", .{});
+            std.process.exit(1);
+        },
+        error.BrokenPipe, error.ConnectionResetByPeer => {
+            std.debug.print("error: connection lost\n", .{});
+            std.process.exit(1);
+        },
+        error.IncompleteHeader, error.IncompleteBody => {
+            std.debug.print("error: incomplete response from server\n", .{});
+            std.process.exit(1);
+        },
+        error.MessageTooLarge => {
+            std.debug.print("error: server response too large\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
 }
 
 test "main module compiles" {
