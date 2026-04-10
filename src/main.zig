@@ -6,42 +6,21 @@ const readline = @import("readline.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
 
-/// Resolve store address from flags, env var, or default
-pub fn parseStoreAddress(ctx: *const cli.Context, env_block: [*:null]const ?[*:0]const u8) struct {
+/// Resolve store address from context flags.
+/// With global flags + env binding, priority is already: flag > env > default.
+pub fn parseStoreAddress(ctx: *const cli.Context) struct {
     address: []const u8,
     port: u16,
 } {
-    const default_addr = "127.0.0.1";
-    const default_port: u16 = 7890;
-
-    const flag_addr = ctx.flag("address");
-    const flag_port = ctx.flag("port");
-
-    if (flag_addr.len > 0 and flag_port.len > 0) {
-        return .{
-            .address = flag_addr,
-            .port = std.fmt.parseInt(u16, flag_port, 10) catch default_port,
-        };
-    }
-
-    // Check EVER_ADDR env var
-    var i: usize = 0;
-    while (env_block[i]) |env_str| : (i += 1) {
-        const len = std.mem.indexOfSentinel(u8, 0, env_str);
-        if (std.mem.startsWith(u8, env_str[0..len], "EVER_ADDR=")) {
-            const value = env_str[10..len];
-            if (std.mem.indexOfScalar(u8, value, ':')) |colon_pos| {
-                const addr = value[0..colon_pos];
-                const port_str = value[colon_pos + 1 ..];
-                const port = std.fmt.parseInt(u16, port_str, 10) catch default_port;
-                return .{ .address = addr, .port = port };
-            }
-        }
-    }
-
+    const addr = ctx.flag("address");
+    const port_str = ctx.flag("port");
+    const port = std.fmt.parseInt(u16, port_str, 10) catch {
+        std.debug.print("error: invalid port '{s}'\n", .{port_str});
+        std.process.exit(1);
+    };
     return .{
-        .address = if (flag_addr.len > 0) flag_addr else default_addr,
-        .port = if (flag_port.len > 0) std.fmt.parseInt(u16, flag_port, 10) catch default_port else default_port,
+        .address = if (addr.len > 0) addr else "127.0.0.1",
+        .port = port,
     };
 }
 
@@ -69,7 +48,7 @@ fn handlePub(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     const offset = c.publish(topic, null, data) catch |err| switch (err) {
@@ -94,7 +73,7 @@ fn handleSub(ctx: *cli.Context) !void {
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
 
     var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
@@ -105,9 +84,13 @@ fn handleSub(ctx: *cli.Context) !void {
     if (follow) {
         var offset = from_offset;
         var did_initial = false;
+        var emitted: u64 = 0;
         while (true) {
+            const remaining: u32 = if (max_count > emitted) @intCast(max_count - emitted) else 0;
+            if (remaining == 0 and did_initial) break;
+            const fetch_count: u32 = if (remaining > 0) remaining else max_count;
             var result = if (!did_initial)
-                (if (is_pattern) client.fetchPattern(topic_name, offset, max_count) else client.fetch(topic_name, offset, max_count)) catch |err| switch (err) {
+                (if (is_pattern) client.fetchPattern(topic_name, offset, fetch_count) else client.fetch(topic_name, offset, fetch_count)) catch |err| switch (err) {
                     error.ServerError => std.process.exit(1),
                     else => return err,
                 }
@@ -116,16 +99,21 @@ fn handleSub(ctx: *cli.Context) !void {
                     if (!is_pattern) topic_name else null,
                     if (is_pattern) topic_name else null,
                     offset,
-                    100,
+                    @min(100, fetch_count),
                     5000,
                 ) catch |err| switch (err) {
                     error.ServerError => std.process.exit(1),
                     else => return err,
                 };
             defer result.deinit();
-            for (result.events) |event| printEvent(event, json_values);
+            for (result.events) |event| {
+                printEvent(event, json_values);
+                emitted += 1;
+                if (emitted >= max_count) break;
+            }
             if (result.events.len > 0) offset += result.events.len;
             did_initial = true;
+            if (emitted >= max_count) break;
         }
     } else {
         var result = (if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
@@ -156,7 +144,7 @@ fn handleWait(ctx: *cli.Context) !void {
     const from_offset = ctx.flagInt(u64, "from");
     const json_values = ctx.flagBool("json-values");
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
 
     var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer client.deinit();
@@ -200,18 +188,18 @@ fn handleOn(ctx: *cli.Context) !void {
 
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
-    const cmd = ctx.flag("cmd");
+    const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
         std.debug.print("error: pattern is required\n", .{});
         std.process.exit(1);
     }
-    if (cmd.len == 0) {
+    if (rest_args.len == 0) {
         std.debug.print("error: command is required after --\n", .{});
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
         (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
@@ -268,14 +256,7 @@ fn handleOn(ctx: *cli.Context) !void {
             if (event.key) |k| try appendShellEscaped(&shell_cmd, allocator, k);
             try shell_cmd.appendSlice(allocator, "' exec ");
 
-            var cmd_list: std.ArrayList([]const u8) = .empty;
-            defer cmd_list.deinit(allocator);
-            var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
-            while (cmd_iter.next()) |arg| {
-                if (arg.len > 0) try cmd_list.append(allocator, arg);
-            }
-
-            for (cmd_list.items) |arg| {
+            for (rest_args) |arg| {
                 try shell_cmd.append(allocator, '\'');
                 for (arg) |c| {
                     if (c == '\'') {
@@ -347,7 +328,7 @@ fn handleTopicCreate(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.createTopic(name) catch |err| switch (err) {
@@ -361,7 +342,7 @@ fn handleTopicList(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     const topics = c.listTopics() catch |err| switch (err) {
@@ -385,7 +366,7 @@ fn handleTopicDelete(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.deleteTopic(name) catch |err| switch (err) {
@@ -400,22 +381,15 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const io = ctx.io;
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
-    const cmd = ctx.flag("cmd");
+    const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
         std.debug.print("error: pattern is required\n", .{});
         std.process.exit(1);
     }
-    if (cmd.len == 0) {
+    if (rest_args.len == 0) {
         std.debug.print("error: command is required after --\n", .{});
         std.process.exit(1);
-    }
-
-    var cmd_list: std.ArrayList([]const u8) = .empty;
-    defer cmd_list.deinit(allocator);
-    var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
-    while (cmd_iter.next()) |arg| {
-        if (arg.len > 0) try cmd_list.append(allocator, arg);
     }
 
     var cwd_buf: [4096]u8 = undefined;
@@ -424,17 +398,17 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const cwd_i: isize = @bitCast(cwd_len);
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFull(pattern, cmd_list.items, cwd, once, null) catch |err| switch (err) {
+    const id = c.registerHookFull(pattern, rest_args, cwd, once, null) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };
 
     var cmd_display: std.ArrayList(u8) = .empty;
     defer cmd_display.deinit(allocator);
-    for (cmd_list.items, 0..) |arg, j| {
+    for (rest_args, 0..) |arg, j| {
         if (j > 0) try cmd_display.append(allocator, ' ');
         try cmd_display.appendSlice(allocator, arg);
     }
@@ -449,7 +423,7 @@ fn handleHookList(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listHooks() catch |err| switch (err) {
@@ -489,7 +463,7 @@ fn handleHookPs(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookPs() catch |err| switch (err) {
@@ -530,7 +504,7 @@ fn handleHookLogs(ctx: *cli.Context) !void {
     const id = std.fmt.parseInt(u64, id_str, 10) catch
         std.process.fatal("invalid hook ID '{s}'.", .{id_str});
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookLogs(id) catch |err| switch (err) {
@@ -563,7 +537,7 @@ fn handleHookRm(ctx: *cli.Context) !void {
     const id = std.fmt.parseInt(u64, id_str, 10) catch
         std.process.fatal("invalid hook ID '{s}'.", .{id_str});
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.removeHook(id) catch |err| switch (err) {
@@ -589,10 +563,10 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    // Count how many schedule flags are set
-    const has_every = every.len > 0;
-    const has_cron = cron.len > 0;
-    const has_in = in_flag.len > 0;
+    // Count how many schedule flags are set (use hasFlag to detect even empty values)
+    const has_every = ctx.hasFlag("every") and every.len > 0;
+    const has_cron = ctx.hasFlag("cron");
+    const has_in = ctx.hasFlag("in") and in_flag.len > 0;
     const schedule_count = @as(u8, if (has_every) 1 else 0) + @as(u8, if (has_cron) 1 else 0) + @as(u8, if (has_in) 1 else 0);
 
     if (schedule_count == 0) {
@@ -601,6 +575,11 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     }
     if (schedule_count > 1) {
         std.debug.print("error: --every, --cron, and --in are mutually exclusive\n", .{});
+        std.process.exit(1);
+    }
+    // Validate non-empty for cron if flag was provided
+    if (has_cron and cron.len == 0) {
+        std.debug.print("error: invalid cron expression\n", .{});
         std.process.exit(1);
     }
     if (topic.len == 0) {
@@ -612,7 +591,7 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     const schedule_value = if (has_in) in_flag else if (has_every) every else cron;
     const actual_payload = if (payload.len > 0) payload else "{}";
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
@@ -631,7 +610,7 @@ fn handleTimerList(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listTimers() catch |err| switch (err) {
@@ -665,7 +644,7 @@ fn handleTimerRm(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.removeTimer(name) catch |err| switch (err) {
@@ -685,7 +664,7 @@ fn handleTimerInfo(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     const timer = c.timerInfo(name) catch |err| switch (err) {
@@ -801,7 +780,7 @@ fn handleTimerNew(ctx: *cli.Context) !void {
 
     const schedule_type: []const u8 = if (is_in) "one_shot" else if (is_every) "interval" else "cron";
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent) catch |err| switch (err) {
@@ -869,7 +848,7 @@ fn handleHookNew(ctx: *cli.Context) !void {
     const cwd_i: isize = @bitCast(cwd_len);
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
-    const addr_info = parseStoreAddress(ctx, ctx.envp);
+    const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
     const id = c.registerHookFull(pattern, cmd_list.items, cwd, once, null) catch |err| switch (err) {
@@ -903,6 +882,32 @@ fn handleStatus(ctx: *cli.Context) !void {
     const json_output = ctx.flagBool("json");
     const actual_dir = if (data_dir.len > 0) data_dir else "./data";
 
+    // Validate directory looks like an Ever store
+    {
+        const dir = std.Io.Dir.cwd().openDir(ctx.io, actual_dir, .{ .iterate = true }) catch {
+            std.debug.print("error: cannot open data directory '{s}'\n", .{actual_dir});
+            std.process.exit(1);
+        };
+        defer dir.close(ctx.io);
+        var found_store_marker = false;
+        var iter = dir.iterate();
+        while (iter.next(ctx.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".log") or
+                std.mem.eql(u8, entry.name, "ever.lock") or
+                std.mem.eql(u8, entry.name, "hooks.json") or
+                std.mem.eql(u8, entry.name, "timers.json"))
+            {
+                found_store_marker = true;
+                break;
+            }
+        }
+        if (!found_store_marker) {
+            std.debug.print("error: '{s}' does not appear to be an Ever data directory\n", .{actual_dir});
+            std.process.exit(1);
+        }
+    }
+
     var store_status = ever.status.getStatus(allocator, ctx.io, actual_dir) catch |err| {
         std.process.fatal("failed to get store status: {}", .{err});
     };
@@ -920,7 +925,10 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     const port_str = ctx.flag("port");
     const data_dir = ctx.flag("data-dir");
 
-    const port = std.fmt.parseInt(u16, port_str, 10) catch 7890;
+    const port = std.fmt.parseInt(u16, port_str, 10) catch {
+        std.debug.print("error: invalid port '{s}'\n", .{port_str});
+        std.process.exit(1);
+    };
     const actual_data_dir = if (data_dir.len > 0) data_dir else "./data";
 
     const dir = Dir.cwd().createDirPathOpen(io, actual_data_dir, .{ .open_options = .{ .iterate = true } }) catch
@@ -970,7 +978,10 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
 
     const http_port_str = ctx.flag("http-port");
     const no_http = ctx.flagBool("no-http");
-    const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch 8890;
+    const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch {
+        std.debug.print("error: invalid http-port '{s}'\n", .{http_port_str});
+        std.process.exit(1);
+    };
 
     if (!no_http) {
         http_server_inst = ever.http.HttpServer.init(allocator, io, &topic_manager, .{
@@ -1151,6 +1162,10 @@ const app = cli.App{
     .name = "ever",
     .description = "lightweight event storage",
     .version = "0.1.0",
+    .global_flags = &.{
+        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .env = "EVER_HOST", .description = "Store address" },
+        .{ .name = "port", .short = 'p', .default = "7890", .env = "EVER_PORT", .description = "Store port" },
+    },
     .help_sections = &.{
         .{
             .title = "Store Setup",
@@ -1190,11 +1205,7 @@ const app = cli.App{
             .description = "Publish an event",
             .args = &.{
                 .{ .name = "topic", .required = true, .description = "Topic name" },
-                .{ .name = "data", .required = true, .description = "JSON event data" },
-            },
-            .flags = &.{
-                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
+                .{ .name = "data", .required = true, .description = "Event data" },
             },
             .run = handlePub,
         },
@@ -1205,8 +1216,6 @@ const app = cli.App{
                 .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
             },
             .flags = &.{
-                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                 .{ .name = "from", .default = "0", .description = "Start offset" },
                 .{ .name = "max", .default = "100", .description = "Max events" },
                 .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
@@ -1221,8 +1230,6 @@ const app = cli.App{
                 .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
             },
             .flags = &.{
-                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                 .{ .name = "count", .default = "1", .description = "Events to wait for" },
                 .{ .name = "timeout", .default = "0", .description = "Timeout in seconds" },
                 .{ .name = "from", .default = "0", .description = "Start offset" },
@@ -1237,11 +1244,9 @@ const app = cli.App{
                 .{ .name = "pattern", .required = true, .description = "Topic pattern" },
             },
             .flags = &.{
-                .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                 .{ .name = "once", .takes_value = false, .description = "Exit after first event" },
-                .{ .name = "cmd", .description = "Command to execute" },
             },
+            .takes_rest = true,
             .run = handleOn,
         },
         .{
@@ -1253,19 +1258,11 @@ const app = cli.App{
                     .aliases = &.{"add"},
                     .description = "Create a new topic",
                     .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTopicCreate,
                 },
                 .{
                     .name = "list",
                     .description = "List all topics",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTopicList,
                 },
                 .{
@@ -1273,10 +1270,6 @@ const app = cli.App{
                     .aliases = &.{ "rm", "remove" },
                     .description = "Delete a topic",
                     .args = &.{.{ .name = "name", .required = true, .description = "Topic name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTopicDelete,
                 },
             },
@@ -1288,10 +1281,6 @@ const app = cli.App{
                 .{
                     .name = "new",
                     .description = "Interactively create a hook",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleHookNew,
                 },
                 .{
@@ -1299,20 +1288,14 @@ const app = cli.App{
                     .description = "Register a server-side hook",
                     .args = &.{.{ .name = "pattern", .required = true, .description = "Topic pattern" }},
                     .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
                         .{ .name = "once", .takes_value = false, .description = "Remove after first trigger" },
-                        .{ .name = "cmd", .description = "Command to execute" },
                     },
+                    .takes_rest = true,
                     .run = handleHookAdd,
                 },
                 .{
                     .name = "list",
                     .description = "List registered hooks",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleHookList,
                 },
                 .{
@@ -1320,29 +1303,17 @@ const app = cli.App{
                     .aliases = &.{ "remove", "delete" },
                     .description = "Remove a hook by ID",
                     .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleHookRm,
                 },
                 .{
                     .name = "ps",
                     .description = "Show running hook processes",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleHookPs,
                 },
                 .{
                     .name = "logs",
                     .description = "Show recent hook execution output",
                     .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleHookLogs,
                 },
             },
@@ -1351,11 +1322,9 @@ const app = cli.App{
             .name = "start",
             .description = "Start the storage server",
             .flags = &.{
-                .{ .name = "address", .default = "127.0.0.1", .description = "Bind address" },
-                .{ .name = "port", .default = "7890", .description = "Bind port" },
-                .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
-                .{ .name = "http-port", .default = "8890", .description = "HTTP API port" },
-                .{ .name = "no-http", .takes_value = false, .description = "Disable HTTP server" },
+                .{ .name = "data-dir", .default = "./data", .env = "EVER_DATA_DIR", .description = "Data directory" },
+                .{ .name = "http-port", .default = "8890", .env = "EVER_HTTP_PORT", .description = "HTTP API port" },
+                .{ .name = "no-http", .takes_value = false, .negatable = false, .description = "Disable HTTP server" },
             },
             .run = handleStart,
         },
@@ -1363,7 +1332,7 @@ const app = cli.App{
             .name = "status",
             .description = "Show store statistics",
             .flags = &.{
-                .{ .name = "data-dir", .default = "./data", .description = "Data directory" },
+                .{ .name = "data-dir", .default = "./data", .env = "EVER_DATA_DIR", .description = "Data directory" },
                 .{ .name = "json", .takes_value = false, .description = "Output as JSON" },
             },
             .run = handleStatus,
@@ -1375,10 +1344,6 @@ const app = cli.App{
                 .{
                     .name = "new",
                     .description = "Interactively create a timer",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTimerNew,
                 },
                 .{
@@ -1390,11 +1355,9 @@ const app = cli.App{
                         .{ .name = "payload", .required = false, .description = "JSON payload (optional)" },
                     },
                     .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                        .{ .name = "every", .value_name = "INTERVAL", .description = "Interval (e.g. 5s, 1m, 2h)" },
-                        .{ .name = "cron", .value_name = "EXPR", .description = "Cron expression" },
-                        .{ .name = "in", .value_name = "DURATION", .description = "Fire once after duration (e.g. 5s, 2m)" },
+                        .{ .name = "every", .value_name = "INTERVAL", .description = "Interval (e.g. 5s, 1m, 2h)", .conflicts = &.{ "cron", "in" } },
+                        .{ .name = "cron", .value_name = "EXPR", .description = "Cron expression", .conflicts = &.{ "every", "in" } },
+                        .{ .name = "in", .value_name = "DURATION", .description = "Fire once after duration (e.g. 5s, 2m)", .conflicts = &.{ "every", "cron" } },
                         .{ .name = "no-persist", .takes_value = false, .description = "Don't catch up missed fires" },
                     },
                     .run = handleTimerAdd,
@@ -1402,10 +1365,6 @@ const app = cli.App{
                 .{
                     .name = "list",
                     .description = "List registered timers",
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTimerList,
                 },
                 .{
@@ -1413,20 +1372,12 @@ const app = cli.App{
                     .aliases = &.{ "remove", "delete" },
                     .description = "Remove a timer by name",
                     .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTimerRm,
                 },
                 .{
                     .name = "info",
                     .description = "Show timer details",
                     .args = &.{.{ .name = "name", .required = true, .description = "Timer name" }},
-                    .flags = &.{
-                        .{ .name = "address", .short = 'a', .default = "127.0.0.1", .description = "Store address" },
-                        .{ .name = "port", .short = 'p', .default = "7890", .description = "Store port" },
-                    },
                     .run = handleTimerInfo,
                 },
             },
