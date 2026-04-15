@@ -120,7 +120,7 @@ pub const ErrorResponse = struct {
 
 pub const RegisterHookRequest = struct {
     pattern: []const u8,
-    command: []const []const u8,
+    command: []const u8,
     cwd: []const u8,
     once: bool = false,
     env: ?[]const []const u8 = null,
@@ -137,7 +137,7 @@ pub const UnregisterHookRequest = struct {
 pub const HookInfo = struct {
     id: u64,
     pattern: []const u8,
-    command: []const []const u8,
+    command: []const u8,
     cwd: []const u8,
     cursor: u64,
     once: bool = false,

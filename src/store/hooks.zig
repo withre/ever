@@ -13,7 +13,7 @@ const store = @import("store.zig");
 pub const Hook = struct {
     id: u64,
     pattern: []const u8,
-    command: []const []const u8,
+    command: []const u8,
     cwd: []const u8,
     cursor: u64,
     created_at: i64,
@@ -25,7 +25,7 @@ pub const Hook = struct {
 const HookJson = struct {
     id: u64,
     pattern: []const u8,
-    command: []const []const u8,
+    command: []const u8,
     cwd: []const u8,
     cursor: u64,
     created_at: i64,
@@ -35,6 +35,23 @@ const HookJson = struct {
 
 const HookFileJson = struct {
     hooks: []const HookJson,
+    next_id: u64,
+};
+
+/// Legacy format where command was stored as an array of words.
+const HookJsonLegacy = struct {
+    id: u64,
+    pattern: []const u8,
+    command: []const []const u8,
+    cwd: []const u8,
+    cursor: u64,
+    created_at: i64,
+    once: bool = false,
+    env: ?[]const []const u8 = null,
+};
+
+const HookFileLegacy = struct {
+    hooks: []const HookJsonLegacy,
     next_id: u64,
 };
 
@@ -75,12 +92,12 @@ pub const HookTable = struct {
     }
 
     /// Add a hook. Returns the assigned ID.
-    pub fn add(self: *HookTable, pattern: []const u8, command: []const []const u8, cwd: []const u8) !u64 {
+    pub fn add(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8) !u64 {
         return self.addFull(pattern, command, cwd, false, null);
     }
 
     /// Add a hook with full options (once, env). Returns the assigned ID.
-    pub fn addFull(self: *HookTable, pattern: []const u8, command: []const []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
+    pub fn addFull(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
         self.lock();
         defer self.mutex.unlock();
 
@@ -91,14 +108,8 @@ pub const HookTable = struct {
         const pattern_copy = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(pattern_copy);
 
-        const cmd_copy = try self.allocator.alloc([]const u8, command.len);
+        const cmd_copy = try self.allocator.dupe(u8, command);
         errdefer self.allocator.free(cmd_copy);
-        var copied: usize = 0;
-        errdefer for (cmd_copy[0..copied]) |c| self.allocator.free(c);
-        for (command, 0..) |arg, i| {
-            cmd_copy[i] = try self.allocator.dupe(u8, arg);
-            copied = i + 1;
-        }
 
         const cwd_copy = try self.allocator.dupe(u8, cwd);
         errdefer self.allocator.free(cwd_copy);
@@ -228,56 +239,74 @@ pub const HookTable = struct {
 
         if (total == 0) return;
 
-        const parsed = std.json.parseFromSlice(HookFileJson, self.allocator, buf[0..total], .{
+        // Try new format first (command as string)
+        if (std.json.parseFromSlice(HookFileJson, self.allocator, buf[0..total], .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        })) |parsed| {
+            defer parsed.deinit();
+            self.next_id = parsed.value.next_id;
+            for (parsed.value.hooks) |h| {
+                try self.loadHook(h.id, h.pattern, h.command, h.cwd, h.cursor, h.created_at, h.once, h.env);
+            }
+            return;
+        } else |_| {}
+
+        // Fall back to legacy format (command as array of words) — join with spaces
+        const legacy = std.json.parseFromSlice(HookFileLegacy, self.allocator, buf[0..total], .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         }) catch return;
-        defer parsed.deinit();
+        defer legacy.deinit();
 
-        self.next_id = parsed.value.next_id;
-
-        for (parsed.value.hooks) |h| {
-            const pattern_copy = try self.allocator.dupe(u8, h.pattern);
-            errdefer self.allocator.free(pattern_copy);
-
-            const cmd_copy = try self.allocator.alloc([]const u8, h.command.len);
-            errdefer self.allocator.free(cmd_copy);
-            var copied: usize = 0;
-            errdefer for (cmd_copy[0..copied]) |c| self.allocator.free(c);
-            for (h.command, 0..) |arg, i| {
-                cmd_copy[i] = try self.allocator.dupe(u8, arg);
-                copied = i + 1;
+        self.next_id = legacy.value.next_id;
+        for (legacy.value.hooks) |h| {
+            // Join command array into single string
+            var cmd_str: std.ArrayList(u8) = .empty;
+            defer cmd_str.deinit(self.allocator);
+            for (h.command, 0..) |arg, j| {
+                if (j > 0) try cmd_str.append(self.allocator, ' ');
+                try cmd_str.appendSlice(self.allocator, arg);
             }
-
-            const cwd_copy = try self.allocator.dupe(u8, h.cwd);
-            errdefer self.allocator.free(cwd_copy);
-
-            // Deep copy env if present
-            const env_copy: ?[]const []const u8 = if (h.env) |e| blk: {
-                const ec = try self.allocator.alloc([]const u8, e.len);
-                var env_copied: usize = 0;
-                errdefer {
-                    for (ec[0..env_copied]) |ev| self.allocator.free(ev);
-                    self.allocator.free(ec);
-                }
-                for (e, 0..) |item, j| {
-                    ec[j] = try self.allocator.dupe(u8, item);
-                    env_copied = j + 1;
-                }
-                break :blk ec;
-            } else null;
-
-            try self.hooks.append(self.allocator, .{
-                .id = h.id,
-                .pattern = pattern_copy,
-                .command = cmd_copy,
-                .cwd = cwd_copy,
-                .cursor = h.cursor,
-                .created_at = h.created_at,
-                .once = h.once,
-                .env = env_copy,
-            });
+            try self.loadHook(h.id, h.pattern, cmd_str.items, h.cwd, h.cursor, h.created_at, h.once, h.env);
         }
+    }
+
+    fn loadHook(self: *HookTable, id: u64, pattern: []const u8, command: []const u8, cwd: []const u8, cursor: u64, created_at: i64, once: bool, env: ?[]const []const u8) !void {
+        const pattern_copy = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(pattern_copy);
+
+        const cmd_copy = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(cmd_copy);
+
+        const cwd_copy = try self.allocator.dupe(u8, cwd);
+        errdefer self.allocator.free(cwd_copy);
+
+        // Deep copy env if present
+        const env_copy: ?[]const []const u8 = if (env) |e| blk: {
+            const ec = try self.allocator.alloc([]const u8, e.len);
+            var env_copied: usize = 0;
+            errdefer {
+                for (ec[0..env_copied]) |ev| self.allocator.free(ev);
+                self.allocator.free(ec);
+            }
+            for (e, 0..) |item, j| {
+                ec[j] = try self.allocator.dupe(u8, item);
+                env_copied = j + 1;
+            }
+            break :blk ec;
+        } else null;
+
+        try self.hooks.append(self.allocator, .{
+            .id = id,
+            .pattern = pattern_copy,
+            .command = cmd_copy,
+            .cwd = cwd_copy,
+            .cursor = cursor,
+            .created_at = created_at,
+            .once = once,
+            .env = env_copy,
+        });
     }
 
     /// Save hooks to disk atomically. Must be called with lock held.
@@ -357,16 +386,8 @@ fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
     const pattern = try allocator.dupe(u8, hook.pattern);
     errdefer allocator.free(pattern);
 
-    const cmd = try allocator.alloc([]const u8, hook.command.len);
-    var cmd_copied: usize = 0;
-    errdefer {
-        for (cmd[0..cmd_copied]) |c| allocator.free(c);
-        allocator.free(cmd);
-    }
-    for (hook.command, 0..) |arg, i| {
-        cmd[i] = try allocator.dupe(u8, arg);
-        cmd_copied = i + 1;
-    }
+    const cmd = try allocator.dupe(u8, hook.command);
+    errdefer allocator.free(cmd);
 
     const cwd = try allocator.dupe(u8, hook.cwd);
     errdefer allocator.free(cwd);
@@ -399,7 +420,6 @@ fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
 
 fn freeHookCopy(allocator: Allocator, hook: Hook) void {
     allocator.free(hook.pattern);
-    for (hook.command) |arg| allocator.free(arg);
     allocator.free(hook.command);
     allocator.free(hook.cwd);
     if (hook.env) |env| {
@@ -734,8 +754,13 @@ pub const HookDaemon = struct {
         defer freeHookSnapshot(self.allocator, hooks);
 
         for (hooks) |hook| {
-            self.processHook(hook) catch |err| {
-                logTimestampedFmt("Hook #{d} error: {}", .{ hook.id, err });
+            self.processHook(hook) catch |err| switch (err) {
+                // Topic may not exist yet or was deleted — silently skip
+                // instead of spamming the log every poll cycle.
+                error.NotFound => {},
+                else => {
+                    logTimestampedFmt("Hook #{d} error: {}", .{ hook.id, err });
+                },
             };
         }
     }
@@ -827,11 +852,9 @@ pub const HookDaemon = struct {
         if (event.key) |k| try appendShellEscaped(&shell_cmd, self.allocator, k);
         try shell_cmd.appendSlice(self.allocator, "' exec ");
 
-        for (hook.command) |arg| {
-            try shell_cmd.append(self.allocator, '\'');
-            try appendShellEscaped(&shell_cmd, self.allocator, arg);
-            try shell_cmd.appendSlice(self.allocator, "' ");
-        }
+        // Pass command string directly — no per-word quoting so shell
+        // metacharacters (redirects, pipes, etc.) work as intended.
+        try shell_cmd.appendSlice(self.allocator, hook.command);
 
         const cmd_z = try self.allocator.allocSentinel(u8, shell_cmd.items.len, 0);
         defer self.allocator.free(cmd_z);
@@ -909,18 +932,8 @@ pub const HookDaemon = struct {
 
         // Build display string for `hook ps`
         var cmd_display: [128]u8 = undefined;
-        var cmd_display_len: u8 = 0;
-        for (hook.command) |arg| {
-            if (cmd_display_len > 0 and cmd_display_len < 127) {
-                cmd_display[cmd_display_len] = ' ';
-                cmd_display_len += 1;
-            }
-            const remaining = 127 - cmd_display_len;
-            const copy_len: u8 = @intCast(@min(arg.len, remaining));
-            @memcpy(cmd_display[cmd_display_len .. cmd_display_len + copy_len], arg[0..copy_len]);
-            cmd_display_len += copy_len;
-            if (cmd_display_len >= 127) break;
-        }
+        const cmd_display_len: u8 = @intCast(@min(hook.command.len, 127));
+        @memcpy(cmd_display[0..cmd_display_len], hook.command[0..cmd_display_len]);
 
         // Copy pattern into fixed buffer
         var pat_buf: [128]u8 = undefined;
@@ -1101,9 +1114,8 @@ test "HookTable add, list, remove" {
     var table = try HookTable.init(allocator, tmp_path);
     defer table.deinit();
 
-    const cmd = &[_][]const u8{ "echo", "hello" };
-    const id1 = try table.add("test.topic", cmd, "/tmp");
-    const id2 = try table.add("agent.", cmd, "/home");
+    const id1 = try table.add("test.topic", "echo hello", "/tmp");
+    const id2 = try table.add("agent.", "echo hello", "/home");
 
     try std.testing.expectEqual(@as(u64, 1), id1);
     try std.testing.expectEqual(@as(u64, 2), id2);

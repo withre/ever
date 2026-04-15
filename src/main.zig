@@ -392,6 +392,14 @@ fn handleHookAdd(ctx: *cli.Context) !void {
         std.process.exit(1);
     }
 
+    // Join rest args into a single command string
+    var cmd_str: std.ArrayList(u8) = .empty;
+    defer cmd_str.deinit(allocator);
+    for (rest_args, 0..) |arg, j| {
+        if (j > 0) try cmd_str.append(allocator, ' ');
+        try cmd_str.appendSlice(allocator, arg);
+    }
+
     var cwd_buf: [4096]u8 = undefined;
     const cwd_z: [*:0]const u8 = "/proc/self/cwd";
     const cwd_len = std.os.linux.readlink(cwd_z, &cwd_buf, cwd_buf.len);
@@ -401,21 +409,15 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFull(pattern, rest_args, cwd, once, null) catch |err| switch (err) {
+    const id = c.registerHookFull(pattern, cmd_str.items, cwd, once, null) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };
 
-    var cmd_display: std.ArrayList(u8) = .empty;
-    defer cmd_display.deinit(allocator);
-    for (rest_args, 0..) |arg, j| {
-        if (j > 0) try cmd_display.append(allocator, ' ');
-        try cmd_display.appendSlice(allocator, arg);
-    }
     if (once) {
-        std.debug.print("Hook #{d} registered (once): {s} → {s}\n", .{ id, pattern, cmd_display.items });
+        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}\n", .{ id, pattern, cmd_str.items });
     } else {
-        std.debug.print("Hook #{d} registered: {s} → {s}\n", .{ id, pattern, cmd_display.items });
+        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}\n", .{ id, pattern, cmd_str.items });
     }
 }
 
@@ -437,13 +439,6 @@ fn handleHookList(ctx: *cli.Context) !void {
     } else {
         std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
         for (result.hooks) |hook| {
-            var cmd_display: std.ArrayList(u8) = .empty;
-            defer cmd_display.deinit(allocator);
-            for (hook.command, 0..) |arg, j| {
-                if (j > 0) try cmd_display.append(allocator, ' ');
-                try cmd_display.appendSlice(allocator, arg);
-            }
-
             var id_buf: [20]u8 = undefined;
             const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
             var cursor_buf: [20]u8 = undefined;
@@ -452,7 +447,7 @@ fn handleHookList(ctx: *cli.Context) !void {
             std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
                 id_str,
                 hook.pattern,
-                cmd_display.items,
+                hook.command,
                 cursor_str,
             });
         }
@@ -841,14 +836,6 @@ fn handleHookNew(ctx: *cli.Context) !void {
     defer allocator.free(once_input);
     const once = std.mem.eql(u8, once_input, "y") or std.mem.eql(u8, once_input, "Y");
 
-    // Parse command into args
-    var cmd_list: std.ArrayList([]const u8) = .empty;
-    defer cmd_list.deinit(allocator);
-    var cmd_iter = std.mem.splitScalar(u8, cmd_input, ' ');
-    while (cmd_iter.next()) |arg| {
-        if (arg.len > 0) try cmd_list.append(allocator, arg);
-    }
-
     // Get cwd
     var cwd_buf: [4096]u8 = undefined;
     const cwd_z: [*:0]const u8 = "/proc/self/cwd";
@@ -859,7 +846,7 @@ fn handleHookNew(ctx: *cli.Context) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFull(pattern, cmd_list.items, cwd, once, null) catch |err| switch (err) {
+    const id = c.registerHookFull(pattern, cmd_input, cwd, once, null) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };

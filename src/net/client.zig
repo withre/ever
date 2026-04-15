@@ -34,7 +34,7 @@ pub const Event = struct {
 pub const HookInfoOwned = struct {
     id: u64,
     pattern: []const u8,
-    command: []const []const u8,
+    command: []const u8,
     cwd: []const u8,
     cursor: u64,
     once: bool = false,
@@ -42,7 +42,6 @@ pub const HookInfoOwned = struct {
 
     pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
         allocator.free(self.pattern);
-        for (self.command) |arg| allocator.free(arg);
         allocator.free(self.command);
         allocator.free(self.cwd);
         if (self.env) |env| {
@@ -298,12 +297,12 @@ pub const Client = struct {
     }
 
     /// Register a hook on the server.
-    pub fn registerHook(self: *Client, pattern: []const u8, command: []const []const u8, cwd: []const u8) !u64 {
+    pub fn registerHook(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8) !u64 {
         return self.registerHookFull(pattern, command, cwd, false, null);
     }
 
     /// Register a hook with full options (once, env).
-    pub fn registerHookFull(self: *Client, pattern: []const u8, command: []const []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
+    pub fn registerHookFull(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
         const req = protocol.RegisterHookRequest{
             .pattern = pattern,
             .command = command,
@@ -366,17 +365,6 @@ pub const Client = struct {
         }
 
         for (parsed.value.hooks, 0..) |h, i| {
-            const cmd_copy = try self.allocator.alloc([]const u8, h.command.len);
-            var cmd_copied: usize = 0;
-            errdefer {
-                for (cmd_copy[0..cmd_copied]) |c| self.allocator.free(c);
-                self.allocator.free(cmd_copy);
-            }
-            for (h.command, 0..) |arg, j| {
-                cmd_copy[j] = try self.allocator.dupe(u8, arg);
-                cmd_copied = j + 1;
-            }
-
             // Deep copy env if present
             const env_copy: ?[]const []const u8 = if (h.env) |env| blk: {
                 const ec = try self.allocator.alloc([]const u8, env.len);
@@ -395,7 +383,7 @@ pub const Client = struct {
             hooks[i] = .{
                 .id = h.id,
                 .pattern = try self.allocator.dupe(u8, h.pattern),
-                .command = cmd_copy,
+                .command = try self.allocator.dupe(u8, h.command),
                 .cwd = try self.allocator.dupe(u8, h.cwd),
                 .cursor = h.cursor,
                 .once = h.once,
