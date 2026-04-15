@@ -199,10 +199,11 @@ fn readHooks(alloc: Allocator, io_: Io, dir: Dir) ![]HookInfo {
     const n = file.readPositionalAll(io_, buf, 0) catch return try alloc.alloc(HookInfo, 0);
     if (n == 0) return try alloc.alloc(HookInfo, 0);
 
+    // New format: command is a string
     const HookJson = struct {
         id: u64,
         pattern: []const u8,
-        command: []const []const u8,
+        command: []const u8,
         cwd: []const u8,
         cursor: u64,
         created_at: i64 = 0,
@@ -214,13 +215,61 @@ fn readHooks(alloc: Allocator, io_: Io, dir: Dir) ![]HookInfo {
         next_id: u64,
     };
 
-    const parsed = std.json.parseFromSlice(HookFileJson, alloc, buf[0..n], .{
+    // Legacy format: command is an array of strings
+    const HookJsonLegacy = struct {
+        id: u64,
+        pattern: []const u8,
+        command: []const []const u8,
+        cwd: []const u8,
+        cursor: u64,
+        created_at: i64 = 0,
+        once: bool = false,
+    };
+
+    const HookFileLegacy = struct {
+        hooks: []const HookJsonLegacy,
+        next_id: u64,
+    };
+
+    const data = buf[0..n];
+
+    // Try new format first (command as string)
+    if (std.json.parseFromSlice(HookFileJson, alloc, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    })) |parsed| {
+        defer parsed.deinit();
+
+        var hooks = try alloc.alloc(HookInfo, parsed.value.hooks.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (hooks[0..initialized]) |h| {
+                alloc.free(h.pattern);
+                alloc.free(h.command);
+            }
+            alloc.free(hooks);
+        }
+
+        for (parsed.value.hooks, 0..) |h, i| {
+            hooks[i] = .{
+                .id = h.id,
+                .pattern = try alloc.dupe(u8, h.pattern),
+                .command = try alloc.dupe(u8, h.command),
+                .cursor = h.cursor,
+            };
+            initialized = i + 1;
+        }
+        return hooks;
+    } else |_| {}
+
+    // Fall back to legacy format (command as array of words)
+    const legacy = std.json.parseFromSlice(HookFileLegacy, alloc, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return try alloc.alloc(HookInfo, 0);
-    defer parsed.deinit();
+    defer legacy.deinit();
 
-    var hooks = try alloc.alloc(HookInfo, parsed.value.hooks.len);
+    var hooks = try alloc.alloc(HookInfo, legacy.value.hooks.len);
     var initialized: usize = 0;
     errdefer {
         for (hooks[0..initialized]) |h| {
@@ -230,7 +279,7 @@ fn readHooks(alloc: Allocator, io_: Io, dir: Dir) ![]HookInfo {
         alloc.free(hooks);
     }
 
-    for (parsed.value.hooks, 0..) |h, i| {
+    for (legacy.value.hooks, 0..) |h, i| {
         // Join command array into a single display string
         var cmd_display: std.ArrayList(u8) = .empty;
         defer cmd_display.deinit(alloc);

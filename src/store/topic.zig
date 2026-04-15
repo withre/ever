@@ -172,30 +172,45 @@ pub const TopicManager = struct {
     /// Publish an event to a topic. Returns the global offset.
     /// Returns TopicDeleted if the topic has been soft-deleted.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
-        self.lock();
-        defer self.mutex.unlock();
-        if (self.deleted_topics.contains(topic_name)) return TopicError.TopicDeleted;
-        const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+        // Phase 1: validate under lock
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            if (self.deleted_topics.contains(topic_name)) return TopicError.TopicDeleted;
+            if (!self.topics.contains(topic_name)) return TopicError.NotFound;
+        }
+        // Phase 2: disk I/O without lock (log has its own mutex)
         const offset = try self.log.append(topic_name, key, value);
-        try idx.offsets.append(self.allocator, offset);
+        // Phase 3: update index under lock
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+            try idx.offsets.append(self.allocator, offset);
+        }
         return offset;
     }
 
     /// Fetch events for a single topic by topic-local offset range.
     /// Skips internal marker events (empty value from createTopic).
     pub fn fetch(self: *TopicManager, allocator: Allocator, topic_name: []const u8, start: u64, max_count: u32) ![]Event {
-        self.lock();
-        defer self.mutex.unlock();
-        const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
-        const offsets = idx.offsets.items;
+        // Phase 1: copy offset data under lock
+        const offsets_copy = blk: {
+            self.lock();
+            defer self.mutex.unlock();
+            const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+            break :blk try allocator.dupe(u64, idx.offsets.items);
+        };
+        defer allocator.free(offsets_copy);
 
+        // Phase 2: read from log WITHOUT holding the lock
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
         var skipped: u64 = 0;
         var i: usize = 0;
-        while (i < offsets.len and events.items.len < max_count) : (i += 1) {
-            const event = (try self.log.read(allocator, offsets[i])) orelse continue;
+        while (i < offsets_copy.len and events.items.len < max_count) : (i += 1) {
+            const event = (try self.log.read(allocator, offsets_copy[i])) orelse continue;
             // Skip marker events (creation markers and tombstones)
             if (event.value.len == 0) {
                 if (skipped < start) skipped += 1;
@@ -212,16 +227,30 @@ pub const TopicManager = struct {
     /// Fetch events across all topics matching a pattern.
     /// Skips internal marker events (creation markers and tombstones).
     pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
-        self.lock();
-        defer self.mutex.unlock();
+        // Phase 1: collect all matching offsets under lock
+        const OffsetBatch = struct { offsets: []u64 };
+        var batches: std.ArrayList(OffsetBatch) = .empty;
+        defer {
+            for (batches.items) |b| allocator.free(b.offsets);
+            batches.deinit(allocator);
+        }
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            var topic_iter = self.topics.iterator();
+            while (topic_iter.next()) |entry| {
+                if (!matchTopic(pattern, entry.key_ptr.*)) continue;
+                const duped = try allocator.dupe(u64, entry.value_ptr.offsets.items);
+                try batches.append(allocator, .{ .offsets = duped });
+            }
+        }
+
+        // Phase 2: read from log WITHOUT holding the lock
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
-        var topic_iter = self.topics.iterator();
-        while (topic_iter.next()) |entry| {
-            if (!matchTopic(pattern, entry.key_ptr.*)) continue;
-            const offsets = entry.value_ptr.offsets.items;
-
+        for (batches.items) |batch| {
+            const offsets = batch.offsets;
             var skipped: u64 = 0;
             var i: usize = 0;
             while (i < offsets.len and events.items.len < max_count) : (i += 1) {

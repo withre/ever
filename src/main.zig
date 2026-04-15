@@ -928,6 +928,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
 
     const dir = Dir.cwd().createDirPathOpen(io, actual_data_dir, .{ .open_options = .{ .iterate = true } }) catch
         std.process.fatal("cannot open data directory '{s}'.", .{actual_data_dir});
+    defer dir.close(io);
 
     const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
         std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir});

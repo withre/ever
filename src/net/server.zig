@@ -614,10 +614,9 @@ pub const Server = struct {
 fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
     if (global_server) |s| {
         s.shutdown_requested.store(true, .release);
-        // Close the listener to unblock accept(). The full drain
-        // happens in shutdown() which the main thread will reach
-        // after run() returns.
-        if (s.net_server) |*ns| { ns.deinit(s.io); s.net_server = null; }
+        // Do NOT touch net_server here — let run() handle cleanup.
+        // deinit() does syscalls (close) which are not async-signal-safe,
+        // and writing net_server races with the main thread's accept loop.
     }
 }
 
