@@ -850,6 +850,8 @@ pub const HookDaemon = struct {
         try shell_cmd.appendSlice(self.allocator, ts_str);
         try shell_cmd.appendSlice(self.allocator, "' EVER_KEY='");
         if (event.key) |k| try appendShellEscaped(&shell_cmd, self.allocator, k);
+        try shell_cmd.appendSlice(self.allocator, "' EVER_DATA='");
+        try appendShellEscaped(&shell_cmd, self.allocator, json);
         try shell_cmd.appendSlice(self.allocator, "' exec ");
 
         // Pass command string directly — no per-word quoting so shell
