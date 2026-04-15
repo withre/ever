@@ -1,5 +1,5 @@
 #+title: HTTP Interface
-#+state: ready
+#+state: complete
 #+FILETAGS: :protocol:core:
 
 * Summary
@@ -107,3 +107,4 @@ ever store start --no-http             # TCP only
 #+end_src
 
 * History
+- 2026-04-15: Marked complete. HTTP API on port 8890 implemented.

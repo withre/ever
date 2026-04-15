@@ -1,5 +1,5 @@
 #+title: Store Status Command
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:store:
 
 * Summary
@@ -117,3 +117,4 @@ For speed with large logs, the scanner only needs to read event headers (26 byte
 This command takes =--data-dir= (not =--address= / =--port=). It's a local filesystem operation. The =Io= parameter is needed for file operations but no network.
 
 * History
+- 2026-04-15: Marked complete. ever store status with --json implemented.

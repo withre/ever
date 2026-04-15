@@ -1,5 +1,5 @@
 #+title: Graceful Server Shutdown
-#+state: ready
+#+state: complete
 #+FILETAGS: :core:protocol:
 
 * Summary
@@ -43,3 +43,4 @@ pub fn shutdown(self: *Server) void {
 Register SIGINT/SIGTERM handler that calls =server.shutdown()=. Requires storing a global pointer to the server (or using a global atomic flag).
 
 * History
+- 2026-04-15: Marked complete. Signal handlers and drain loop implemented.

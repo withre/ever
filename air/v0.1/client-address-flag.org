@@ -1,5 +1,5 @@
 #+title: Client Address and Port Flags
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:core:
 
 * Summary
@@ -53,3 +53,4 @@ Extract a =parseStoreAddress= helper in main.zig that:
 Each handler calls this instead of hardcoding constants.
 
 * History
+- 2026-04-15: Marked complete. --address/--port flags and EVER_HOST/EVER_PORT env vars implemented.

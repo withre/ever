@@ -1,5 +1,5 @@
 #+title: CLI Argument Parsing Library
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:core:
 
 * Summary
@@ -248,3 +248,4 @@ Do NOT depend on ren. Copy the minimal colour primitives needed:
 This keeps the CLI library self-contained and extractable. ren is a rendering library with block layout, Unicode width, animations — far more than CLI help needs.
 
 * History
+- 2026-04-15: Marked complete. CLI argument parsing library built and refactored into module.

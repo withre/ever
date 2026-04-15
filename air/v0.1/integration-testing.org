@@ -1,5 +1,5 @@
 #+title: Integration Testing
-#+state: ready
+#+state: complete
 #+FILETAGS: :testing:core:
 
 
@@ -74,3 +74,4 @@ src/
 Or inline in relevant modules with descriptive test block names.
 
 * History
+- 2026-04-15: Marked complete. Integration tests in src/tests/integration.zig.

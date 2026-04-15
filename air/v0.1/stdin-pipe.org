@@ -1,5 +1,5 @@
 #+title: Pipe-Based Stdin for Triggers and Hooks
-#+state: ready
+#+state: complete
 #+FILETAGS: :subscriber:cli:
 
 * Summary
@@ -57,3 +57,4 @@ Two call sites to update:
 Both currently share the same pattern (write to temp, append =< /tmp/...= to shell command). The pipe approach eliminates the redirect entirely — the child's stdin is already the pipe.
 
 * History
+- 2026-04-15: Marked complete. pipe2 implemented in hooks and triggers.

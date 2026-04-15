@@ -1,5 +1,5 @@
 #+title: Timer-Based Event Publishing
-#+state: ready
+#+state: complete
 #+FILETAGS: :orchestrator:store:
 
 * Summary
@@ -214,3 +214,4 @@ Plus OK responses at =0x8A-0x8D=.
 | *Total*           | *~520 LOC* |                                      |
 
 * History
+- 2026-04-15: Marked complete. Interval, cron, and one-shot timers implemented.

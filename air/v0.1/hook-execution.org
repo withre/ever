@@ -1,0 +1,379 @@
+#+title: Hook Execution Model
+#+state: complete
+#+FILETAGS: :subscriber:orchestrator:
+
+* Summary
+Background execution model for server-side hooks — fork without blocking, PID tracking, output capture, graceful cleanup. Currently the hook daemon calls =waitpid= synchronously after each =fork/exec=, which means a slow or hung hook blocks all other hooks from processing. This spec replaces the blocking model with a concurrent, tracked execution model.
+
+* Motivation
+The current =HookDaemon.executeHookCommand= in =src/store/hooks.zig= does:
+1. =fork()=
+2. Write JSON to child stdin via pipe
+3. =waitpid(@intCast(pid), &status, 0)= — *blocking*
+
+This creates four problems:
+
+** Blocking execution stalls all hooks
+A hook registered as =ever hook add . -- ping 8.8.8.8= blocks the entire daemon loop. No other hooks process until the child exits. The daemon polls sequentially through all hooks in =pollAndExecute=, so one slow hook starves every other hook.
+
+** Hook output pollutes store logs
+Child processes inherit the store's stdout/stderr. Hook output (debug prints, errors, stack traces) is interleaved with the store's own log messages. There is no way to attribute output to a specific hook execution after the fact.
+
+** Orphaned processes on shutdown
+=HookDaemon.stop()= sets the shutdown flag and joins the daemon thread. But if the daemon thread is blocked in =waitpid=, it cannot check the shutdown flag until the child exits. There is no =SIGTERM/SIGKILL= of running hook children. If the store is killed with =SIGKILL=, children are reparented to init and keep running.
+
+** No execution visibility
+No way to ask "what hooks are running right now?" or "what did hook #3 print last time it ran?". The only diagnostic output is the timestamped log lines printed to stderr on failure.
+
+* Goals
+- Hooks execute in the background: =fork/exec= returns immediately, no blocking =waitpid=
+- PID tracking table for all running hook child processes
+- Periodic zombie reaping via =waitpid(WNOHANG)= each daemon tick
+- Graceful shutdown: =SIGTERM= all children → wait with timeout → =SIGKILL= stragglers
+- Process group isolation via =setpgid= so =kill(-pgid, sig)= cleans up child trees
+- Hook stdout/stderr redirected to per-execution log files under =data/hooks/=
+- =ever hook logs <id>= CLI command to inspect recent execution output
+- =ever hook ps= CLI command to see currently running hook processes
+- Configurable concurrent execution limit (default 16)
+- Optional per-hook timeout (=--timeout= flag on =hook add=)
+
+* Non-Goals
+- Hook output streaming back to subscribers in real-time (future)
+- Hook retry on failure / retry policies (future)
+- Hook priority or execution ordering guarantees between different hooks
+- Per-hook concurrency limits (all hooks share one global limit)
+
+* Proposal
+
+** Architecture Change
+
+#+begin_src
+Current:
+  daemonLoop → pollAndExecute → processHook → executeHookCommand
+                                                  fork → waitpid (BLOCKS)
+
+Proposed:
+  daemonLoop → pollAndExecute → processHook → spawnHookChild (returns immediately)
+               reapChildren (WNOHANG, non-blocking)
+               enforceTimeouts
+#+end_src
+
+The daemon loop gains two new responsibilities each tick: reaping finished children and enforcing timeouts. The =executeHookCommand= function is replaced with =spawnHookChild= which returns the child PID without waiting.
+
+** PID Tracking Table
+
+A new =ChildProcess= struct tracks each running hook execution:
+
+#+begin_src zig
+const ChildProcess = struct {
+    pid: std.posix.pid_t,
+    pgid: std.posix.pid_t,      // process group ID (== pid, set via setpgid)
+    hook_id: u64,
+    topic: []const u8,          // topic that triggered this execution
+    offset: u64,                // event offset that triggered this execution
+    started_at: i64,            // millisecond timestamp
+    timeout_ms: ?u64,           // null = no timeout
+    log_path: []const u8,       // path to stdout/stderr log file
+    sigterm_sent: bool,         // true if SIGTERM already sent (timeout/shutdown)
+};
+#+end_src
+
+The daemon holds an =ArrayList(ChildProcess)= as its process table. Typical size is 0–16 entries. No need for a HashMap — linear scan is fine at this scale.
+
+** Spawn Flow (replaces =executeHookCommand=)
+
+1. Check concurrent limit: if =children.items.len >= max_concurrent=, skip this event (leave cursor un-advanced, retry next tick)
+2. Create log file: =data/hooks/<hook_id>-<timestamp>.log=
+3. Create pipe for stdin delivery (same as current)
+4. =fork()=
+5. *Child*: =setpgid(0, 0)= to create new process group, redirect stdout+stderr to log file fd, redirect stdin from pipe, =execve=
+6. *Parent*: record =ChildProcess= in the table, write event JSON to pipe, close pipe write end, return immediately
+
+** Zombie Reaping
+
+Each daemon tick (currently every 500ms), after polling hooks:
+
+#+begin_src zig
+fn reapChildren(self: *HookDaemon) void {
+    var i: usize = 0;
+    while (i < self.children.items.len) {
+        var status: u32 = 0;
+        const rc = std.os.linux.waitpid(self.children.items[i].pid, &status, std.os.linux.W.NOHANG);
+        if (rc > 0) {
+            // Child exited — log status, free entry, advance cursor
+            const child = self.children.swapRemove(i);
+            self.handleChildExit(child, status);
+            // don't increment i — swapRemove moved a new item into position i
+        } else {
+            i += 1;
+        }
+    }
+}
+#+end_src
+
+=handleChildExit= logs the exit code, calls =hook_table.updateCursor=, and handles one-shot hook removal.
+
+** Timeout Enforcement
+
+Each daemon tick, after reaping:
+
+#+begin_src zig
+fn enforceTimeouts(self: *HookDaemon) void {
+    const now = getMilliTimestamp();
+    for (self.children.items) |*child| {
+        if (child.timeout_ms) |timeout| {
+            if (now - child.started_at > timeout and !child.sigterm_sent) {
+                // Kill the entire process group
+                _ = std.os.linux.kill(-child.pgid, std.os.linux.SIG.TERM);
+                child.sigterm_sent = true;
+                logTimestampedFmt("Hook #{d} timed out after {d}ms, sent SIGTERM", .{ child.hook_id, timeout });
+            }
+            // If SIGTERM was sent more than 5s ago and still running, SIGKILL
+            if (child.sigterm_sent and now - child.started_at > timeout + 5000) {
+                _ = std.os.linux.kill(-child.pgid, std.os.linux.SIG.KILL);
+            }
+        }
+    }
+}
+#+end_src
+
+** Graceful Shutdown Sequence
+
+=HookDaemon.stop()= changes from just setting a flag + join to:
+
+1. Set =shutdown= flag (daemon loop will stop spawning new children)
+2. =SIGTERM= all children via process groups: =kill(-pgid, SIGTERM)=
+3. Poll =waitpid(WNOHANG)= in a loop, sleeping 100ms between attempts, for up to 5 seconds
+4. =SIGKILL= any remaining children: =kill(-pgid, SIGKILL)=
+5. =waitpid= with timeout (1 more second) to collect zombies
+6. Join daemon thread
+7. Log any children that could not be reaped (should not happen after SIGKILL)
+
+** Process Group Isolation
+
+Each hook child calls =setpgid(0, 0)= before =execve= to become a process group leader. This means:
+- =kill(-pid, SIGTERM)= kills the hook AND any children it spawned (subshells, pipelines)
+- The store's own process group is not affected
+- Works with the existing =/bin/sh -c= execution model — the shell and its children are all in the same group
+
+Implementation note: =setpgid= must be called in the child after =fork=, before =execve=. The parent should also call =setpgid(child_pid, child_pid)= to avoid a race where the parent tries to signal the group before the child has set it up.
+
+** Log File Management
+
+*** Directory Structure
+#+begin_src
+data/
+├── hooks/
+│   ├── 1-20260408T143022-001.log    # hook #1, execution at timestamp
+│   ├── 1-20260408T143522-002.log    # hook #1, next execution
+│   ├── 3-20260408T143022-001.log    # hook #3, execution at timestamp
+│   └── ...
+├── hooks.json
+├── 00000000000000000000.log
+└── ever.lock
+#+end_src
+
+*** File Naming
+Format: =<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log=
+
+The sequence number =<seq>= is a per-daemon-instance counter to avoid collisions when multiple events trigger the same hook within the same second.
+
+*** Rotation
+Keep the last N log files per hook (configurable, default 10). On each new spawn, if a hook already has N log files, delete the oldest. Rotation is best-effort — if deletion fails, continue anyway.
+
+*** Content Format
+Each log file begins with a metadata header:
+
+#+begin_src
+# Hook #1 | Pattern: agent.build.complete | Command: ./deploy.sh
+# Trigger: topic=agent.build.complete offset=42 timestamp=1712345678000
+# Started: 2026-04-08T14:30:22Z
+--- stdout/stderr below ---
+<raw hook output>
+--- exit ---
+# Exited: code=0 duration=1234ms
+#+end_src
+
+The header lines use =#= prefix so they're easy to grep out. The exit footer is appended by the parent after =waitpid= reaps the child.
+
+** Output Redirection
+
+In the child process, after =fork= and before =execve=:
+
+#+begin_src zig
+// Child process setup:
+setpgid(0, 0);
+// Open log file
+const log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+dup2(log_fd, 1);  // stdout → log file
+dup2(log_fd, 2);  // stderr → log file
+close(log_fd);
+// stdin from pipe (same as current)
+dup2(pipe_read, 0);
+close(pipe_read);
+execve(...);
+#+end_src
+
+** Wire Protocol Additions
+
+Two new message types for =hook ps= and =hook logs=:
+
+| Code | Name          | Direction | Body                                   |
+|------+---------------+-----------+----------------------------------------|
+| 0x0E | hook_ps       | Request   | ={}= (no parameters)                  |
+| 0x8E | hook_ps_ok    | Response  | ={"children": [ChildInfo, ...]}=       |
+| 0x0F | hook_logs     | Request   | ={"hook_id": N, "limit": M}=          |
+| 0x8F | hook_logs_ok  | Response  | ={"entries": [LogEntry, ...]}=         |
+
+*** ChildInfo
+#+begin_src json
+{
+  "pid": 12345,
+  "hook_id": 1,
+  "topic": "agent.build.complete",
+  "offset": 42,
+  "started_at": 1712345678000,
+  "running_ms": 5432
+}
+#+end_src
+
+*** LogEntry
+#+begin_src json
+{
+  "hook_id": 1,
+  "log_file": "1-20260408T143022-001.log",
+  "started_at": 1712345678000,
+  "exit_code": 0,
+  "duration_ms": 1234,
+  "size_bytes": 4567
+}
+#+end_src
+
+The =hook logs= command returns metadata about available log files. To actually read log content, add a =--tail N= flag to =ever hook logs <id>= which reads the last N lines from the most recent log file.
+
+** CLI Commands
+
+*** =ever hook ps=
+Show currently running hook processes.
+
+#+begin_src
+$ ever hook ps
+PID    HOOK  PATTERN                COMMAND        RUNNING
+12345  #1    agent.build.complete   ./deploy.sh    5s
+12348  #3    agent.                 ./log.sh       2s
+
+2 hooks running (limit: 16)
+#+end_src
+
+*** =ever hook logs <id>=
+Show recent execution log entries for a hook.
+
+#+begin_src
+$ ever hook logs 1
+EXECUTION                  EXIT  DURATION  SIZE
+2026-04-08T14:35:22        0     1.2s      4.5KB
+2026-04-08T14:30:22        1     0.3s      128B
+2026-04-08T14:25:22        0     2.1s      12KB
+
+$ ever hook logs 1 --tail 20
+(last 20 lines of most recent log file)
+#+end_src
+
+** Concurrent Execution Limit
+
+When the process table has =max_concurrent= entries, new hook events are not processed:
+- The hook's cursor is NOT advanced
+- The daemon tick logs a warning: "Hook execution limit reached (16), deferring"
+- Next tick, after some children have been reaped, processing resumes
+- This is per-daemon global, not per-hook
+
+Configurable via =ever store start --hook-max-concurrent 16= (default: 16).
+
+** Per-Hook Timeout
+
+Added as an optional field on =Hook=:
+
+#+begin_src zig
+pub const Hook = struct {
+    // ... existing fields ...
+    timeout_ms: ?u64 = null,  // null = no timeout
+};
+#+end_src
+
+Set via CLI:
+
+#+begin_src bash
+ever hook add --timeout 30s agent.build.complete -- ./deploy.sh
+#+end_src
+
+Parse duration strings: =30s=, =5m=, =1h=. Stored as milliseconds in =hooks.json=.
+
+** Interaction with One-Shot Hooks
+
+One-shot hooks (=--once=) currently call =hook_table.remove(hook.id)= immediately after execution in =processHook=. With background execution, the removal must be deferred to =handleChildExit= (when the child is reaped):
+
+1. =processHook= spawns the child and marks the hook as "pending removal" (or simply records =once= in =ChildProcess=)
+2. =processHook= advances the cursor (or the cursor becomes irrelevant since the hook is being removed)
+3. When =reapChildren= collects the child, if =once=, call =hook_table.remove(hook_id)=
+
+Edge case: if a one-shot hook's child is still running when new events arrive for the same pattern, those events should be skipped (the hook is conceptually "consumed"). Track this by checking the process table for an active child with the same =hook_id= before spawning.
+
+** Cursor Advancement Strategy
+
+Currently: cursor is advanced after =waitpid= returns (synchronous, cursor tracks "last completed" offset).
+
+With background execution, cursor should advance when the child is *spawned*, not when it completes. Rationale:
+- If the daemon crashes while a child is running, on restart we should not re-execute the same event
+- The hook's purpose is "execute on event" not "execute and confirm" — we don't have delivery guarantees anyway
+- This matches the current behavior where failed hooks (non-zero exit) still advance the cursor
+
+If the concurrent limit is reached and we can't spawn, cursor stays where it is — the event will be retried next tick.
+
+* Design Details
+
+** Daemon Loop (revised)
+
+#+begin_src zig
+fn daemonLoop(self: *HookDaemon) void {
+    while (!self.shutdown.load(.acquire)) {
+        self.reapChildren();
+        self.enforceTimeouts();
+        self.pollAndExecute();  // respects concurrent limit
+
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 500_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    self.shutdownChildren();
+}
+#+end_src
+
+Order matters: reap first (frees slots), then enforce timeouts, then poll for new work.
+
+** Data Directory Setup
+
+On daemon start, create =data/hooks/= directory if it doesn't exist. Use =mkdir= with =0o755=.
+
+** Thread Safety
+
+The process table (=ArrayList(ChildProcess)=) is only accessed from the daemon thread — no mutex needed. The =HookTable= is shared and already has its own mutex for =updateCursor= / =remove= / =snapshot= calls.
+
+* Implementation Estimate
+
+| Component                        | Estimate  | Notes                                            |
+|----------------------------------+-----------+--------------------------------------------------|
+| ChildProcess struct + PID table  | ~40 LOC   | Struct definition, init/deinit                   |
+| spawnHookChild (replaces exec)   | ~80 LOC   | Fork, setpgid, log fd setup, record in table     |
+| reapChildren                     | ~30 LOC   | WNOHANG loop, handleChildExit                    |
+| enforceTimeouts                  | ~25 LOC   | Scan table, SIGTERM/SIGKILL                      |
+| shutdownChildren                 | ~40 LOC   | SIGTERM all, poll loop, SIGKILL, final reap       |
+| Log file management              | ~50 LOC   | Create, rotate, metadata header/footer            |
+| Protocol: hook_ps / hook_logs    | ~30 LOC   | Message types and JSON bodies                    |
+| Server handlers                  | ~60 LOC   | Handle new message types, read log dir            |
+| CLI: hook ps / hook logs         | ~50 LOC   | Display formatting, --tail flag                  |
+| Hook struct: timeout_ms field    | ~15 LOC   | Field addition, JSON persistence, CLI parsing    |
+| Cursor strategy changes          | ~20 LOC   | Advance on spawn, skip one-shot with active child |
+| *Total*                          | *~440 LOC* |                                                  |
+
+* History
+- 2026-04-08: Draft created. Identified four problems with current synchronous fork+exec+waitpid model in HookDaemon.
+- 2026-04-15: Marked complete. Background hook execution with PID tracking, timeout enforcement, and graceful shutdown implemented.
