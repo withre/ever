@@ -33,6 +33,7 @@ pub const Event = struct {
 
 pub const HookInfoOwned = struct {
     id: u64,
+    name: ?[]const u8 = null,
     pattern: []const u8,
     command: []const u8,
     cwd: []const u8,
@@ -41,6 +42,7 @@ pub const HookInfoOwned = struct {
     env: ?[]const []const u8 = null,
 
     pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
+        if (self.name) |n| allocator.free(n);
         allocator.free(self.pattern);
         allocator.free(self.command);
         allocator.free(self.cwd);
@@ -301,14 +303,20 @@ pub const Client = struct {
         return self.registerHookFull(pattern, command, cwd, false, null);
     }
 
-    /// Register a hook with full options (once, env).
+    /// Register a hook with full options (once, env, name).
     pub fn registerHookFull(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
+        return self.registerHookFullNamed(pattern, command, cwd, once, env, null);
+    }
+
+    /// Register a hook with full options including optional name.
+    pub fn registerHookFullNamed(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8) !u64 {
         const req = protocol.RegisterHookRequest{
             .pattern = pattern,
             .command = command,
             .cwd = cwd,
             .once = once,
             .env = env,
+            .name = name,
         };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
@@ -382,6 +390,7 @@ pub const Client = struct {
 
             hooks[i] = .{
                 .id = h.id,
+                .name = if (h.name) |n| try self.allocator.dupe(u8, n) else null,
                 .pattern = try self.allocator.dupe(u8, h.pattern),
                 .command = try self.allocator.dupe(u8, h.command),
                 .cwd = try self.allocator.dupe(u8, h.cwd),

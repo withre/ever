@@ -381,6 +381,7 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const io = ctx.io;
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
+    const name_flag = ctx.flag("name");
     const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
@@ -406,10 +407,12 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     const cwd_i: isize = @bitCast(cwd_len);
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
+    const name: ?[]const u8 = if (name_flag.len > 0) name_flag else null;
+
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFull(pattern, cmd_str.items, cwd, once, null) catch |err| switch (err) {
+    const id = c.registerHookFullNamed(pattern, cmd_str.items, cwd, once, null, name) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };
@@ -437,15 +440,17 @@ fn handleHookList(ctx: *cli.Context) !void {
     if (result.hooks.len == 0) {
         std.debug.print("No hooks registered.\n", .{});
     } else {
-        std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "Pattern", "Command", "Last Offset" });
+        std.debug.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset" });
         for (result.hooks) |hook| {
             var id_buf: [20]u8 = undefined;
-            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{hook.id}) catch "?";
+            const id_str = std.fmt.bufPrint(&id_buf, "#{d}", .{hook.id}) catch "?";
             var cursor_buf: [20]u8 = undefined;
             const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
+            const name_str = if (hook.name) |n| n else "-";
 
-            std.debug.print("{s:<4} {s:<25} {s:<30} {s:<12}\n", .{
+            std.debug.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{
                 id_str,
+                name_str,
                 hook.pattern,
                 hook.command,
                 cursor_str,
@@ -523,39 +528,97 @@ fn handleHookLogs(ctx: *cli.Context) !void {
 fn handleHookRm(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
-    const id_str = ctx.arg("id");
+    const id_or_name = ctx.arg("id");
 
-    if (id_str.len == 0) {
-        std.debug.print("error: hook ID is required\n", .{});
+    if (id_or_name.len == 0) {
+        std.debug.print("error: hook ID or name is required\n", .{});
         std.process.exit(1);
     }
-    const id = std.fmt.parseInt(u64, id_str, 10) catch
-        std.process.fatal("invalid hook ID '{s}'.", .{id_str});
 
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    c.removeHook(id) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
-        else => return err,
-    };
-    std.debug.print("Hook #{d} removed.\n", .{id});
+
+    // Try parsing as numeric ID first
+    if (std.fmt.parseInt(u64, id_or_name, 10)) |id| {
+        c.removeHook(id) catch |err| switch (err) {
+            error.ServerError => std.process.exit(1),
+            else => return err,
+        };
+        std.debug.print("Hook #{d} removed.\n", .{id});
+    } else |_| {
+        // Treat as name — list hooks to find the ID
+        var result = c.listHooks() catch |err| switch (err) {
+            error.ServerError => std.process.exit(1),
+            else => return err,
+        };
+        defer result.deinit();
+
+        var found_id: ?u64 = null;
+        for (result.hooks) |hook| {
+            if (hook.name) |name| {
+                if (std.mem.eql(u8, name, id_or_name)) {
+                    found_id = hook.id;
+                    break;
+                }
+            }
+        }
+
+        if (found_id) |id| {
+            // Reconnect since we consumed the connection for listHooks
+            var c2 = connectToStore(allocator, io, addr_info.address, addr_info.port);
+            defer c2.deinit();
+            c2.removeHook(id) catch |err| switch (err) {
+                error.ServerError => std.process.exit(1),
+                else => return err,
+            };
+            std.debug.print("Hook '{s}' (#{d}) removed.\n", .{ id_or_name, id });
+        } else {
+            std.debug.print("error: hook '{s}' not found\n", .{id_or_name});
+            std.process.exit(1);
+        }
+    }
 }
 
 fn handleTimerAdd(ctx: *cli.Context) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
-    const name = ctx.arg("name");
+    const name_arg = ctx.arg("name");
+    const name_flag = ctx.flag("name");
     const every = ctx.flag("every");
     const cron = ctx.flag("cron");
     const in_flag = ctx.flag("in");
-    const topic = ctx.arg("topic");
-    const payload = ctx.arg("payload");
+    const topic_arg = ctx.arg("topic");
+    const payload_arg = ctx.arg("payload");
     const persistent = !ctx.flagBool("no-persist");
 
-    if (name.len == 0) {
-        std.debug.print("error: timer name is required\n", .{});
-        std.process.exit(1);
+    // Resolve name and topic: support both old and new syntax
+    // Old: ever timer add <name> --every 5s <topic> [payload]
+    // New: ever timer add --every 5s <topic> [payload]  (auto-name)
+    // New: ever timer add --name foo --every 5s <topic> [payload]
+    var name: []const u8 = undefined;
+    var topic: []const u8 = undefined;
+    var payload: []const u8 = undefined;
+
+    if (name_flag.len > 0) {
+        // --name flag takes priority
+        name = name_flag;
+        topic = if (name_arg.len > 0) name_arg else topic_arg;
+        payload = if (name_arg.len > 0) topic_arg else payload_arg;
+    } else if (topic_arg.len > 0) {
+        // Old syntax: name and topic both provided as positional
+        name = name_arg;
+        topic = topic_arg;
+        payload = payload_arg;
+    } else if (name_arg.len > 0) {
+        // Only one positional arg — treat as topic, auto-generate name
+        topic = name_arg;
+        payload = topic_arg;
+        name = "";
+    } else {
+        name = name_arg;
+        topic = topic_arg;
+        payload = payload_arg;
     }
 
     // Count how many schedule flags are set (use hasFlag to detect even empty values)
@@ -597,15 +660,24 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    c.addTimer(name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
+    // Auto-generate name if not provided
+    const actual_name = if (name.len > 0) name else blk: {
+        const auto = std.fmt.allocPrint(allocator, "{s}-{s}", .{ topic, schedule_value }) catch {
+            std.debug.print("error: failed to generate timer name\n", .{});
+            std.process.exit(1);
+        };
+        break :blk auto;
+    };
+
+    c.addTimer(actual_name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };
 
     if (has_in) {
-        std.debug.print("Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ name, in_flag, topic });
+        std.debug.print("Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ actual_name, in_flag, topic });
     } else {
-        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ name, if (has_every) "every" else "cron", schedule_value, topic });
+        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ actual_name, if (has_every) "every" else "cron", schedule_value, topic });
     }
 }
 
@@ -1285,6 +1357,7 @@ const app = cli.App{
                     .args = &.{.{ .name = "pattern", .required = true, .description = "Topic pattern" }},
                     .flags = &.{
                         .{ .name = "once", .takes_value = false, .description = "Remove after first trigger" },
+                        .{ .name = "name", .description = "Hook name (auto-generated if omitted)" },
                     },
                     .takes_rest = true,
                     .run = handleHookAdd,
@@ -1297,8 +1370,8 @@ const app = cli.App{
                 .{
                     .name = "rm",
                     .aliases = &.{ "remove", "delete" },
-                    .description = "Remove a hook by ID",
-                    .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
+                    .description = "Remove a hook by ID or name",
+                    .args = &.{.{ .name = "id", .required = true, .description = "Hook ID or name" }},
                     .run = handleHookRm,
                 },
                 .{
@@ -1346,11 +1419,12 @@ const app = cli.App{
                     .name = "add",
                     .description = "Add a recurring timer",
                     .args = &.{
-                        .{ .name = "name", .required = true, .description = "Timer name" },
-                        .{ .name = "topic", .required = true, .description = "Topic to publish to" },
+                        .{ .name = "name", .required = true, .description = "Timer name or topic (if --name used)" },
+                        .{ .name = "topic", .required = false, .description = "Topic to publish to" },
                         .{ .name = "payload", .required = false, .description = "JSON payload (optional)" },
                     },
                     .flags = &.{
+                        .{ .name = "name", .description = "Timer name (auto-generated if omitted)" },
                         .{ .name = "every", .value_name = "INTERVAL", .description = "Interval (e.g. 5s, 1m, 2h)", .conflicts = &.{ "cron", "in" } },
                         .{ .name = "cron", .value_name = "EXPR", .description = "Cron expression", .conflicts = &.{ "every", "in" } },
                         .{ .name = "in", .value_name = "DURATION", .description = "Fire once after duration (e.g. 5s, 2m)", .conflicts = &.{ "every", "cron" } },

@@ -296,7 +296,7 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
-        const id = ht.addFull(req.pattern, req.command, req.cwd, req.once, req.env) catch
+        const id = ht.addFull(req.pattern, req.command, req.cwd, req.once, req.env, req.name) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook");
 
         const resp_body = try protocol.encodeBody(self.allocator, protocol.RegisterHookResponse{ .id = id });
@@ -337,6 +337,7 @@ pub const Server = struct {
         for (hooks, 0..) |hook, i| {
             hook_infos[i] = .{
                 .id = hook.id,
+                .name = hook.name,
                 .pattern = hook.pattern,
                 .command = hook.command,
                 .cwd = hook.cwd,

@@ -712,13 +712,13 @@ pub const TimerDaemon = struct {
             const should_fire = self.shouldFire(timer, now_secs);
             if (should_fire) {
                 self.fireTimer(timer, now_ms) catch |err| {
-                    std.debug.print("Timer '{s}' fire error: {}\n", .{ timer.name, err });
+                    logTimestampedFmt("Timer '{s}' fire error: {}", .{ timer.name, err });
                     continue;
                 };
                 // Auto-remove one-shot timers after firing
                 if (timer.one_shot) {
                     self.timer_table.remove(timer.name) catch {};
-                    std.debug.print("One-shot timer '{s}' removed after firing.\n", .{timer.name});
+                    logTimestampedFmt("One-shot timer '{s}' removed after firing.", .{timer.name});
                 }
             }
         }
@@ -751,9 +751,9 @@ pub const TimerDaemon = struct {
             const next = timer.schedule.nextFire(last_secs);
             if (next < now_secs) {
                 // Missed fire — catch up with one event
-                std.debug.print("Timer '{s}' catching up missed fire.\n", .{timer.name});
+                logTimestampedFmt("Timer '{s}' catching up missed fire.", .{timer.name});
                 self.fireTimer(timer, now_ms) catch |err| {
-                    std.debug.print("Timer '{s}' catch-up error: {}\n", .{ timer.name, err });
+                    logTimestampedFmt("Timer '{s}' catch-up error: {}", .{ timer.name, err });
                 };
             }
         }
@@ -773,7 +773,7 @@ pub const TimerDaemon = struct {
         }
 
         _ = self.topic_manager.publish(timer.topic, null, payload) catch |err| {
-            std.debug.print("Timer '{s}' publish failed: {}\n", .{ timer.name, err });
+            logTimestampedFmt("Timer '{s}' publish failed: {}", .{ timer.name, err });
             return err;
         };
 
@@ -861,6 +861,40 @@ fn getMilliTimestamp() i64 {
     const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
     if (rc != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
+    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    const secs: u64 = @intCast(ts.sec);
+
+    const SECS_PER_DAY = 86400;
+    const days = secs / SECS_PER_DAY;
+    const day_secs = secs % SECS_PER_DAY;
+    const hour: u8 = @intCast(day_secs / 3600);
+    const minute: u8 = @intCast((day_secs % 3600) / 60);
+    const second: u8 = @intCast(day_secs % 60);
+
+    var y: u16 = 1970;
+    var remaining = days;
+    while (true) {
+        const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+        const year_days: u64 = if (is_leap) 366 else 365;
+        if (remaining < year_days) break;
+        remaining -= year_days;
+        y += 1;
+    }
+    const is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+    const month_days = [12]u8{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var m: u8 = 0;
+    while (m < 12) : (m += 1) {
+        if (remaining < month_days[m]) break;
+        remaining -= month_days[m];
+    }
+
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch "<message truncated>";
+    std.debug.print("[{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}] {s}\n", .{ y, m + 1, @as(u8, @intCast(remaining + 1)), hour, minute, second, msg });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

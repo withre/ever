@@ -124,6 +124,7 @@ pub const RegisterHookRequest = struct {
     cwd: []const u8,
     once: bool = false,
     env: ?[]const []const u8 = null,
+    name: ?[]const u8 = null,
 };
 
 pub const RegisterHookResponse = struct {
@@ -136,6 +137,7 @@ pub const UnregisterHookRequest = struct {
 
 pub const HookInfo = struct {
     id: u64,
+    name: ?[]const u8 = null,
     pattern: []const u8,
     command: []const u8,
     cwd: []const u8,

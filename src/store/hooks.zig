@@ -12,6 +12,7 @@ const store = @import("store.zig");
 
 pub const Hook = struct {
     id: u64,
+    name: ?[]const u8 = null,
     pattern: []const u8,
     command: []const u8,
     cwd: []const u8,
@@ -24,6 +25,7 @@ pub const Hook = struct {
 /// JSON-serializable hook for persistence.
 const HookJson = struct {
     id: u64,
+    name: ?[]const u8 = null,
     pattern: []const u8,
     command: []const u8,
     cwd: []const u8,
@@ -41,6 +43,7 @@ const HookFileJson = struct {
 /// Legacy format where command was stored as an array of words.
 const HookJsonLegacy = struct {
     id: u64,
+    name: ?[]const u8 = null,
     pattern: []const u8,
     command: []const []const u8,
     cwd: []const u8,
@@ -93,11 +96,11 @@ pub const HookTable = struct {
 
     /// Add a hook. Returns the assigned ID.
     pub fn add(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8) !u64 {
-        return self.addFull(pattern, command, cwd, false, null);
+        return self.addFull(pattern, command, cwd, false, null, null);
     }
 
-    /// Add a hook with full options (once, env). Returns the assigned ID.
-    pub fn addFull(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8) !u64 {
+    /// Add a hook with full options (once, env, name). Returns the assigned ID.
+    pub fn addFull(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8) !u64 {
         self.lock();
         defer self.mutex.unlock();
 
@@ -113,6 +116,13 @@ pub const HookTable = struct {
 
         const cwd_copy = try self.allocator.dupe(u8, cwd);
         errdefer self.allocator.free(cwd_copy);
+
+        // Deep copy or auto-generate name
+        const name_copy: ?[]const u8 = if (name) |n|
+            try self.allocator.dupe(u8, n)
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ pattern, id });
+        errdefer if (name_copy) |nc| self.allocator.free(nc);
 
         // Deep copy env if present
         const env_copy: ?[]const []const u8 = if (env) |e| blk: {
@@ -131,6 +141,7 @@ pub const HookTable = struct {
 
         try self.hooks.append(self.allocator, .{
             .id = id,
+            .name = name_copy,
             .pattern = pattern_copy,
             .command = cmd_copy,
             .cwd = cwd_copy,
@@ -158,6 +169,37 @@ pub const HookTable = struct {
             }
         }
         return error.NotFound;
+    }
+
+    /// Remove a hook by name. Scans all hooks for a matching name.
+    pub fn removeByName(self: *HookTable, name: []const u8) !void {
+        self.lock();
+        defer self.mutex.unlock();
+
+        for (self.hooks.items, 0..) |hook, i| {
+            if (hook.name) |hook_name| {
+                if (std.mem.eql(u8, hook_name, name)) {
+                    self.freeHook(hook);
+                    _ = self.hooks.swapRemove(i);
+                    try self.saveLocked();
+                    return;
+                }
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// Find hook ID by name. Returns null if not found.
+    pub fn findIdByName(self: *HookTable, name: []const u8) ?u64 {
+        self.lock();
+        defer self.mutex.unlock();
+
+        for (self.hooks.items) |hook| {
+            if (hook.name) |hook_name| {
+                if (std.mem.eql(u8, hook_name, name)) return hook.id;
+            }
+        }
+        return null;
     }
 
     /// Return the number of registered hooks. Safe for cross-thread display.
@@ -247,7 +289,7 @@ pub const HookTable = struct {
             defer parsed.deinit();
             self.next_id = parsed.value.next_id;
             for (parsed.value.hooks) |h| {
-                try self.loadHook(h.id, h.pattern, h.command, h.cwd, h.cursor, h.created_at, h.once, h.env);
+                try self.loadHook(h.id, h.pattern, h.command, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name);
             }
             return;
         } else |_| {}
@@ -268,11 +310,14 @@ pub const HookTable = struct {
                 if (j > 0) try cmd_str.append(self.allocator, ' ');
                 try cmd_str.appendSlice(self.allocator, arg);
             }
-            try self.loadHook(h.id, h.pattern, cmd_str.items, h.cwd, h.cursor, h.created_at, h.once, h.env);
+            try self.loadHook(h.id, h.pattern, cmd_str.items, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name);
         }
     }
 
-    fn loadHook(self: *HookTable, id: u64, pattern: []const u8, command: []const u8, cwd: []const u8, cursor: u64, created_at: i64, once: bool, env: ?[]const []const u8) !void {
+    fn loadHook(self: *HookTable, id: u64, pattern: []const u8, command: []const u8, cwd: []const u8, cursor: u64, created_at: i64, once: bool, env: ?[]const []const u8, name: ?[]const u8) !void {
+        const name_copy: ?[]const u8 = if (name) |n| try self.allocator.dupe(u8, n) else null;
+        errdefer if (name_copy) |nc| self.allocator.free(nc);
+
         const pattern_copy = try self.allocator.dupe(u8, pattern);
         errdefer self.allocator.free(pattern_copy);
 
@@ -299,6 +344,7 @@ pub const HookTable = struct {
 
         try self.hooks.append(self.allocator, .{
             .id = id,
+            .name = name_copy,
             .pattern = pattern_copy,
             .command = cmd_copy,
             .cwd = cwd_copy,
@@ -318,6 +364,7 @@ pub const HookTable = struct {
         for (self.hooks.items, 0..) |hook, i| {
             hook_jsons[i] = .{
                 .id = hook.id,
+                .name = hook.name,
                 .pattern = hook.pattern,
                 .command = hook.command,
                 .cwd = hook.cwd,
@@ -383,6 +430,9 @@ pub fn freeHookSnapshot(allocator: Allocator, hooks: []Hook) void {
 }
 
 fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
+    const name_copy: ?[]const u8 = if (hook.name) |n| try allocator.dupe(u8, n) else null;
+    errdefer if (name_copy) |n| allocator.free(n);
+
     const pattern = try allocator.dupe(u8, hook.pattern);
     errdefer allocator.free(pattern);
 
@@ -408,6 +458,7 @@ fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
 
     return .{
         .id = hook.id,
+        .name = name_copy,
         .pattern = pattern,
         .command = cmd,
         .cwd = cwd,
@@ -419,6 +470,7 @@ fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
 }
 
 fn freeHookCopy(allocator: Allocator, hook: Hook) void {
+    if (hook.name) |n| allocator.free(n);
     allocator.free(hook.pattern);
     allocator.free(hook.command);
     allocator.free(hook.cwd);
@@ -881,6 +933,81 @@ pub const HookDaemon = struct {
         const log_fd_i: isize = @bitCast(log_fd_rc);
         if (log_fd_i < 0) return error.LogFileOpen;
         const log_fd: i32 = @intCast(log_fd_rc);
+
+        // Write context header to log file
+        {
+            var header: std.ArrayList(u8) = .empty;
+            defer header.deinit(self.allocator);
+
+            header.appendSlice(self.allocator, "=== Hook Execution ===\n") catch {};
+
+            // Hook ID and name
+            if (hook.name) |hname| {
+                var id_buf: [64]u8 = undefined;
+                const id_line = std.fmt.bufPrint(&id_buf, "Hook:      #{d} ({s})\n", .{ hook.id, hname }) catch "";
+                header.appendSlice(self.allocator, id_line) catch {};
+            } else {
+                var id_buf: [64]u8 = undefined;
+                const id_line = std.fmt.bufPrint(&id_buf, "Hook:      #{d}\n", .{hook.id}) catch "";
+                header.appendSlice(self.allocator, id_line) catch {};
+            }
+
+            header.appendSlice(self.allocator, "Pattern:   ") catch {};
+            header.appendSlice(self.allocator, hook.pattern) catch {};
+            header.appendSlice(self.allocator, "\n") catch {};
+
+            header.appendSlice(self.allocator, "Command:   ") catch {};
+            header.appendSlice(self.allocator, hook.command) catch {};
+            header.appendSlice(self.allocator, "\n") catch {};
+
+            header.appendSlice(self.allocator, "Topic:     ") catch {};
+            header.appendSlice(self.allocator, event.topic) catch {};
+            header.appendSlice(self.allocator, "\n") catch {};
+
+            header.appendSlice(self.allocator, "Offset:    ") catch {};
+            header.appendSlice(self.allocator, offset_str) catch {};
+            header.appendSlice(self.allocator, "\n") catch {};
+
+            // Timestamp
+            {
+                var ts_hdr = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+                _ = std.os.linux.clock_gettime(.REALTIME, &ts_hdr);
+                const secs: u64 = @intCast(ts_hdr.sec);
+                const SECS_PER_DAY = 86400;
+                const days = secs / SECS_PER_DAY;
+                const day_secs = secs % SECS_PER_DAY;
+                const hr: u8 = @intCast(day_secs / 3600);
+                const mn: u8 = @intCast((day_secs % 3600) / 60);
+                const sc: u8 = @intCast(day_secs % 60);
+                var y: u16 = 1970;
+                var rem = days;
+                while (true) {
+                    const il = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+                    const yd: u64 = if (il) 366 else 365;
+                    if (rem < yd) break;
+                    rem -= yd;
+                    y += 1;
+                }
+                const il2 = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+                const md = [12]u8{ 31, if (il2) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+                var mo: u8 = 0;
+                while (mo < 12) : (mo += 1) {
+                    if (rem < md[mo]) break;
+                    rem -= md[mo];
+                }
+                var ts_fmt_buf: [32]u8 = undefined;
+                const ts_line = std.fmt.bufPrint(&ts_fmt_buf, "Timestamp: {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\n", .{ y, mo + 1, @as(u8, @intCast(rem + 1)), hr, mn, sc }) catch "";
+                header.appendSlice(self.allocator, ts_line) catch {};
+            }
+
+            header.appendSlice(self.allocator, "Payload:   ") catch {};
+            header.appendSlice(self.allocator, json) catch {};
+            header.appendSlice(self.allocator, "\n") catch {};
+
+            header.appendSlice(self.allocator, "===\n\n") catch {};
+
+            writeAllFd(log_fd, header.items);
+        }
 
         // Create pipe for stdin delivery
         var pipe_fds: [2]i32 = undefined;
