@@ -8,15 +8,15 @@ const std = @import("std");
 
 // ── Raw escape sequences (private) ────────────────────────────────────
 
-const esc_title = "\x1b[38;2;140;170;210m";
-const esc_section = "\x1b[38;2;150;165;100m\x1b[1m";
-const esc_cmd = "\x1b[38;2;130;155;170m";
-const esc_desc = "\x1b[38;2;130;135;140m";
-const esc_flag = "\x1b[38;2;120;130;140m";
-const esc_flag_desc = "\x1b[38;2;100;105;110m";
-const esc_env = "\x1b[38;2;90;100;90m";
-const esc_required = "\x1b[38;2;180;130;100m";
-const esc_reset = "\x1b[0m";
+const esc_title = "\x1b[38;2;140;170;210m"; // rgb(140,170,210) — soft steel blue
+const esc_section = "\x1b[38;2;150;165;100m\x1b[1m"; // rgb(150,165,100) bold — muted sage green
+const esc_cmd = "\x1b[38;2;130;155;170m"; // rgb(130,155,170) — dusty teal
+const esc_desc = "\x1b[38;2;130;135;140m"; // rgb(130,135,140) — warm grey
+const esc_flag = "\x1b[38;2;120;130;140m"; // rgb(120,130,140) — slate grey
+const esc_flag_desc = "\x1b[38;2;100;105;110m"; // rgb(100,105,110) — dim charcoal
+const esc_env = "\x1b[38;2;90;100;90m"; // rgb(90,100,90) — dark olive
+const esc_required = "\x1b[38;2;180;130;100m"; // rgb(180,130,100) — muted terracotta
+const esc_reset = "\x1b[0m"; // reset all attributes
 
 /// A resolved set of colour strings — either real escapes or empty.
 pub const Palette = struct {
