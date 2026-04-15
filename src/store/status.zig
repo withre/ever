@@ -381,15 +381,29 @@ pub fn printHuman(status: *const StoreStatus) void {
     if (status.topics.len == 0) {
         std.debug.print("    (none)\n", .{});
     } else {
+        // First pass: find max topic name width (including marker)
+        var max_name_w: usize = 0;
+        for (status.topics) |t| {
+            const w = t.name.len + if (t.deleted) @as(usize, 10) else @as(usize, 0); // " (deleted)" = 10
+            if (w > max_name_w) max_name_w = w;
+        }
+        // Ensure minimum column width and add padding
+        if (max_name_w < 20) max_name_w = 20;
+        max_name_w += 2; // extra spacing before count
+
+        // Second pass: print with alignment
         for (status.topics) |t| {
             var evt_buf: [32]u8 = undefined;
             const evt_str = formatNumber(&evt_buf, t.events);
             const marker: []const u8 = if (t.deleted) " (deleted)" else "";
-            if (t.events == 1) {
-                std.debug.print("    {s}{s:<25} {s:>10} event\n", .{ t.name, marker, evt_str });
-            } else {
-                std.debug.print("    {s}{s:<25} {s:>10} events\n", .{ t.name, marker, evt_str });
-            }
+            const name_w = t.name.len + marker.len;
+            const padding = if (max_name_w > name_w) max_name_w - name_w else 0;
+            const suffix: []const u8 = if (t.events == 1) " event" else " events";
+            // Print: indent + name + marker + padding + right-aligned count + suffix
+            std.debug.print("    {s}{s}", .{ t.name, marker });
+            var i: usize = 0;
+            while (i < padding) : (i += 1) std.debug.print(" ", .{});
+            std.debug.print("{s:>6}{s}\n", .{ evt_str, suffix });
         }
     }
 
@@ -397,14 +411,32 @@ pub fn printHuman(status: *const StoreStatus) void {
     if (status.hooks.len == 0) {
         std.debug.print("    (none)\n", .{});
     } else {
+        // First pass: find max widths for pattern and command columns
+        var max_pat_w: usize = 0;
+        var max_cmd_w: usize = 0;
+        for (status.hooks) |h| {
+            if (h.pattern.len > max_pat_w) max_pat_w = h.pattern.len;
+            if (h.command.len > max_cmd_w) max_cmd_w = h.command.len;
+        }
+        if (max_pat_w < 10) max_pat_w = 10;
+        if (max_cmd_w < 10) max_cmd_w = 10;
+        max_pat_w += 2;
+        max_cmd_w += 2;
+
+        // Second pass: print with alignment
         for (status.hooks) |h| {
             var cursor_buf: [32]u8 = undefined;
-            std.debug.print("    #{d:<3} {s:<20} → {s:<25} cursor: {s}\n", .{
-                h.id,
-                h.pattern,
-                h.command,
-                formatNumber(&cursor_buf, h.cursor),
-            });
+            const cursor_str = formatNumber(&cursor_buf, h.cursor);
+            // Print id
+            std.debug.print("    #{d:<3} {s}", .{ h.id, h.pattern });
+            // Pad pattern
+            var p: usize = h.pattern.len;
+            while (p < max_pat_w) : (p += 1) std.debug.print(" ", .{});
+            std.debug.print("→ {s}", .{h.command});
+            // Pad command
+            var c: usize = h.command.len;
+            while (c < max_cmd_w) : (c += 1) std.debug.print(" ", .{});
+            std.debug.print("cursor: {s}\n", .{cursor_str});
         }
     }
 
