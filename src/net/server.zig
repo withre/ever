@@ -615,9 +615,25 @@ pub const Server = struct {
 fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
     if (global_server) |s| {
         s.shutdown_requested.store(true, .release);
-        // Do NOT touch net_server here — let run() handle cleanup.
-        // deinit() does syscalls (close) which are not async-signal-safe,
-        // and writing net_server races with the main thread's accept loop.
+        // Make a dummy connection to ourselves to unblock accept().
+        // connect()+close() are async-signal-safe. The accept loop will
+        // see shutdown_requested and break out cleanly.
+        const fd = std.os.linux.socket(2, 1, 0); // AF_INET, SOCK_STREAM
+        const fd_i: isize = @bitCast(fd);
+        if (fd_i >= 0) {
+            var addr: [16]u8 = undefined;
+            @memset(&addr, 0);
+            addr[0] = 2; // AF_INET
+            addr[1] = 0;
+            addr[2] = @intCast(s.config.port >> 8);
+            addr[3] = @intCast(s.config.port & 0xFF);
+            addr[4] = 127;
+            addr[5] = 0;
+            addr[6] = 0;
+            addr[7] = 1;
+            _ = std.os.linux.connect(@intCast(fd), @ptrCast(&addr), 16);
+            _ = std.os.linux.close(@intCast(fd));
+        }
     }
 }
 
