@@ -41,18 +41,18 @@ pub fn run(
     if (handleParentWithoutRun(app, raw, resolved)) return;
 
     var ctx = Context.init(allocator, io, env_block);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
     ctx.command_path = if (resolved.parent_name.len > 0) resolved.parent_name else resolved.cmd.name;
 
     applyDefaults(&ctx, resolved.cmd.flags, app.global_flags) catch return;
     applyEnv(&ctx, resolved.cmd.flags, app.global_flags, env_block) catch return;
     parsePreCmdGlobals(&ctx, raw, resolved, app.global_flags) catch return;
-    try parseCommandArgs(&ctx, app, resolved.cmd, raw[resolved.args_start..]);
+    try parseCommandArgs(&ctx, allocator, app, resolved.cmd, raw[resolved.args_start..]);
 
     validate.validateRequired(resolved.cmd, &ctx);
     validate.validateConflicts(resolved.cmd, &ctx);
 
-    if (resolved.cmd.run) |run_fn| try run_fn(&ctx);
+    if (resolved.cmd.run) |run_fn| try run_fn(&ctx, allocator);
 }
 
 // ── Special First-Arg Handling ─────────────────────────────────────────
@@ -336,6 +336,7 @@ fn parseShortGlobalFlag(
 /// Parse flags and positional args for the resolved command.
 fn parseCommandArgs(
     ctx: *Context,
+    allocator: std.mem.Allocator,
     app: *const App,
     cmd: Command,
     args: []const []const u8,
@@ -345,7 +346,7 @@ fn parseCommandArgs(
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--")) {
-            try parseRestOrPositional(ctx, cmd, args[i + 1 ..], &pos_idx);
+            try parseRestOrPositional(ctx, allocator, cmd, args[i + 1 ..], &pos_idx);
             break;
         }
         if (std.mem.startsWith(u8, a, "--")) {
@@ -359,9 +360,9 @@ fn parseCommandArgs(
 }
 
 /// Handle tokens after `--`: rest args or overflow positional.
-fn parseRestOrPositional(ctx: *Context, cmd: Command, rest: []const []const u8, pos_idx: *usize) !void {
+fn parseRestOrPositional(ctx: *Context, allocator: std.mem.Allocator, cmd: Command, rest: []const []const u8, pos_idx: *usize) !void {
     if (cmd.takes_rest) {
-        for (rest) |r| try ctx.rest_args.append(ctx.allocator, r);
+        for (rest) |r| try ctx.rest_args.append(allocator, r);
     } else {
         for (rest) |r| {
             if (pos_idx.* < cmd.args.len) {

@@ -47,7 +47,9 @@ pub const Command = struct {
     subcommands: []const Command = &.{},
     /// If true, everything after `--` is captured as rest args.
     takes_rest: bool = false,
-    run: ?*const fn (*Context) anyerror!void = null,
+    /// Handler receives an explicit allocator following the unmanaged pattern
+    /// (Zig stdlib direction: per-call allocator, no stored allocator field).
+    run: ?*const fn (*Context, std.mem.Allocator) anyerror!void = null,
 
     /// Check if this command matches the given name (primary or alias).
     pub fn matches(self: *const Command, input: []const u8) bool {
@@ -93,7 +95,6 @@ pub const Context = struct {
     flags: std.StringHashMap([]const u8),
     positional: std.StringHashMap([]const u8),
     rest_args: std.ArrayList([]const u8),
-    allocator: std.mem.Allocator,
     io: std.Io,
     envp: [*:null]const ?[*:0]const u8,
     /// Full command path, e.g. "timer add".
@@ -105,7 +106,6 @@ pub const Context = struct {
             .flags = std.StringHashMap([]const u8).init(allocator),
             .positional = std.StringHashMap([]const u8).init(allocator),
             .rest_args = .empty,
-            .allocator = allocator,
             .io = io,
             .envp = envp,
             .command_path = "",
@@ -113,8 +113,8 @@ pub const Context = struct {
     }
 
     /// Release all owned resources.
-    pub fn deinit(self: *Context) void {
-        self.rest_args.deinit(self.allocator);
+    pub fn deinit(self: *Context, allocator: std.mem.Allocator) void {
+        self.rest_args.deinit(allocator);
         self.flags.deinit();
         self.positional.deinit();
     }
@@ -203,7 +203,7 @@ test "context basics" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try ctx.flags.put("port", "8080");
     try std.testing.expectEqualStrings("8080", ctx.flag("port"));
@@ -214,7 +214,7 @@ test "context flagBool" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try ctx.flags.put("verbose", "true");
     try std.testing.expect(ctx.flagBool("verbose"));
@@ -225,7 +225,7 @@ test "context hasFlag distinguishes set vs absent" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try ctx.flags.put("present", "");
     try std.testing.expect(ctx.hasFlag("present"));
@@ -236,7 +236,7 @@ test "context flag returns empty for missing" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try std.testing.expectEqualStrings("", ctx.flag("nope"));
 }
@@ -245,7 +245,7 @@ test "context flagInt returns 0 for missing" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try std.testing.expectEqual(@as(u16, 0), ctx.flagInt(u16, "nope"));
 }
@@ -254,7 +254,7 @@ test "context flagInt returns 0 for empty" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try ctx.flags.put("empty", "");
     try std.testing.expectEqual(@as(u32, 0), ctx.flagInt(u32, "empty"));
@@ -264,7 +264,7 @@ test "context rest args" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try ctx.rest_args.append(allocator, "echo");
     try ctx.rest_args.append(allocator, "hello");
@@ -278,7 +278,7 @@ test "context arg returns empty for missing" {
     const allocator = std.testing.allocator;
     const envp: [*:null]const ?[*:0]const u8 = &.{};
     var ctx = Context.init(allocator, std.testing.io, envp);
-    defer ctx.deinit();
+    defer ctx.deinit(allocator);
 
     try std.testing.expectEqualStrings("", ctx.arg("missing"));
 }

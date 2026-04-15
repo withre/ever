@@ -32,8 +32,7 @@ fn connectToStore(allocator: std.mem.Allocator, io: std.Io, addr: []const u8, po
     };
 }
 
-fn handlePub(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handlePub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const topic = ctx.arg("topic");
@@ -58,8 +57,7 @@ fn handlePub(ctx: *cli.Context) !void {
     std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
 }
 
-fn handleSub(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleSub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
@@ -129,8 +127,7 @@ fn handleSub(ctx: *cli.Context) !void {
     }
 }
 
-fn handleWait(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleWait(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
@@ -181,8 +178,7 @@ fn handleWait(ctx: *cli.Context) !void {
     }
 }
 
-fn handleOn(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleOn(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const envp = ctx.envp;
 
@@ -318,8 +314,7 @@ fn handleOn(ctx: *cli.Context) !void {
     }
 }
 
-fn handleTopicCreate(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTopicCreate(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -338,8 +333,7 @@ fn handleTopicCreate(ctx: *cli.Context) !void {
     std.debug.print("Created topic: {s}\n", .{name});
 }
 
-fn handleTopicList(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTopicList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -356,8 +350,7 @@ fn handleTopicList(ctx: *cli.Context) !void {
     if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
 }
 
-fn handleTopicDelete(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTopicDelete(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -376,8 +369,7 @@ fn handleTopicDelete(ctx: *cli.Context) !void {
     std.debug.print("Deleted topic: {s}\n", .{name});
 }
 
-fn handleHookAdd(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
@@ -424,8 +416,7 @@ fn handleHookAdd(ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookList(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -459,8 +450,7 @@ fn handleHookList(ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookPs(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookPs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -492,8 +482,7 @@ fn handleHookPs(ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookLogs(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookLogs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const id_str = ctx.arg("id");
 
@@ -525,8 +514,7 @@ fn handleHookLogs(ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookRm(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const id_or_name = ctx.arg("id");
 
@@ -580,8 +568,7 @@ fn handleHookRm(ctx: *cli.Context) !void {
     }
 }
 
-fn handleTimerAdd(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTimerAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const name_arg = ctx.arg("name");
     const name_flag = ctx.flag("name");
@@ -681,8 +668,7 @@ fn handleTimerAdd(ctx: *cli.Context) !void {
     }
 }
 
-fn handleTimerList(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTimerList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -709,8 +695,7 @@ fn handleTimerList(ctx: *cli.Context) !void {
     }
 }
 
-fn handleTimerRm(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTimerRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -729,8 +714,7 @@ fn handleTimerRm(ctx: *cli.Context) !void {
     std.debug.print("Timer '{s}' removed.\n", .{name});
 }
 
-fn handleTimerInfo(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTimerInfo(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -768,8 +752,7 @@ fn handleTimerInfo(ctx: *cli.Context) !void {
     std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
 }
 
-fn handleTimerNew(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleTimerNew(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     // Prompt: Timer name
@@ -871,8 +854,7 @@ fn handleTimerNew(ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookNew(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleHookNew(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
 
     // Prompt: Topic pattern
@@ -935,15 +917,13 @@ fn readLine(allocator: std.mem.Allocator) ![]u8 {
     return readline.readLine(allocator);
 }
 
-fn handleStart(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleStart(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const io = ctx.io;
     const envp = ctx.envp;
     try startServer(allocator, io, ctx, envp);
 }
 
-fn handleStatus(ctx: *cli.Context) !void {
-    const allocator = ctx.allocator;
+fn handleStatus(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
 
     const data_dir = ctx.flag("data-dir");
     const json_output = ctx.flagBool("json");
