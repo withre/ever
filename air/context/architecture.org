@@ -148,6 +148,12 @@ Trailing dot is shell-safe (no quoting needed). The =*= wildcard matches exactly
 - Timer daemon: separate thread, publishes to TopicManager (planned)
 - Client commands: single-threaded, one TCP connection
 
+*** Mutex Scope for I/O
+Copy index data under the lock, release it, then do disk I/O without the lock. =Log.append= has its own mutex, so =TopicManager= doesn't need to hold its mutex during writes. This reduces lock contention on I/O-bound operations.
+
+*** Signal Handling
+Only async-signal-safe operations in signal handlers. To unblock a blocking =accept()= call on shutdown, use a dummy self-connection (socket+connect+close) — raw syscalls are signal-safe. Never call =deinit()= or manipulate complex structs in a signal handler.
+
 Known limitation: detached threads not joined on shutdown (=graceful-shutdown.org= spec exists).
 
 ** Key Learnings
@@ -163,6 +169,9 @@ Topics created with =createTopic= but never published to would vanish on restart
 
 *** Blocking fetch over polling
 =ever on= and =ever sub --follow= use =block_ms= in =FetchRequest=. The server holds the connection (poll+sleep loop) until events arrive or timeout. This eliminates idle CPU from client-side polling loops.
+
+*** Hook background execution
+Hooks execute via fork/exec in a background daemon thread. Each hook invocation gets event data via environment variables and stdin (temp file). PID-based temp file paths (=/tmp/.ever-hook-stdin-{pid}=) avoid collisions. The hook daemon thread shares =TopicManager= with the server — snapshot hook state under the =HookTable= mutex before executing.
 
 *** Double mutex is acceptable
 =TopicManager.publish= holds its mutex, then calls =Log.append= which acquires the Log mutex. This is redundant but not a bug — the Log mutex ensures correctness if Log is ever used without TopicManager. The overhead is one extra spinlock acquisition per write (~nanoseconds).

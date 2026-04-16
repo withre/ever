@@ -184,6 +184,8 @@ zig build test -Doptimize=ReleaseSafe
 
 - *Mutex*: =std.Thread.Mutex= is gone. Use =std.atomic.Mutex= (spinlock enum with =.tryLock()= and =.unlock()=, no blocking =.lock()=).
 - *StringArrayHashMap*: Still managed (stores allocator). =getOrPut= takes only key, not allocator.
+- *Unmanaged allocator pattern*: Zig v0.16 deprecated Managed containers. Pass allocator per-call rather than storing in structs. Handler functions should accept allocator as an explicit parameter. This is the direction Zig is going — adopt it for long-term relevance.
+- *std.debug.print format widths*: Format widths are comptime-only. For runtime-width padding, use manual loops.
 
 *** Event Memory Ownership
 - =Log.read()= and =Log.readBatch()= return events with topic+key+value in a single contiguous allocation
@@ -201,6 +203,12 @@ zig build test -Doptimize=ReleaseSafe
 - *Debug vs ReleaseFast differ*: Data races may only manifest in release builds. Always test =zig build -Doptimize=ReleaseFast= before committing concurrency changes.
 - *Lockfile released on process death*: =flock= is automatically released by the kernel when the process exits (even kill -9). No stale lockfile cleanup needed.
 - *reuse_address=false is essential*: With =true=, multiple stores bind to the same port and clients get randomly routed. Set =false= so the OS rejects duplicate binds.
+- *Field propagation discipline*: Adding a field to a data struct (Hook, Timer, etc.) requires coordinated updates across 12+ locations: struct definition, JSON serialization struct, legacy struct, add/addFull method, load method, saveLocked, deepCopy helper, free/freeCopy helper, protocol message struct, server handler, client struct+methods, CLI handler. Missing any one causes silent data loss or distant compile errors.
+- *Signal handler safety*: Only async-signal-safe operations in signal handlers. To unblock a blocking =accept()= call, use a dummy self-connection (socket+connect+close) — raw syscalls are signal-safe. Never call =deinit()= or manipulate complex structs in a signal handler.
+- *Mutex scope for I/O*: Copy index data under the lock, release it, then do disk I/O without the lock. =Log.append= has its own mutex, so =TopicManager= doesn't need to hold its mutex during writes.
+
+*** Review Artifacts
+- Review artifacts (QA reports, security audits, test findings) should NOT be committed to the source repo. Store them in a separate project/directory (e.g., =ace-stack/data/reviews/=).
 
 *** Debugging
 - Use =std.debug.print= for quick debugging (remove before commit)
