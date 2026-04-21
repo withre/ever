@@ -374,6 +374,8 @@ fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
     const name_flag = ctx.flag("name");
+    const from_beginning = ctx.flagBool("from-beginning");
+    const from_flag = ctx.flag("from");
     const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
@@ -384,6 +386,24 @@ fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
         std.debug.print("error: command is required after --\n", .{});
         std.process.exit(1);
     }
+    if (from_beginning and from_flag.len > 0) {
+        std.debug.print("error: --from-beginning and --from are mutually exclusive\n", .{});
+        std.process.exit(1);
+    }
+
+    // Resolve start cursor: null = tip (server resolves), 0 = full replay,
+    // explicit N = start at topic-local offset N.
+    const start_cursor: ?u64 = blk: {
+        if (from_beginning) break :blk 0;
+        if (from_flag.len > 0) {
+            const n = std.fmt.parseInt(u64, from_flag, 10) catch {
+                std.debug.print("error: --from must be a non-negative integer, got '{s}'\n", .{from_flag});
+                std.process.exit(1);
+            };
+            break :blk n;
+        }
+        break :blk null;
+    };
 
     // Join rest args into a single command string
     var cmd_str: std.ArrayList(u8) = .empty;
@@ -404,15 +424,21 @@ fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFullNamed(pattern, cmd_str.items, cwd, once, null, name) catch |err| switch (err) {
+    const id = c.registerHookFullNamedCursor(pattern, cmd_str.items, cwd, once, null, name, start_cursor) catch |err| switch (err) {
         error.ServerError => std.process.exit(1),
         else => return err,
     };
 
+    const mode_suffix: []const u8 = if (from_beginning)
+        " [replaying from beginning]"
+    else if (from_flag.len > 0)
+        " [replaying from offset]"
+    else
+        "";
     if (once) {
-        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}\n", .{ id, pattern, cmd_str.items });
+        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
     } else {
-        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}\n", .{ id, pattern, cmd_str.items });
+        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
     }
 }
 
@@ -1338,6 +1364,8 @@ const app = cli.App{
                     .flags = &.{
                         .{ .name = "once", .takes_value = false, .description = "Remove after first trigger" },
                         .{ .name = "name", .description = "Hook name (auto-generated if omitted)" },
+                        .{ .name = "from-beginning", .takes_value = false, .description = "Replay all historical events before following new ones", .conflicts = &.{"from"} },
+                        .{ .name = "from", .description = "Start at an explicit topic-local offset (replay from there)", .conflicts = &.{"from-beginning"} },
                     },
                     .takes_rest = true,
                     .run = handleHookAdd,

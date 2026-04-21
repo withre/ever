@@ -36,6 +36,13 @@ pub const TopicListEntry = struct {
 /// Per-topic index: tracks which global offsets belong to this topic.
 const TopicIndex = struct {
     offsets: std.ArrayList(u64) = .empty,
+    /// Count of non-marker events in this topic. A "marker" is any event
+    /// whose value is empty (creation markers from createTopic, tombstones
+    /// from deleteTopic, and — by historical quirk — user publishes with an
+    /// empty value). Kept in sync with the skip logic in `fetch`/`fetchPattern`
+    /// so hook cursors can be set to "tip" (== non_marker_count) to skip all
+    /// currently-visible events.
+    non_marker_count: u64 = 0,
 
     fn deinit(self: *TopicIndex, allocator: Allocator) void {
         self.offsets.deinit(allocator);
@@ -83,6 +90,65 @@ pub const TopicManager = struct {
 
     fn lock(self: *TopicManager) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Public lock used by the hook-registration path to compute a "tip"
+    /// cursor and insert the hook under the same critical section that
+    /// `publish` uses (single-writer discipline). This guarantees no publish
+    /// can interleave between the tip read and hook insertion. The ordering
+    /// guarantee is consistency under the store's single-writer publish
+    /// discipline, not strict atomicity in the formal sense.
+    pub fn lockForHookRegistration(self: *TopicManager) void {
+        self.lock();
+    }
+
+    pub fn unlockForHookRegistration(self: *TopicManager) void {
+        self.mutex.unlock();
+    }
+
+    /// Return the current tip for `pattern` — the cursor value the hook
+    /// daemon should use as a starting point so only events published after
+    /// registration are delivered. Caller must hold the registration lock.
+    ///
+    /// The semantics differ by pattern shape and match the corresponding
+    /// fetch path used by the hook daemon:
+    ///
+    /// - **Exact topic**: returns `non_marker_count` of that topic. Used as
+    ///   a topic-local skip count by `fetch(...)`. Future events on this
+    ///   topic are delivered exactly once.
+    ///
+    /// - **Prefix or wildcard pattern**: returns the current global log
+    ///   offset (`log.nextOffset()`). Used as a global-offset cursor by
+    ///   `fetchPatternByOffset(...)`. Any event published from now on —
+    ///   on any matching topic, *including topics that don't exist yet*
+    ///   — is delivered exactly once. This avoids the B1 wildcard bug
+    ///   where a single per-topic skip count could swallow events on
+    ///   low-count or newly-created matching topics.
+    pub fn tipForPatternLocked(self: *TopicManager, pattern: []const u8) u64 {
+        const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
+            (pattern.len > 0 and pattern[pattern.len - 1] == '.');
+
+        if (!is_pattern) {
+            if (self.topics.getPtr(pattern)) |idx| return idx.non_marker_count;
+            return 0;
+        }
+
+        return self.log.nextOffset();
+    }
+
+    /// Convenience for callers that don't need the registration ordering
+    /// guarantee — acquires and releases the lock internally.
+    ///
+    /// **test-only:** server code (and any caller that needs the tip read
+    /// to be ordered with the hook insertion against concurrent publishes)
+    /// must use `lockForHookRegistration` + `tipForPatternLocked` and then
+    /// insert the hook before unlocking. This wrapper drops the lock before
+    /// returning, so a concurrent publish can interleave between the read
+    /// and any subsequent action by the caller.
+    pub fn tipForPattern(self: *TopicManager, pattern: []const u8) u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.tipForPatternLocked(pattern);
     }
 
     /// Register a new topic. Writes a marker event to the log so the
@@ -187,6 +253,7 @@ pub const TopicManager = struct {
             defer self.mutex.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             try idx.offsets.append(self.allocator, offset);
+            if (value.len != 0) idx.non_marker_count += 1;
         }
         return offset;
     }
@@ -220,6 +287,75 @@ pub const TopicManager = struct {
             if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
             errdefer store.freeEvent(allocator, event);
             try events.append(allocator, event);
+        }
+        return events.toOwnedSlice(allocator);
+    }
+
+    /// Fetch events matching `pattern`, starting at a global log offset.
+    /// Used by the hook daemon for wildcard/prefix hooks, where the cursor
+    /// is interpreted as the next global log offset to consider (rather than
+    /// a per-topic skip count). This naturally handles topics that exist
+    /// but have a low event count, and topics that didn't exist at the time
+    /// the cursor was captured — every future event is delivered exactly
+    /// once in publish order.
+    ///
+    /// Marker events (empty value: createTopic markers and tombstones) are
+    /// skipped silently — they are not user-visible publishes.
+    pub fn fetchPatternByOffset(
+        self: *TopicManager,
+        allocator: Allocator,
+        pattern: []const u8,
+        start_offset: u64,
+        max_count: u32,
+    ) ![]Event {
+        // We read from the log directly. Hold the manager mutex while reading
+        // so log appends and readBatch don't race; readBatch itself is not
+        // thread-safe against concurrent appends.
+        self.lock();
+        defer self.mutex.unlock();
+
+        var events: std.ArrayList(Event) = .empty;
+        errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
+
+        var cursor = start_offset;
+        const next = self.log.nextOffset();
+        while (events.items.len < max_count and cursor < next) {
+            // Read in chunks to bound memory; readBatch returns up to chunk size.
+            // The `+ 16` slack lets us read a few extra entries to absorb
+            // marker/tombstone skips so the buffer can still reach `max_count`
+            // deliverable events without an extra round-trip.
+            const chunk: u32 = @intCast(@min(@as(u64, max_count) - events.items.len + 16, 256));
+            const batch = try self.log.readBatch(allocator, cursor, chunk);
+            defer allocator.free(batch);
+            if (batch.len == 0) break;
+            for (batch, 0..) |evt, idx| {
+                if (evt.value.len == 0) {
+                    // Marker / tombstone — not user-visible.
+                    cursor = evt.offset + 1;
+                    store.freeEvent(allocator, evt);
+                    continue;
+                }
+                if (!matchTopic(pattern, evt.topic)) {
+                    cursor = evt.offset + 1;
+                    store.freeEvent(allocator, evt);
+                    continue;
+                }
+                if (events.items.len >= max_count) {
+                    // Buffer full. Free this and the remaining un-iterated
+                    // batch entries and bail out. We deliberately do NOT
+                    // advance `cursor` past these events: this fn returns
+                    // only delivered events, and the daemon advances the
+                    // hook's persistent cursor based on `event.offset + 1`
+                    // of those — so undelivered offsets are re-read on the
+                    // next call.
+                    store.freeEvent(allocator, evt);
+                    for (batch[idx + 1 ..]) |rest| store.freeEvent(allocator, rest);
+                    break;
+                }
+                cursor = evt.offset + 1;
+                errdefer store.freeEvent(allocator, evt);
+                try events.append(allocator, evt);
+            }
         }
         return events.toOwnedSlice(allocator);
     }
@@ -285,6 +421,7 @@ pub const TopicManager = struct {
                 gop.value_ptr.* = .{};
             }
             try gop.value_ptr.offsets.append(self.allocator, offset);
+            if (event.value.len != 0) gop.value_ptr.non_marker_count += 1;
 
             // Detect deletion tombstone markers
             if (event.key) |key| {
@@ -505,6 +642,80 @@ test "TopicManager soft-delete survives restart" {
 
         // Should not be publishable
         try std.testing.expectError(TopicError.TopicDeleted, tm.publish("persist", null, "nope"));
+    }
+}
+
+test "TopicManager tipForPattern: exact topic" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.demo");
+    try std.testing.expectEqual(@as(u64, 0), tm.tipForPattern("t.demo"));
+
+    _ = try tm.publish("t.demo", null, "one");
+    _ = try tm.publish("t.demo", null, "two");
+    try std.testing.expectEqual(@as(u64, 2), tm.tipForPattern("t.demo"));
+
+    // Unknown topic: tip is 0 (future events still caught when the topic is created)
+    try std.testing.expectEqual(@as(u64, 0), tm.tipForPattern("t.does-not-exist"));
+}
+
+test "TopicManager tipForPattern: prefix and wildcard" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("agent.one");
+    try tm.createTopic("agent.two");
+    try tm.createTopic("file.a");
+    _ = try tm.publish("agent.one", null, "a");
+    _ = try tm.publish("agent.one", null, "b");
+    _ = try tm.publish("agent.one", null, "c");
+    _ = try tm.publish("agent.two", null, "x");
+    _ = try tm.publish("file.a", null, "z");
+
+    // For prefix/wildcard patterns, tip is the global log offset — i.e. the
+    // next offset that will be assigned. 3 createTopic markers + 5 publishes
+    // = 8 entries already written, so next offset is 8.
+    try std.testing.expectEqual(@as(u64, 8), tm.tipForPattern("agent."));
+    try std.testing.expectEqual(@as(u64, 8), tm.tipForPattern("agent.*"));
+    try std.testing.expectEqual(@as(u64, 8), tm.tipForPattern("."));
+}
+
+test "TopicManager tipForPattern: tombstones and markers are excluded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.x"); // creation marker
+    _ = try tm.publish("t.x", null, "real");
+    // Tip counts only real events, not the creation marker.
+    try std.testing.expectEqual(@as(u64, 1), tm.tipForPattern("t.x"));
+}
+
+test "TopicManager tip survives restart via rebuildIndex" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try tm.createTopic("persist.tip");
+        _ = try tm.publish("persist.tip", null, "a");
+        _ = try tm.publish("persist.tip", null, "b");
+    }
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try std.testing.expectEqual(@as(u64, 2), tm.tipForPattern("persist.tip"));
     }
 }
 

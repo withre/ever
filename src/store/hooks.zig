@@ -16,6 +16,20 @@ pub const Hook = struct {
     pattern: []const u8,
     command: []const u8,
     cwd: []const u8,
+    /// Position from which the hook daemon will deliver the next event.
+    /// The interpretation is **polymorphic in the pattern shape** and is
+    /// stable for the life of the hook (pattern is immutable):
+    ///
+    /// - *Exact topic* (no `*`, no trailing `.`): topic-local skip count
+    ///   passed to `TopicManager.fetch` as `start`. The daemon advances it
+    ///   by `+1` per delivered event.
+    /// - *Prefix or wildcard*: global log offset passed to
+    ///   `TopicManager.fetchPatternByOffset` as `start_offset`. The daemon
+    ///   advances it to `event.offset + 1` per delivered event.
+    ///
+    /// See `HookDaemon.processHook` for the dispatch and
+    /// `air/v0.1/hook-registration-cursor.org` for the rationale (B1 fix,
+    /// round 2).
     cursor: u64,
     created_at: i64,
     once: bool = false,
@@ -94,13 +108,25 @@ pub const HookTable = struct {
         freeHookCopy(self.allocator, hook);
     }
 
-    /// Add a hook. Returns the assigned ID.
+    /// Add a hook. Returns the assigned ID. Initial cursor is 0 (replay history).
+    /// Prefer `addFull` or `addWithCursor` in production code.
     pub fn add(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8) !u64 {
-        return self.addFull(pattern, command, cwd, false, null, null);
+        return self.addWithCursor(pattern, command, cwd, false, null, null, 0);
     }
 
-    /// Add a hook with full options (once, env, name). Returns the assigned ID.
+    /// Add a hook with full options. Initial cursor is 0 (replay all history).
+    /// This preserves the legacy signature; new call-sites should use
+    /// `addWithCursor` and pass an explicit starting cursor (e.g. the current
+    /// tip from `TopicManager.tipForPatternLocked`).
     pub fn addFull(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8) !u64 {
+        return self.addWithCursor(pattern, command, cwd, once, env, name, 0);
+    }
+
+    /// Add a hook with an explicit starting cursor. The cursor is a topic-local
+    /// skip count (same semantics as `TopicManager.fetch(... start = cursor)`).
+    /// Pass `0` to replay all history; pass the result of
+    /// `TopicManager.tipForPatternLocked` to observe only future events.
+    pub fn addWithCursor(self: *HookTable, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8, initial_cursor: u64) !u64 {
         self.lock();
         defer self.mutex.unlock();
 
@@ -145,7 +171,7 @@ pub const HookTable = struct {
             .pattern = pattern_copy,
             .command = cmd_copy,
             .cwd = cwd_copy,
-            .cursor = 0,
+            .cursor = initial_cursor,
             .created_at = getMilliTimestamp(),
             .once = once,
             .env = env_copy,
@@ -822,8 +848,12 @@ pub const HookDaemon = struct {
         const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
             (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
+        // Cursor semantics differ by pattern shape (see
+        // `TopicManager.tipForPatternLocked`):
+        //   - exact topic   → topic-local skip count, advance by batch index
+        //   - prefix/wildcard → global log offset, advance to event.offset + 1
         const events = if (is_pattern)
-            try self.topic_manager.fetchPattern(self.allocator, pattern, hook.cursor, 100)
+            try self.topic_manager.fetchPatternByOffset(self.allocator, pattern, hook.cursor, 100)
         else
             try self.topic_manager.fetch(self.allocator, pattern, hook.cursor, 100);
         defer {
@@ -844,9 +874,11 @@ pub const HookDaemon = struct {
                     logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
                 },
             };
-            // Cursor is topic-local: fetch() interprets start as the number of
-            // events to skip within the topic, so we advance by batch index.
-            self.hook_table.updateCursor(hook.id, hook.cursor + i + 1);
+            const new_cursor: u64 = if (is_pattern)
+                event.offset + 1
+            else
+                hook.cursor + i + 1;
+            self.hook_table.updateCursor(hook.id, new_cursor);
 
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
@@ -1260,6 +1292,86 @@ test "HookTable add, list, remove" {
     }
 
     // Cleanup temp dir
+    const hooks_json_z = try allocator.allocSentinel(u8, tmp_path.len + 11, 0);
+    defer allocator.free(hooks_json_z);
+    @memcpy(hooks_json_z[0..tmp_path.len], tmp_path);
+    @memcpy(hooks_json_z[tmp_path.len .. tmp_path.len + 11], "/hooks.json");
+    _ = std.os.linux.unlink(hooks_json_z.ptr);
+    _ = std.os.linux.rmdir(tmp_z.ptr);
+}
+
+test "HookTable addWithCursor stores explicit initial cursor" {
+    const allocator = std.testing.allocator;
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/.ever-hook-cursor-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(tmp_path);
+    const tmp_z = try allocator.allocSentinel(u8, tmp_path.len, 0);
+    defer allocator.free(tmp_z);
+    @memcpy(tmp_z[0..tmp_path.len], tmp_path);
+    _ = std.os.linux.mkdir(tmp_z.ptr, 0o755);
+
+    var table = try HookTable.init(allocator, tmp_path);
+    defer table.deinit();
+
+    const id_tip = try table.addWithCursor("t.a", "echo", "/tmp", false, null, null, 42);
+    const id_zero = try table.addWithCursor("t.b", "echo", "/tmp", true, null, null, 0);
+    _ = id_zero;
+
+    const snap = try table.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    var saw_42 = false;
+    var saw_0 = false;
+    for (snap) |h| {
+        if (h.id == id_tip) {
+            try std.testing.expectEqual(@as(u64, 42), h.cursor);
+            saw_42 = true;
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), h.cursor);
+            saw_0 = true;
+        }
+    }
+    try std.testing.expect(saw_42);
+    try std.testing.expect(saw_0);
+
+    // Cleanup
+    const hooks_json_z = try allocator.allocSentinel(u8, tmp_path.len + 11, 0);
+    defer allocator.free(hooks_json_z);
+    @memcpy(hooks_json_z[0..tmp_path.len], tmp_path);
+    @memcpy(hooks_json_z[tmp_path.len .. tmp_path.len + 11], "/hooks.json");
+    _ = std.os.linux.unlink(hooks_json_z.ptr);
+    _ = std.os.linux.rmdir(tmp_z.ptr);
+}
+
+test "HookTable reload preserves stored cursor" {
+    const allocator = std.testing.allocator;
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/.ever-hook-reload-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(tmp_path);
+    const tmp_z = try allocator.allocSentinel(u8, tmp_path.len, 0);
+    defer allocator.free(tmp_z);
+    @memcpy(tmp_z[0..tmp_path.len], tmp_path);
+    _ = std.os.linux.mkdir(tmp_z.ptr, 0o755);
+
+    var id: u64 = 0;
+    {
+        var table = try HookTable.init(allocator, tmp_path);
+        defer table.deinit();
+        id = try table.addWithCursor("t.persist", "echo", "/tmp", false, null, "persist-hook", 17);
+        // Advance cursor to simulate daemon progress.
+        table.updateCursor(id, 25);
+    }
+    {
+        var table = try HookTable.init(allocator, tmp_path);
+        defer table.deinit();
+        const snap = try table.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        try std.testing.expectEqual(@as(usize, 1), snap.len);
+        try std.testing.expectEqual(id, snap[0].id);
+        // Reload must keep the advanced cursor, not reset to 0 or to the
+        // initial cursor — this is the "persistence round-trip" guarantee the
+        // spec relies on for existing hooks.
+        try std.testing.expectEqual(@as(u64, 25), snap[0].cursor);
+    }
+
+    // Cleanup
     const hooks_json_z = try allocator.allocSentinel(u8, tmp_path.len + 11, 0);
     defer allocator.free(hooks_json_z);
     @memcpy(hooks_json_z[0..tmp_path.len], tmp_path);

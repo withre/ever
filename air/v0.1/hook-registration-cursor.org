@@ -1,0 +1,142 @@
+#+title: Hook Registration Cursor Semantics
+#+state: complete
+#+FILETAGS: :subscriber:orchestrator:bug:
+
+* Summary
+Newly-registered hooks start at cursor =0= and replay the entire historical log for their pattern, instead of only matching events published *after* registration. This breaks =--once= hooks used for orchestration: they self-consume on a stale historical event and never see the future event the caller cared about.
+
+* Motivation
+
+** Observed failure
+In an ACE-stack orchestration session (2026-04-21):
+
+1. A sub-agent was spawned, then killed. Its =--on-exit= published to =cli.research.done= at offset 173.
+2. The orchestrator later registered =ever hook add --once --name cli-research-notify cli.research.done -- /tmp/notify.sh= with the intent of catching the *next* completion event from a replacement agent.
+3. The hook immediately fired on the pre-existing offset 173 event, auto-removed itself (=--once=), and was gone before the replacement agent published its real "done" event.
+4. The orchestrator never received the notification and had to poll manually.
+
+Execution log confirms (=ever hook logs 8=):
+#+begin_example
+Hook:      #8 (cli-research-notify)
+Pattern:   cli.research.done
+Command:   /tmp/ever-orch/notify-orch.sh
+Offset:    173   ← pre-existing event, registered AFTER this was published
+#+end_example
+
+** Root cause
+=src/store/hooks.zig:148= initialises new hooks with =cursor = 0=:
+#+begin_src zig
+const h = Hook{
+    // ...
+    .cursor = 0,
+    // ...
+};
+#+end_src
+
+The daemon then polls from =hook.cursor= forward, catching up through all history. For =--once= this is catastrophic because the hook dies on the first historical match and no real subscriber remains.
+
+** Why this matters
+The ACE-stack skill documents =ever hook add= as the preferred primitive for "react when this event happens" in multi-agent workflows. Users reasonably expect hooks to observe *future* events, the way =ever on= (ephemeral trigger), =chronoa send=, =inotify=, =systemd .path=, and every comparable tool do by default. Today's behaviour silently corrupts orchestration patterns that rely on =--once=.
+
+* Goals
+- Default cursor for newly-registered hooks points at the current log tip (i.e. next published event is the first one the hook sees).
+- Existing hooks reloaded from persistence resume at their stored cursor (no regression on restart).
+- Users who *want* historical replay can opt in explicitly.
+- =--once= is safe to use for "catch the next occurrence" without manual offset management.
+
+* Non-Goals
+- Redesigning the hook execution model (covered by [[./hook-execution.org]]).
+- Per-event deduplication or exactly-once delivery semantics.
+- Changing pattern-matching rules.
+
+* Proposal
+
+** Default behaviour
+At =ever hook add= time, set the new hook's cursor to =topic_manager.current_tip_for(pattern)= — the first offset that does *not* yet exist. Any event published from that moment on is delivered to the hook; nothing already in the log is replayed.
+
+The meaning of "tip" depends on the pattern shape, and matches the corresponding fetch path used by the hook daemon:
+
+- *Exact topic*: tip is the topic's =non_marker_count=. The cursor acts as a topic-local skip count consumed by =fetch=. Future events on that topic are delivered exactly once.
+- *Prefix or wildcard*: tip is the current global log offset (=log.next_offset()=). The cursor acts as a global log-offset cursor consumed by =fetchPatternByOffset=. Any event published from now on — on any matching topic, *including topics that don't exist yet* — is delivered exactly once. (See B1 below.)
+
+** Opt-in replay
+Add CLI flags to =ever hook add= for users who genuinely need historical replay:
+
+| Flag | Meaning |
+|------+---------|
+| (default) | Start at tip — only future events |
+| =--from-beginning= | Start at offset 0 — replay everything, then follow |
+| =--from <N>= | Start at an explicit offset |
+
+=--once= combined with =--from-beginning= or =--from <N>= is permitted but the user must have asked for it — no silent replay.
+
+** Server protocol
+The =HookAddRequest= protocol message gains an optional =start_cursor: ?u64= field. The CLI resolves the three flag modes to a concrete value (or =null= meaning "tip") and sends it. The server, on receiving =null=, computes the current tip and inserts the hook under the same lock used by the publish path (single-writer discipline) — no publish can interleave between tip-read and registration. This is consistency under single-writer ordering, not strict formal atomicity.
+
+** Persistence & reload
+The persisted hook record already stores =cursor=. On =HookTable.load=, hooks resume at their saved cursor as today. This spec only changes the *initial* cursor value on =add=, not reload behaviour.
+
+The =cursor= field is a single =u64= but its interpretation is *polymorphic in the pattern shape* (exact → topic-local skip count; prefix/wildcard → global log offset; see Default behaviour above). The pattern is immutable for the life of a hook, so the interpretation is stable across reload — the daemon dispatches to =fetch= or =fetchPatternByOffset= based on the same pattern-shape check at every poll cycle. No schema change was required.
+
+* Design Details
+
+** Files expected to change
+- =src/store/hooks.zig= — =HookTable.addHook= initial-cursor logic; accept optional start cursor.
+- =src/store/topics.zig= (or equivalent) — helper to compute current tip for a pattern (exact topic, prefix, wildcard).
+- =src/store/protocol.zig= (wherever =HookAddRequest= is defined) — new optional field.
+- =src/cli/= hook subcommand — new flags =--from-beginning=, =--from <N>=.
+- Client: CLI sends resolved start cursor.
+- Tests: add cases for (a) default = tip, (b) =--from-beginning= replays history, (c) =--from N= starts at N, (d) wildcard pattern computes tip correctly, (e) restart preserves cursor, (f) =--once= with no prior events waits for the next one.
+
+** Edge cases
+- Empty topic / topic does not yet exist (exact pattern): tip is 0; first published event is delivered.
+- Pattern matches topics created *after* registration (prefix/wildcard): the global log-offset cursor naturally orders them in the hook's future. The first event ever published to such a topic has a global offset ≥ the registration cursor and is delivered.
+- Pattern matches topics that exist but have a low =non_marker_count= at registration (prefix/wildcard): with the global log-offset semantics this is moot — every event past the registration cursor is delivered regardless of how many events its topic had previously. (See B1.)
+- Concurrent publish at the exact registration instant: tip-read and hook insertion happen under the same lock used by the publish path. The store's single-writer publish discipline gives the required ordering guarantee.
+
+** Documentation updates
+- =SKILL.md= (Ever skill): document cursor default and the two opt-in flags.
+- =/home/ryota/.agents/skills/ace-stack/SKILL.md=: already recommends =ever hook= for coordination. Add a one-liner that the default is "future events only" and link here.
+- Release notes / =CHANGELOG=: call out the behaviour change — users who relied on replay must now pass =--from-beginning=.
+
+* Open Questions
+1. Should =ever hook add= without flags emit a one-line note like =Hook will fire on events from offset N= so the behaviour is visible?
+2. Should =ever hook list= show the registration-time starting cursor separately from the current cursor?
+3. Is there a use case where a hook added at runtime legitimately wants =--from-beginning= as the *default*? (Probably not — explicit flag is better.)
+
+* Decision Log
+** B1 design choice (round 2, 2026-04-28)
+Three options were considered for the wildcard/prefix correctness fix:
+
+1. *Per-topic cursor map on the hook* — snapshot tip per matching topic at registration; lazy-init new topics at offset 0.
+2. *Global log-offset cursor* — hook records the global log offset at registration; deliver iff =event.offset ≥ registration_offset=.
+3. *Per-topic snapshot, no laziness* — snapshot tips at registration; topics created later are silently ignored.
+
+*Chosen: Option 2.* It is the smallest, clearest fix, requires no schema change (cursor stays a single =u64=), and naturally handles both bug scenarios (low-count existing topics and topics created post-registration). Exact-topic hooks keep their topic-local skip-count semantics (which were already correct) — only prefix/wildcard hooks switch to global-offset cursors. The cursor field's interpretation is a function of the pattern shape, which is stable once the hook is registered.
+
+Option 1 was rejected as over-engineered for the problem; Option 3 was rejected because silently dropping events on later-created topics is the same class of failure we were fixing.
+
+* History
+- 2026-04-21: Draft created after hook-cursor bug was observed in live orchestration session. See event at =cli.research.done= offset 173 for the triggering case.
+- 2026-04-28: Round-2 fix (=hookfix-r2= worker). Addressed the staff-review findings against fd61e99:
+  - *B1 (blocker)*: wildcard/prefix hooks switched to a *global log-offset cursor* (Option 2 above). =TopicManager.tipForPatternLocked= now returns =log.nextOffset()= for prefix/wildcard patterns; exact-topic patterns still return =non_marker_count= (topic-local skip count). New =TopicManager.fetchPatternByOffset= reads the log directly from a global offset and filters by pattern, skipping marker/tombstone events. The hook daemon dispatches to =fetch= or =fetchPatternByOffset= based on pattern shape, and advances the cursor as =event.offset + 1= for wildcard hooks.
+  - *M1 (wording)*: replaced "atomically" wording in =SKILL.md=, this spec, and the =topic.zig= doc-comments with "under the same lock used by the publish path (single-writer discipline)" — matches what the implementation actually guarantees.
+  - *M2 (test)*: the previous wildcard test (=integration: wildcard hook tip is max across matching topics=) was tautological and acknowledged the bug as a "known caveat". Replaced with =integration: B1 wildcard hook delivers events on low-count and new topics= which exercises both B1.a (low-count existing topic) and B1.b (topic created post-registration). Verified the new test fails on =fd61e99=, then made it pass via the B1 fix.
+  - *Build wiring*: discovered =src/tests/integration.zig= was not actually run by =zig build test= (the file was authored in round 1 but never imported anywhere). Wired it up as a fourth test artifact in =build.zig= using the =ever= module. Test count: was 126/126 (without integration tests), now 141/141 (126 + 15 integration tests).
+- 2026-04-28: Polish round on round-2 commit (=hookfix-r2= worker, review =APPROVE-WITH-NITS=). No behaviour change — documentation and one micro-optimisation:
+  - =fetchPatternByOffset= over-fill branch: free the un-iterated tail of the batch and =break= instead of continuing per-event allocate-then-free; clarified the comment that the local =cursor= is intentionally not advanced past undelivered events (the daemon re-reads them next call).
+  - Added the =+ 16= chunk-size slack comment.
+  - Added a doc-comment on =Hook.cursor= explaining the polymorphic interpretation (exact → topic-local skip count; prefix/wildcard → global log offset) and pointing at the dispatch in =processHook=.
+  - Added a Persistence & reload note here making the same point at the spec level.
+  - Added a =cursor= column legend in =SKILL.md= under =ever hook list=.
+  - Marked =tipForPattern= (the unlocked variant) as =test-only= with a warning to use the locked variant from server code.
+- 2026-04-21: Shipped (=hook-fix= worker).
+  - =src/store/topic.zig=: per-topic =non_marker_count=, public =lockForHookRegistration= / =unlockForHookRegistration= / =tipForPatternLocked= / =tipForPattern=.
+  - =src/store/hooks.zig=: new =addWithCursor= with explicit initial-cursor argument; existing =add= / =addFull= preserved for compatibility (still default to 0 — only the server path changed).
+  - =src/protocol/message.zig=: =RegisterHookRequest.start_cursor: ?u64= — =null= means "server-resolve to tip".
+  - =src/net/server.zig=: tip computed while holding the TopicManager publish lock, then hook inserted with that cursor, all within one critical section.
+  - =src/net/client.zig=: new =registerHookFullNamedCursor= overload carrying =start_cursor=.
+  - =src/main.zig=: CLI flags =--from-beginning= and =--from <N>= (mutually exclusive via =conflicts=).
+  - Tests: =tipForPattern= (exact / prefix / wildcard / markers-excluded / restart), =addWithCursor=, reload preserves cursor, and five integration tests covering the Design-Details matrix, including the original =--once= bug scenario.
+  - Smoke check: =ever pub n=1=, add =--once= hook, wait (no fire), =ever pub n=2=, hook fires on n=2 only. Verified.
+  - Preserved behaviour: hooks reloaded from =hooks.json= resume at their stored cursor — only the initial-cursor path changed.

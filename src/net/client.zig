@@ -309,7 +309,15 @@ pub const Client = struct {
     }
 
     /// Register a hook with full options including optional name.
+    /// Uses server-default start cursor (= current tip).
     pub fn registerHookFullNamed(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8) !u64 {
+        return self.registerHookFullNamedCursor(pattern, command, cwd, once, env, name, null);
+    }
+
+    /// Register a hook with an explicit start cursor. `start_cursor == null`
+    /// asks the server to resolve "current tip" atomically; `0` replays all
+    /// history; any other value starts at that topic-local offset.
+    pub fn registerHookFullNamedCursor(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8, start_cursor: ?u64) !u64 {
         const req = protocol.RegisterHookRequest{
             .pattern = pattern,
             .command = command,
@@ -317,6 +325,7 @@ pub const Client = struct {
             .once = once,
             .env = env,
             .name = name,
+            .start_cursor = start_cursor,
         };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);

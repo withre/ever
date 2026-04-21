@@ -63,10 +63,23 @@ pub fn build(b: *std.Build) void {
     main_tests.root_module.addImport("ever", ever_module);
     const run_main_tests = b.addRunArtifact(main_tests);
 
+    // Integration tests — exercise TopicManager / HookTable through their
+    // public APIs without standing up TCP. Lives in src/tests/integration.zig.
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    integration_tests.root_module.addImport("ever", ever_module);
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_main_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 
     // Benchmark executable (always ReleaseFast for realistic numbers)
     const bench_exe = b.addExecutable(.{

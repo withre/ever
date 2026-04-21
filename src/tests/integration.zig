@@ -5,8 +5,9 @@
 //! `std.testing.tmpDir` for isolated data directories.
 
 const std = @import("std");
-const store = @import("../store/store.zig");
-const topic_mod = @import("../store/topic.zig");
+const ever = @import("ever");
+const store = ever.store;
+const topic_mod = ever.topic;
 const TopicManager = topic_mod.TopicManager;
 const Event = store.Event;
 
@@ -327,4 +328,221 @@ test "integration: empty topic persists across restart" {
         defer freeEvents(events);
         try testing.expectEqual(@as(usize, 0), events.len);
     }
+}
+
+// ── Hook Registration Cursor Semantics ──────────────────────────────────────
+//
+// Verifies the fix from air/v0.1/hook-registration-cursor.org: newly-registered
+// hooks observe only events published after registration, not historical ones.
+
+const HookTable = ever.hooks.HookTable;
+const freeHookSnapshot = ever.hooks.freeHookSnapshot;
+
+fn makeHookDir(suffix: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/tmp/.ever-integ-hook-{d}-{s}", .{ std.os.linux.getpid(), suffix });
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    _ = std.os.linux.mkdir(path_z.ptr, 0o755);
+    return path;
+}
+
+fn cleanupHookDir(path: []const u8) void {
+    const hj = std.fmt.allocPrint(allocator, "{s}/hooks.json", .{path}) catch return;
+    defer allocator.free(hj);
+    const hj_z = allocator.allocSentinel(u8, hj.len, 0) catch return;
+    defer allocator.free(hj_z);
+    @memcpy(hj_z[0..hj.len], hj);
+    _ = std.os.linux.unlink(hj_z.ptr);
+    const p_z = allocator.allocSentinel(u8, path.len, 0) catch return;
+    defer allocator.free(p_z);
+    @memcpy(p_z[0..path.len], path);
+    _ = std.os.linux.rmdir(p_z.ptr);
+    allocator.free(path);
+}
+
+test "integration: hook registered at tip skips pre-existing events" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.cursor");
+    _ = try tm.publish("t.cursor", null, "pre-1");
+    _ = try tm.publish("t.cursor", null, "pre-2");
+
+    // Simulate the server registration path: compute tip under the same
+    // lock used by publish, then insert the hook with that cursor.
+    const hook_dir = try makeHookDir("tip");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    tm.lockForHookRegistration();
+    const tip = tm.tipForPatternLocked("t.cursor");
+    const hook_id = try ht.addWithCursor("t.cursor", "echo", "/tmp", false, null, null, tip);
+    tm.unlockForHookRegistration();
+
+    try testing.expectEqual(@as(u64, 2), tip);
+
+    // Simulate the daemon's fetch: starting from hook.cursor, no historical
+    // events should be visible.
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    const events_before = try tm.fetch(allocator, "t.cursor", snap[0].cursor, 100);
+    defer freeEvents(events_before);
+    try testing.expectEqual(@as(usize, 0), events_before.len);
+
+    // Publish two more events — these should appear.
+    _ = try tm.publish("t.cursor", null, "post-1");
+    _ = try tm.publish("t.cursor", null, "post-2");
+
+    const events_after = try tm.fetch(allocator, "t.cursor", snap[0].cursor, 100);
+    defer freeEvents(events_after);
+    try testing.expectEqual(@as(usize, 2), events_after.len);
+    try testing.expectEqualStrings("post-1", events_after[0].value);
+    try testing.expectEqualStrings("post-2", events_after[1].value);
+    _ = hook_id;
+}
+
+test "integration: hook with from-beginning (cursor=0) replays history" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.replay");
+    _ = try tm.publish("t.replay", null, "a");
+    _ = try tm.publish("t.replay", null, "b");
+    _ = try tm.publish("t.replay", null, "c");
+
+    const hook_dir = try makeHookDir("replay");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // Explicit cursor=0 (from-beginning): historical events are visible.
+    _ = try ht.addWithCursor("t.replay", "echo", "/tmp", false, null, null, 0);
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+
+    const events = try tm.fetch(allocator, "t.replay", snap[0].cursor, 100);
+    defer freeEvents(events);
+    try testing.expectEqual(@as(usize, 3), events.len);
+}
+
+test "integration: hook with --from N starts at explicit offset" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.fromn");
+    _ = try tm.publish("t.fromn", null, "0");
+    _ = try tm.publish("t.fromn", null, "1");
+    _ = try tm.publish("t.fromn", null, "2");
+    _ = try tm.publish("t.fromn", null, "3");
+
+    const hook_dir = try makeHookDir("fromn");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    _ = try ht.addWithCursor("t.fromn", "echo", "/tmp", false, null, null, 2);
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+
+    const events = try tm.fetch(allocator, "t.fromn", snap[0].cursor, 100);
+    defer freeEvents(events);
+    // Skip first 2 real events → see "2" and "3".
+    try testing.expectEqual(@as(usize, 2), events.len);
+    try testing.expectEqualStrings("2", events[0].value);
+    try testing.expectEqualStrings("3", events[1].value);
+}
+
+test "integration: B1 wildcard hook delivers events on low-count and new topics" {
+    // Reproducer for the B1 blocker on commit fd61e99: a wildcard/prefix hook
+    // registered with a single global "tip" cursor silently drops events on
+    //   (a) topics that exist but have a non_marker_count below `tip`, and
+    //   (b) topics that don't exist yet at registration time.
+    //
+    // The fix routes wildcard hooks through `fetchPatternByOffset`, which uses
+    // a global log-offset cursor instead of a per-topic skip count.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("agent.busy");
+    try tm.createTopic("agent.quiet");
+    _ = try tm.publish("agent.busy", null, "b1");
+    _ = try tm.publish("agent.busy", null, "b2");
+    _ = try tm.publish("agent.busy", null, "b3");
+    _ = try tm.publish("agent.quiet", null, "q1");
+
+    // "Tip" semantics for a wildcard hook: only events published from now on
+    // (on any matching topic, including topics that don't exist yet) should
+    // be delivered. With the fixed semantics, this is the current global
+    // log offset.
+    const tip = tm.tipForPattern("agent.");
+
+    // (a) Publish into a low-count existing topic. Pre-fix, the global
+    // skip-count cursor (tip == 3) swallows this event because
+    // agent.quiet has only 1+1=2 non-marker events, both below 3.
+    _ = try tm.publish("agent.quiet", null, "q2-after");
+
+    // (b) A topic created AFTER registration with a future event must fire.
+    try tm.createTopic("agent.late");
+    _ = try tm.publish("agent.late", null, "late-1");
+
+    // (c) Sanity: an event on a high-count topic still fires.
+    _ = try tm.publish("agent.busy", null, "b4-after");
+
+    const events = try tm.fetchPatternByOffset(allocator, "agent.", tip, 100);
+    defer freeEvents(events);
+
+    var saw_q2 = false;
+    var saw_late = false;
+    var saw_b4 = false;
+    for (events) |e| {
+        if (std.mem.eql(u8, e.value, "q2-after")) saw_q2 = true;
+        if (std.mem.eql(u8, e.value, "late-1")) saw_late = true;
+        if (std.mem.eql(u8, e.value, "b4-after")) saw_b4 = true;
+    }
+    try testing.expect(saw_q2);
+    try testing.expect(saw_late);
+    try testing.expect(saw_b4);
+    try testing.expectEqual(@as(usize, 3), events.len);
+}
+
+test "integration: --once hook with no prior events waits for next" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t.once");
+    _ = try tm.publish("t.once", null, "stale"); // pre-existing event
+    const tip = tm.tipForPattern("t.once");
+
+    const hook_dir = try makeHookDir("once");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    _ = try ht.addWithCursor("t.once", "echo", "/tmp", true, null, null, tip);
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+
+    // Immediately after registration: no events pending for the --once hook.
+    const none = try tm.fetch(allocator, "t.once", snap[0].cursor, 10);
+    defer freeEvents(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Publish the awaited event; hook should now see exactly this one.
+    _ = try tm.publish("t.once", null, "fresh");
+    const pending = try tm.fetch(allocator, "t.once", snap[0].cursor, 10);
+    defer freeEvents(pending);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("fresh", pending[0].value);
 }

@@ -73,6 +73,8 @@ ever hook add agent.build.complete --cmd './deploy.sh'
 ever hook add agent. -- ./log-agent.sh    # prefix pattern
 ever hook add --once deploy.trigger -- ./deploy.sh
 ever hook add --name my-deploy deploy.trigger -- ./deploy.sh
+ever hook add --from-beginning agent. -- ./replay.sh     # replay all history, then follow
+ever hook add --from 100 agent.build -- ./catchup.sh     # start from explicit offset
 ever hook list                            # list all hooks
 ever hook rm 1                            # remove by ID
 ever hook rm my-deploy                    # remove by name
@@ -222,6 +224,11 @@ ever hook add agent. -- ./log-agent.sh                # prefix pattern
 # List hooks
 ever hook list
 # ID  NAME                 Pattern                  Command                        Last Offset
+# The `Last Offset` (cursor) column has two semantics depending on pattern shape:
+#   * Exact topics (e.g. `agent.done`)         → topic-local skip count: number
+#     of non-marker events on that topic already delivered to this hook.
+#   * Prefix / wildcard (e.g. `agent.`, `a.*`) → global log offset: the next
+#     log offset the hook will consider, counted across all topics.
 
 # Remove by ID or name
 ever hook rm 1
@@ -249,6 +256,14 @@ Hooks execute via fork/exec from the store's hook daemon thread. Same stdin/env 
 **`--once`**: Fires exactly once, then auto-removed. Ideal for one-time triggers.
 
 **`--name`**: Assign a human-readable name for easy reference in `hook rm`.
+
+**Cursor semantics (since 0.1).** Newly-registered hooks observe only events published **after** registration — historical events are not replayed. This is the safe default for orchestration: `ever hook add --once agent.done -- ./notify.sh` reliably catches the *next* completion, not a stale pre-existing one. The cursor is computed under the same lock used by the publish path (single-writer discipline), so no publish can slip between tip-read and hook registration.
+
+Opt in to replay explicitly:
+- `--from-beginning` — replay every historical event for the pattern, then follow.
+- `--from <N>` — start at an explicit topic-local offset (skip the first `N` non-marker events).
+
+The two flags are mutually exclusive. Hooks reloaded from disk on daemon restart resume from their stored cursor — this change only affects the *initial* cursor at `hook add` time. See `air/v0.1/hook-registration-cursor.org` for the full design.
 
 ### When to use which
 

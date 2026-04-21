@@ -125,6 +125,12 @@ pub const RegisterHookRequest = struct {
     once: bool = false,
     env: ?[]const []const u8 = null,
     name: ?[]const u8 = null,
+    /// Starting cursor for the new hook (topic-local skip count).
+    /// `null` — the default — means "current tip", resolved atomically by
+    /// the server against the TopicManager's publish lock so no event can
+    /// slip between tip-read and hook insertion. Pass `0` for a full
+    /// historical replay, or an explicit value for partial replay.
+    start_cursor: ?u64 = null,
 };
 
 pub const RegisterHookResponse = struct {

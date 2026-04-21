@@ -296,8 +296,19 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
-        const id = ht.addFull(req.pattern, req.command, req.cwd, req.once, req.env, req.name) catch
-            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook");
+        // Resolve start cursor. `null` means "current tip" — computed while
+        // holding the TopicManager's publish lock so no event can slip in
+        // between tip-read and hook insertion.
+        const id = if (req.start_cursor) |explicit|
+            ht.addWithCursor(req.pattern, req.command, req.cwd, req.once, req.env, req.name, explicit) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook")
+        else blk: {
+            self.topic_manager.lockForHookRegistration();
+            defer self.topic_manager.unlockForHookRegistration();
+            const tip = self.topic_manager.tipForPatternLocked(req.pattern);
+            break :blk ht.addWithCursor(req.pattern, req.command, req.cwd, req.once, req.env, req.name, tip) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to register hook");
+        };
 
         const resp_body = try protocol.encodeBody(self.allocator, protocol.RegisterHookResponse{ .id = id });
         defer self.allocator.free(resp_body);
