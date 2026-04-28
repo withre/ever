@@ -1,0 +1,448 @@
+#+title: Extract CLI into Standalone Package (clicraft)
+#+state: complete
+#+FILETAGS: :cli:core:
+
+* Summary
+Extract Ever's in-tree CLI (=src/cli/=, ~1 600 LOC, 5 files, =std=-only) into
+a standalone Zig package, tentatively =withre/clicraft= (fallback:
+=withre/zig-subcli=). Do a single pre-0.1.0 API-break pass while moving:
+rename =FlagDef → Flag=, =ArgDef → Arg=, =Command.run → Command.action=; add
+a typed-value layer (=ValueRef=) enabling enum options; split parsing into a
+non-exiting =App.parse= plus an exiting =App.run= wrapper; support
+concatenated short booleans. Ever then consumes the package via
+=zig fetch --save= and deletes =src/cli/=.
+
+Decision to extract (rather than adopt =sam701/zig-cli= or keep in-tree) is
+already made — see =air/v0.1/cli-decision.md= and =cli-comparison.md= in
+=/tmp/ever-orch/=. This spec scopes the work, not the debate.
+
+* Motivation
+The CLI module is already library-shaped: self-contained, =std=-only, one
+call site in =src/main.zig=, inline tests, clean module boundaries. It has
+real UX advantages over the main alternative (=sam701/zig-cli=): grouped
+root help, command aliases, =--no-X= negation, mutually-exclusive flags,
+Levenshtein "did you mean?", =fn(*Context, Allocator)= handlers instead of
+globals. Those features are load-bearing in =src/main.zig= (e.g. =timer add=
+depends on =.conflicts=).
+
+However it has library-grade debt that blocks public release:
+- Parse errors =std.process.exit(1)= from deep inside helpers — untestable,
+  unwrappable.
+- Values are =[]const u8= everywhere; handlers re-parse on every access and
+  =flagInt= prints + exits on bad input.
+- No enums, no multi-value options, no concatenated short booleans.
+- =colour.zig= uses =std.c.isatty= directly; portability is implicit.
+
+Extraction is the forcing function to fix these. Doing it once, up front,
+in a single rename/restructure PR is cheaper than shipping the current shape
+publicly and breaking it later.
+
+** Goals
+- New public package =withre/clicraft= (MIT) with =build.zig=,
+  =build.zig.zon=, README, examples, CI, tests.
+- Consumable by Ever via =zig fetch --save git+https://github.com/withre/clicraft=.
+- Public API renamed once and then frozen for the 0.1.x line:
+  =Flag=, =Arg=, =Command.action=.
+- Typed-value layer (=ValueRef=) supporting =intN=, =uN=, =fN=, =bool=,
+  =[]const u8=, =enum=, =?T=, =[]const T=.
+- Enum options with helpful error messages and =--help= rendering of members.
+- =App.parse(alloc, io, argv, envp) !Parsed= — non-exiting; returns a
+  detailed error set. =App.run(...)= is a thin wrapper that prints + exits
+  on parse error, preserving today's UX.
+- Concatenated short booleans (=-abc=) for boolean-only runs.
+- All current Ever-consumed features preserved: =.conflicts=, aliases,
+  =--no-X=, =HelpSection[]= grouping, Levenshtein suggestions,
+  command-with-subcommands-AND-action.
+- Ever migration PR that adds the dependency, updates =src/main.zig= to
+  the new names, deletes =src/cli/=, and keeps all existing Ever tests
+  and CLI UX green.
+
+** Non-Goals
+- Windows / non-POSIX portability. =std.c.isatty= stays; Windows is a
+  post-0.1.0 "Future Work" item only.
+- Typed values for positional arguments beyond what falls out trivially
+  from reusing =ValueRef= for =Arg= (if it's free, take it; otherwise
+  leave positionals as =[]const u8=).
+- Distribution via any registry other than =zig fetch --save= against the
+  git repo.
+- Source-compat shims for the old names (=FlagDef=, =ArgDef=, =Command.run=).
+  The rename is a hard break; Ever is the only known consumer.
+- Shell-completion generation (candidate for 0.2.0).
+- A second API-break pass after 0.1.0. Any further renames wait for 1.0.
+
+* Proposal
+
+** Repo layout
+=withre/clicraft=:
+#+begin_src
+clicraft/
+├── build.zig
+├── build.zig.zon
+├── flake.nix                    # optional, mirrors Ever's dev-shell style
+├── LICENCE                      # MIT (added by project lead out-of-band)
+├── README.md
+├── src/
+│   ├── root.zig                 # public re-exports (was Ever's src/cli.zig)
+│   ├── types.zig
+│   ├── parse.zig
+│   ├── validate.zig
+│   ├── help.zig
+│   ├── colour.zig
+│   └── value_ref.zig            # new
+├── examples/
+│   ├── hello/                   # one command, one flag, one positional
+│   ├── subcommands/             # nesting + aliases + --no-X
+│   └── env-and-conflicts/       # env binding + .conflicts + HelpSection
+└── .github/
+    └── workflows/
+        └── ci.yml               # Zig master + pinned stable (TODO)
+#+end_src
+
+=root.zig= re-exports =App=, =Command=, =Flag=, =Arg=, =HelpSection=,
+=HelpEntry=, =Context=, =ParseError=, =ParseResult=, =ValueRef=, =mkRef=,
+=Palette=, =ColourMode=.
+
+** Public API shape (post-rename)
+
+=examples/hello/main.zig=:
+#+begin_src zig
+const std = @import("std");
+const cli = @import("clicraft");
+
+const Config = struct {
+    name: []const u8 = "world",
+    loud: bool = false,
+};
+
+fn greet(ctx: *cli.Context, alloc: std.mem.Allocator) !void {
+    _ = alloc;
+    const cfg = ctx.bound(Config);
+    var w = ctx.io.stdout.writer;
+    if (cfg.loud) try w.print("HELLO, {s}!\n", .{cfg.name})
+    else try w.print("hello, {s}\n", .{cfg.name});
+}
+
+pub fn main(init: std.process.Init) !void {
+    var cfg = Config{};
+    const app = cli.App{
+        .name = "hello",
+        .version = "0.1.0",
+        .commands = &.{
+            .{
+                .name = "greet",
+                .flags = &.{
+                    .{ .name = "name", .short = 'n', .value = cli.mkRef(&cfg.name) },
+                    .{ .name = "loud", .short = 'l', .value = cli.mkRef(&cfg.loud) },
+                },
+                .action = greet,
+            },
+        },
+    };
+    try app.run(init);
+}
+#+end_src
+
+Two styles coexist on =Flag=:
+- =.default= + stringly access via =ctx.flag("name")= (legacy, preserved).
+- =.value = mkRef(&dest)= (new, typed). When present, the parser writes
+  directly into =dest= and =ctx.bound(T)= returns the root config struct.
+
+Handlers remain =fn(*Context, Allocator) !void=.
+
+** ValueRef design
+=ValueRef= is an opaque handle built by =cli.mkRef(&dest)=. It carries:
+#+begin_src zig
+pub const ValueRef = struct {
+    dest: *anyopaque,
+    vtable: *const VTable,
+    type_name: []const u8,   // for error messages and --help
+};
+pub const VTable = struct {
+    parse: *const fn (dest: *anyopaque, input: []const u8,
+                      alloc: std.mem.Allocator) ParseValueError!void,
+    is_bool: bool,           // affects short-concat and --no-X
+    is_multi: bool,          // slice-valued; append instead of overwrite
+    render_type: *const fn (writer: *std.Io.Writer) anyerror!void,
+};
+#+end_src
+
+=mkRef= is =comptime= — it inspects =@TypeOf(dest.*)= and emits the vtable:
+- =bool= → sets =is_bool=; accepts no value; =--no-X= toggles.
+- =intN= / =uN= → =std.fmt.parseInt=.
+- =fN= → =std.fmt.parseFloat=.
+- =[]const u8= → identity.
+- enum =E= → =std.meta.stringToEnum(E, input) orelse InvalidEnumValue=;
+  =render_type= lists members.
+- =?T= → empty string or missing means =null=; else recurse on =T=.
+- =[]const T= → =is_multi=; each occurrence parses =T= and appends
+  (allocation on the user-supplied allocator; freed by caller).
+
+Parse failures surface as:
+#+begin_src zig
+ParseError.InvalidValue{ flag: []const u8, given: []const u8,
+                         expected_type: []const u8 }
+#+end_src
+=App.parse= returns these; =App.run= formats and exits.
+
+** Non-exiting parse
+#+begin_src zig
+pub const Parsed = struct {
+    ctx: Context,
+    command_path: []const []const u8,
+    pub fn deinit(self: *Parsed, alloc: std.mem.Allocator) void;
+};
+
+pub const ParseError = error{
+    UnknownCommand, UnknownFlag, MissingRequiredFlag,
+    MissingRequiredArg, ConflictingFlags, InvalidValue,
+    NegationOfNonNegatable, UnexpectedPositional,
+} || std.mem.Allocator.Error;
+
+/// Outcome of =App.parse=. Help and version requests are *not* errors —
+/// they are legitimate non-parsing outcomes the caller usually wants to
+/// honour with exit 0. Modelling them as variants (rather than sentinel
+/// members of =ParseError=) keeps the error set semantically about
+/// failure and lets =try app.parse(...)= mean what it normally means in
+/// Zig: "unwrap on error."
+pub const ParseResult = union(enum) {
+    parsed: Parsed,
+    help: HelpRequest,        // which command path the user asked help for
+    version,
+    err: ErrorInfo,           // structured failure (see below)
+};
+
+pub const HelpRequest = struct {
+    command_path: []const []const u8,
+};
+
+pub fn parse(app: App, alloc: std.mem.Allocator, io: std.Io,
+             argv: [][:0]const u8, envp: Envp)
+    std.mem.Allocator.Error!ParseResult;
+
+pub fn run(app: App, init: std.process.Init) !void {
+    // Thin wrapper: calls parse, matches on ParseResult,
+    //   .parsed  → dispatch command_path to its .action
+    //   .help    → render help, exit 0
+    //   .version → print version, exit 0
+    //   .err     → format ErrorInfo to stderr, exit 1
+}
+#+end_src
+All =std.process.exit= calls are removed from =parse.zig=/=validate.zig=.
+The only allocation-failure path escapes through the =Allocator.Error=
+left on the outer error set; every other outcome is a value, not an
+error. Library users who want today's UX call =App.run=; users who want
+to own the flow (REPL, test harness, embedded shell) call =App.parse=
+and match the union directly.
+
+Structured error payloads (expected type, near-miss suggestion, offending
+token) live in =ErrorInfo= and are returned in =ParseResult.err= rather
+than stashed on =Context=. =Context.last_error= is removed; the parser
+is pure-ish and the result type carries everything the caller needs.
+
+** Context API
+Inside an action callback, =Context= exposes:
+#+begin_src zig
+pub const Context = struct {
+    io: std.Io,
+    envp: Envp,
+    command_path: []const []const u8,
+    // ... internal: parsed flag table, allocator, etc.
+
+    /// Stringly access to a parsed flag value, for flags declared with
+    /// =.default= rather than =.value = mkRef(...)=. Returns the raw
+    /// token as written on the command line (or the default), without
+    /// type conversion.
+    pub fn flag(self: *Context, name: []const u8) ?[]const u8;
+
+    /// Typed access to the user-supplied state struct that =mkRef=
+    /// targets were taken from. Pinned semantics:
+    ///   - =T= must be the exact type whose address was passed to
+    ///     =App.run=/=App.parse= via =App.bind(&state)= (see below).
+    ///     Mismatch is a comptime error when possible, otherwise a
+    ///     runtime =@panic= in debug and UB in release-fast — same
+    ///     contract as =@fieldParentPtr=.
+    ///   - The returned pointer aliases the caller's state; lifetime
+    ///     is the caller's. The library never frees it.
+    ///   - Safe to call zero or many times; idempotent, no allocation.
+    ///   - If =App.bind= was never called, =bound= is a comptime error.
+    pub fn bound(self: *Context, comptime T: type) *T;
+};
+#+end_src
+=App= gains a single =bind= entry point so the parser knows the address
+and type of the user state struct that =mkRef= targets came from:
+#+begin_src zig
+var cfg = Config{};
+var app = cli.App{ .name = "hello", /* ... */ };
+app.bind(&cfg);   // type-erased internally; ctx.bound(Config) recovers it
+try app.run(init);
+#+end_src
+This closes the loop the example in *Public API shape* relies on:
+=mkRef(&cfg.name)= writes into =cfg=, =app.bind(&cfg)= records the root
+pointer, and =ctx.bound(Config)= hands it back inside the action.
+Binding is optional — actions that only need stringly =ctx.flag(...)=
+access can skip it.
+
+** Enum options
+#+begin_src zig
+const LogLevel = enum { debug, info, warn, err };
+var lvl: LogLevel = .info;
+// ...
+.{ .name = "log", .value = cli.mkRef(&lvl) },
+#+end_src
+Error for =--log bogus=:
+#+begin_src
+error: invalid value "bogus" for --log
+  expected one of: debug, info, warn, err
+  (did you mean "debug"?)   # reuses existing Levenshtein
+#+end_src
+=--help= renders =--log <debug|info|warn|err>= inline with the flag.
+Enum *subcommands* are explicitly out of scope — subcommands stay as
+explicit =Command= entries.
+
+** Concatenated short booleans
+Rule: =-abc= expands to =-a -b -c= *iff every one of a, b, c is declared
+with a boolean =ValueRef= (or legacy =takes_value=false=)*. If any is
+value-taking, the whole token is rejected with:
+#+begin_src
+error: '-abc' mixes boolean and value-taking short flags
+  use '-a -b -c <value>' explicitly
+#+end_src
+Deliberately *not* zig-cli's hybrid that lets the tail be swallowed as a
+value — that rule is subtle and surprising.
+
+** Ever migration PR
+Single PR against Ever:
+1. Add dependency: =zig fetch --save git+https://github.com/withre/clicraft#v0.1.0=.
+2. =src/main.zig=: replace =@import("cli.zig")= with
+   =@import("clicraft")=; rename =FlagDef/ArgDef/.run= usages to
+   =Flag/Arg/.action=. Optionally migrate a few flags to =mkRef=-typed
+   form as smoke test; bulk migration can wait.
+3. Delete =src/cli/= and =src/cli.zig=.
+4. Remove any Ever tests that exercised =src/cli/= internals; keep
+   end-to-end tests (they go through =main=).
+5. Verify: =zig build test=, existing CLI UX tests (help output,
+   =--no-X=, =timer add= conflicts, aliases), integration suite.
+
+* Design Details
+
+** File-by-file move plan
+| Ever path                | clicraft path           | Notes |
+|--------------------------+-------------------------+-------|
+| =src/cli.zig=            | =src/root.zig=          | Promote to public entry; re-export surface. |
+| =src/cli/types.zig=      | =src/types.zig=         | Rename types (see below); add =ValueRef= field on =Flag=. |
+| =src/cli/parse.zig=      | =src/parse.zig=         | Remove all =std.process.exit=; thread errors through =ParseError=. Add short-concat. |
+| =src/cli/validate.zig=   | =src/validate.zig=      | Unchanged logic; adjust error surfacing. |
+| =src/cli/help.zig=       | =src/help.zig=          | Extend to render =ValueRef.type_name= / enum members. |
+| =src/cli/colour.zig=     | =src/colour.zig=        | Add =ColourMode= enum (=.auto=/=.always=/=.never=); keep =isatty=. |
+| —                        | =src/value_ref.zig=     | New. |
+
+** Public-API symbol renames
+| Old (Ever)              | New (clicraft)        |
+|-------------------------+-----------------------|
+| =FlagDef=               | =Flag=                |
+| =ArgDef=                | =Arg=                 |
+| =Command.run=           | =Command.action=      |
+| =HelpEntry=, =HelpSection= | unchanged          |
+| =App=, =Command=, =Context=, =ParseError= | unchanged (semantics change for =ParseError=) |
+
+=Flag= gains:
+- =value: ?ValueRef = null= — when set, parser writes typed value.
+- =default=, =env=, =negatable=, =conflicts=, =short=, =description=,
+  =required= unchanged.
+
+** Test strategy
+- *Unit tests inline per module* (existing Ever pattern preserved).
+- *End-to-end tests in =src/tests.zig=* that:
+  - Build small =App= literals.
+  - Call =App.parse= directly (now possible — no exit).
+  - Assert =Parsed.command_path= and =ctx= contents (both stringly and
+    =mkRef=-bound).
+  - Assert every =ParseError= variant on crafted bad inputs (unknown
+    flag, conflicting pair, enum mis-value, short-concat with
+    value-taking flag, =--no-X= on non-negatable, missing required).
+- *Help snapshot tests* via =std.testing.expectEqualStrings= on captured
+  writer output (plain mode, =ColourMode.never=).
+- *Examples double as integration tests*: =zig build test-examples=
+  runs each example with canned argv and checks exit status + stdout.
+
+** CI matrix
+GitHub Actions (=.github/workflows/ci.yml=):
+- =zig-version: [master, <pinned-stable>]= — TODO: set
+  =<pinned-stable>= to whatever Ever pins (see Open Questions). Until
+  then, master-only is acceptable.
+- Jobs: =zig build test=, =zig build test-examples=, =zig fmt --check=.
+- Ubuntu only for 0.1.0 (POSIX-first).
+
+** build.zig.zon shape
+#+begin_src zig
+.{
+    .name = .clicraft,
+    .version = "0.1.0",
+    .fingerprint = 0x0,   // populated on first `zig build`
+    .minimum_zig_version = "0.15.0",  // TODO: align with Ever's pin
+    .paths = .{ "build.zig", "build.zig.zon", "src", "examples",
+                "README.md", "LICENCE" },
+    .dependencies = .{},
+}
+#+end_src
+
+=build.zig= exposes a =clicraft= module, a =test= step aggregating unit
++ e2e + example tests, and per-example =run-<name>= steps.
+
+** Versioning policy
+- 0.x while unstable. No API breaks inside a 0.1.z patch line.
+- Additive features (new flag options, new =ValueRef= target types,
+  completion generation) → minor bump (0.2.0, 0.3.0).
+- Any renaming, signature change, or behaviour change → major 0.→1.0
+  transition; no second break inside 0.x.
+- Ever's =build.zig.zon= pins an exact tag; bumps are deliberate.
+
+** Future Work (out of 0.1.0)
+- Windows support: replace =std.c.isatty= with a portable probe; audit
+  envp handling for Windows (accept =std.process.EnvMap= alongside raw
+  envp).
+- Shell-completion generator (bash/zsh/fish) — 0.2.0 candidate.
+- Config-file overlay (=--config foo.zon=) — speculative.
+- Typed positional arguments beyond the trivial case.
+
+* Open Questions
+1. *Pinned stable Zig version* for the CI matrix. Blocked on Ever
+   itself pinning a stable release; clicraft should track Ever's choice.
+   Until then: master-only CI is acceptable.
+2. *Completion-script generator*: include a stub in 0.1.0 to reserve
+   the =completions= subcommand namespace, or defer entirely to 0.2.0?
+   Leaning defer; flag if product UX work disagrees.
+3. *Error-info payload shape*: expose =Context.last_error: ?ErrorInfo=
+   as a public struct, or keep it private and only render through
+   =App.run='s formatter? Affects how test code inspects parse errors.
+   Tentatively public; revisit during implementation.
+
+* History
+- 2026-04-21: Draft written by cli-brief agent after project-lead sign-off
+  on =cli-comparison.md= research and =cli-decision.md= recommendation.
+- 2026-04-21: Restored verbatim after filesystem snapshot rollback (12:00–12:45 window) wiped the original file. Content identical to the draft cli-brief produced; no re-review needed.
+- 2026-04-28: Pre-=ready= amendments by cli-spec-fix agent.
+  - Amendment A (=ctx.bound(T)=): chose *A1* — added a new "Context API"
+    subsection under Design Details that pins =ctx.bound(T)='s signature,
+    semantics, lifetime, and error behaviour, and introduces the matching
+    =App.bind(&state)= entry point. Reasoning: =ctx.bound= is a real,
+    load-bearing piece of the typed-state design (it pairs with =mkRef=
+    to give actions typed access to user config); rewriting the example
+    around an ad-hoc captured pointer would have hidden the design and
+    pushed the same problem onto every consumer. Pinning it once is the
+    smaller, more honest change.
+  - Amendment B (Help/Version signalling): chose *B2* — replaced the
+    =HelpRequested=/=VersionRequested= sentinel members of =ParseError=
+    with a =ParseResult = union(enum) { parsed, help, version, err }=
+    and updated =App.parse='s signature to
+    =Allocator.Error!ParseResult=. Reasoning: idiomatic Zig 0.13+
+    reserves the error channel for actual failures; =--help= succeeding
+    is not a failure, and =try app.parse(...)= should not have to
+    special-case sentinel "errors" that mean "the user got what they
+    asked for." The union also gives a natural home for the structured
+    =ErrorInfo= payload, replacing the previous =Context.last_error=
+    side-channel. =App.run= absorbs the extra match arms, so the
+    end-user UX is unchanged.
+  - Document state line left at =draft=; supervisor will flip to
+    =ready= after diff review.
+- 2026-05-27: Migrated Ever to consume the published =zig-cli-kit= dependency: wired the package through =build.zig=, updated =src/main.zig= for the new handler and =App.run= signatures, removed the in-tree CLI copy, and verified =zig build= / =zig build test= / CLI smoke commands.

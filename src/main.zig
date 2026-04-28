@@ -1,6 +1,6 @@
 const std = @import("std");
 const ever = @import("ever");
-const cli = @import("cli.zig");
+const cli = @import("zig-cli-kit");
 const readline = @import("readline.zig");
 
 const Io = std.Io;
@@ -32,7 +32,7 @@ fn connectToStore(allocator: std.mem.Allocator, io: std.Io, addr: []const u8, po
     };
 }
 
-fn handlePub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handlePub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const topic = ctx.arg("topic");
@@ -57,7 +57,7 @@ fn handlePub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
 }
 
-fn handleSub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
@@ -66,8 +66,8 @@ fn handleSub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
         std.process.exit(1);
     }
 
-    const from_offset = ctx.flagInt(u64, "from");
-    const max_count = ctx.flagInt(u32, "max");
+    const from_offset = try ctx.flagInt(u64, "from");
+    const max_count = try ctx.flagInt(u32, "max");
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
 
@@ -127,7 +127,7 @@ fn handleSub(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleWait(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const topic_name = ctx.arg("topic");
@@ -136,9 +136,9 @@ fn handleWait(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
         std.process.exit(1);
     }
 
-    const count = ctx.flagInt(u32, "count");
-    const timeout_secs = ctx.flagInt(u32, "timeout");
-    const from_offset = ctx.flagInt(u64, "from");
+    const count = try ctx.flagInt(u32, "count");
+    const timeout_secs = try ctx.flagInt(u32, "timeout");
+    const from_offset = try ctx.flagInt(u64, "from");
     const json_values = ctx.flagBool("json-values");
 
     const addr_info = parseStoreAddress(ctx);
@@ -178,7 +178,7 @@ fn handleWait(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleOn(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const envp = ctx.envp;
 
@@ -314,7 +314,7 @@ fn handleOn(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleTopicCreate(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTopicCreate(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -333,7 +333,7 @@ fn handleTopicCreate(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     std.debug.print("Created topic: {s}\n", .{name});
 }
 
-fn handleTopicList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTopicList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -350,7 +350,7 @@ fn handleTopicList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
 }
 
-fn handleTopicDelete(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTopicDelete(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -369,7 +369,7 @@ fn handleTopicDelete(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     std.debug.print("Deleted topic: {s}\n", .{name});
 }
 
-fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
@@ -442,7 +442,7 @@ fn handleHookAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleHookList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -476,7 +476,7 @@ fn handleHookList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleHookPs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -508,7 +508,7 @@ fn handleHookPs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleHookLogs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const id_str = ctx.arg("id");
 
@@ -540,7 +540,7 @@ fn handleHookLogs(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleHookRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const id_or_name = ctx.arg("id");
 
@@ -594,7 +594,7 @@ fn handleHookRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleTimerAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTimerAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const name_arg = ctx.arg("name");
     const name_flag = ctx.flag("name");
@@ -694,7 +694,7 @@ fn handleTimerAdd(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleTimerList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTimerList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     const addr_info = parseStoreAddress(ctx);
@@ -721,7 +721,7 @@ fn handleTimerList(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleTimerRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTimerRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -740,7 +740,7 @@ fn handleTimerRm(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     std.debug.print("Timer '{s}' removed.\n", .{name});
 }
 
-fn handleTimerInfo(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTimerInfo(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const name = ctx.arg("name");
 
@@ -778,7 +778,7 @@ fn handleTimerInfo(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
 }
 
-fn handleTimerNew(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     // Prompt: Timer name
@@ -880,7 +880,7 @@ fn handleTimerNew(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn handleHookNew(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleHookNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
 
     // Prompt: Topic pattern
@@ -943,13 +943,13 @@ fn readLine(allocator: std.mem.Allocator) ![]u8 {
     return readline.readLine(allocator);
 }
 
-fn handleStart(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleStart(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const io = ctx.io;
     const envp = ctx.envp;
     try startServer(allocator, io, ctx, envp);
 }
 
-fn handleStatus(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
+fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 
     const data_dir = ctx.flag("data-dir");
     const json_output = ctx.flagBool("json");
@@ -1483,7 +1483,22 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const env_block = init.minimal.environ.block.slice.ptr;
-    app.run(allocator, io, args_list.items, env_block) catch |err| switch (err) {
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+    defer stdout.interface.flush() catch {};
+    defer stderr.interface.flush() catch {};
+
+    app.run(
+        allocator,
+        io,
+        &stdout.interface,
+        &stderr.interface,
+        env_block,
+        args_list.items,
+    ) catch |err| switch (err) {
         error.UnsupportedVersion => {
             std.debug.print("error: protocol version mismatch (is the server an Ever store?)\n", .{});
             std.process.exit(1);

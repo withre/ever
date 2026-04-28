@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .fingerprint = 0xdb41433d9d4ef7d3,
 
-    .dependencies = .{},
+    .dependencies = .{
+        .zig_cli_kit = .{
+            .url = "git+https://github.com/withre/zig-cli-kit.git#f9def36ebaf7742a6bafe4138a811322099326b6",
+            .hash = "zig_cli_kit-0.1.0-oM7g3lgnAgAXGQvWuOvyLUdQG8PfMmQ5_3Apb5AY6f6l",
+        },
+    },
 
     .paths = .{
         "build.zig",
