@@ -17,9 +17,64 @@ const allocator = testing.allocator;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+fn runServerForTest(server: *ever.net.Server) void {
+    server.run() catch {};
+}
+
 fn freeEvents(events: []Event) void {
     for (events) |e| store.freeEvent(allocator, e);
     allocator.free(events);
+}
+
+// ── Status Server Probe ─────────────────────────────────────────────────────
+
+test "integration: status server probe flips true then false" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+    const port: u16 = 30000 + pid_part;
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+
+    var reachable = false;
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+            reachable = true;
+            break;
+        }
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    try testing.expect(reachable);
+
+    var status = ever.status.StoreStatus{
+        .data_dir = ".",
+        .server = .{ .address = "127.0.0.1", .port = port, .reachable = reachable },
+        .segments = 0,
+        .total_bytes = 0,
+        .total_events = 0,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = false,
+    };
+    const json_running = try ever.status.formatJson(&status, allocator);
+    defer allocator.free(json_running);
+    try testing.expect(std.mem.indexOf(u8, json_running, "\"reachable\": true") != null);
+    try testing.expect(std.mem.indexOf(u8, json_running, "\"lock_held\": false") != null);
+
+    server.shutdown_requested.store(true, .release);
+    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
+    thread.join();
+    server.shutdown();
+
+    const after_shutdown = ever.status.probeServer(io, "127.0.0.1", port, 50);
+    try testing.expect(!after_shutdown);
 }
 
 // ── Basic Publish-Subscribe ─────────────────────────────────────────────────

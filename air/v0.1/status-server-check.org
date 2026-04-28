@@ -1,0 +1,196 @@
+#+title: Status Reports Whether Server Is Running
+#+state: complete
+#+FILETAGS: :cli:store:
+
+* Summary
+Extend =ever status= so its output answers "is an Ever server running?" by
+probing the configured network endpoint (=--address= / =--port= /
+=EVER_HOST= / =EVER_PORT=), in addition to the existing data-dir lock
+inspection. Both human-readable and =--json= output gain a new =Server=
+section.
+
+* Motivation
+=ever status= already inspects the data directory and prints
+=Lock: not held= / =Lock: held (server running)=. But the lock check is
+*data-directory local*: if a server is running against a different
+=--data-dir=, the local lockfile is stale and =ever status= happily
+reports "not held" even though =ever pub= / =ever sub= succeed against
+the running daemon on =127.0.0.1:7890=.
+
+That's confusing. The most common question a user asks =ever status= is
+"is the thing I would talk to with =ever pub= alive?" — i.e. is the
+configured =address:port= reachable. Today the command can't answer
+that. This spec makes it the headline signal.
+
+** Goals
+- =ever status= prints a =Server= line reporting whether the configured
+  endpoint accepts a TCP connection, e.g. =Server: running at
+  127.0.0.1:7890= or =Server: not reachable at 127.0.0.1:7890=.
+- =ever status --json= gains a =server= object: ={ "address": "...",
+  "port": N, "reachable": bool }=.
+- The probe respects the same =--address= / =--port= / =EVER_HOST= /
+  =EVER_PORT= resolution as the rest of the CLI (already wired through
+  =global_flags= in =src/main.zig=).
+- Probe is fast and bounded: short connect timeout (≤ 500 ms), no
+  protocol handshake required — TCP connect success is enough.
+- Keeps the existing =Lock:= line and =lock_held= JSON field unchanged
+  (they answer a different, narrower question: "is *this* data dir
+  locked by a server").
+
+** Non-Goals
+- Protocol-level health check (sending a PING / version handshake).
+  TCP connect is the v0.1 signal; deeper probes can come later.
+- HTTP-endpoint probe. The TCP store port is the canonical "is the
+  server up" signal; HTTP is a sidecar.
+- Reporting *which* data dir the reachable server is using. The server
+  doesn't expose that today; out of scope.
+- Changing exit codes based on reachability. =ever status= keeps exit 0
+  on success; scripts can read the JSON.
+
+* Proposal
+
+** Human-readable output (new line bolded for clarity)
+#+begin_src
+Ever Store: ./data
+══════════════════════════════════════
+
+  Server: running at 127.0.0.1:7890
+
+  Log
+    Segments:    3
+    Total size:  12.4 MB
+    Events:      48,291
+
+  Topics (5)
+    ...
+
+  Hooks (2)
+    ...
+
+  Lock: not held
+#+end_src
+
+When the endpoint refuses connection / times out:
+#+begin_src
+  Server: not reachable at 127.0.0.1:7890
+#+end_src
+
+The =Server= line goes *first* in the body (above =Log=) because it
+answers the most common question. =Lock= stays where it is.
+
+** JSON output (additive)
+#+begin_src json
+{
+  "data_dir": "./data",
+  "server": {
+    "address": "127.0.0.1",
+    "port": 7890,
+    "reachable": true
+  },
+  "log": { ... },
+  "topics": [ ... ],
+  "hooks": [ ... ],
+  "lock_held": false
+}
+#+end_src
+
+The =server= object is inserted between =data_dir= and =log=. Existing
+fields are untouched so consumers of =lock_held= don't break.
+
+* Design Details
+
+** Where the probe lives
+Add =fn probeServer(io: Io, address: []const u8, port: u16,
+timeout_ms: u32) bool= in =src/store/status.zig= (or a new
+=src/store/probe.zig= if status.zig gets cluttered). It opens a TCP
+connection with a bounded timeout and returns =true= iff connect
+succeeds. No bytes are sent or read.
+
+Implementation sketch using existing networking primitives — pattern
+after =ever.client.Client.connect= in =src/main.zig= line ~29, but
+with a short connect timeout. If =std.net=' s default connect already
+fails fast on =ECONNREFUSED= (the local case), no extra timeout work
+is needed; only the non-local / firewalled case needs the timer. A
+500 ms cap is fine.
+
+** Where the call lives
+=handleStatus= in =src/main.zig= (around line 984) already has access
+to =ctx.flag("address")= and =ctx.flag("port")= via the inherited
+=global_flags=. Extend the call to =ever.status.getStatus= (or wrap
+its result) to attach =ServerProbe= info before printing.
+
+Suggested shape:
+#+begin_src zig
+pub const ServerProbe = struct {
+    address: []const u8,
+    port: u16,
+    reachable: bool,
+};
+
+pub const StoreStatus = struct {
+    // existing fields...
+    server: ?ServerProbe = null,   // optional: nil means "didn't probe"
+};
+#+end_src
+
+=handleStatus= populates =server= after =getStatus= returns. Keeping it
+optional preserves the existing test for =getStatus= without forcing it
+to probe network in unit tests.
+
+** Printing
+- =printHuman= prints the =Server= block iff =status.server != null=,
+  before the =Log= block. Use the existing colour helpers for the
+  "running"/"not reachable" word so it pops in interactive output.
+- =printJson= emits the =server= object iff present. Match the existing
+  hand-rolled JSON style in the file (no need to switch to
+  =std.json.stringify=).
+
+** Tests
+- Add a unit test that constructs a =StoreStatus= with =server = .{
+  .reachable = true }= and asserts both =printHuman= and =printJson=
+  include the expected line / field. Use the existing
+  =std.testing.expectEqualStrings= snapshot pattern in status.zig.
+- Integration test (under =src/tests/=): start a real server in a temp
+  dir on an ephemeral port, run =ever status --json= against it, assert
+  =server.reachable == true= and =server.port == <ephemeral>=. Then
+  kill it, run again, assert =reachable == false=. Follow the existing
+  integration-test scaffold (=src/tests/integration.zig=).
+- =checkLockHeld= behaviour and =lock_held= field stay unchanged — add
+  a regression assertion that both fields appear in the same JSON
+  output to lock in the contract.
+
+** Out-of-scope behaviours to explicitly avoid
+- Do not block =ever status= for more than ~500 ms total on the probe.
+  A misconfigured =EVER_HOST= pointing at a remote host that drops
+  packets should still let the command return quickly.
+- Do not retry. One attempt, one verdict.
+- Do not resolve =--address= to multiple A records and probe each;
+  =std.net='s first-address-wins is fine.
+
+* Open Questions
+1. Should =Server: not reachable= be coloured red, or stay neutral?
+   Existing =colour.zig= has the helpers; lean toward red for the
+   negative case to match how shell users read =status= commands at a
+   glance. Defer to the implementing agent's taste; this is reversible.
+2. Should =--json= without server probe (e.g. =--no-probe=) be a flag?
+   Probably not for v0.1 — the probe is cheap and the data is the
+   point. Add only if integration tests show flakiness.
+
+* History
+- 2026-05-27: Implemented. Added =ServerProbe= struct and =probeServer=
+  helper in =src/store/status.zig= (bounded 500 ms non-blocking TCP
+  connect via =std.os.linux= syscalls; defaults to false on parse or
+  socket errors). =handleStatus= in =src/main.zig= now populates
+  =status.server= from =parseStoreAddress(ctx)= before printing.
+  =formatHuman= prints the =Server= block above =Log=; =formatJson=
+  emits a =server= object between =data_dir= and =log=. Existing
+  =lock_held= contract is unchanged. Unit tests in =status.zig=
+  snapshot the new line and JSON shape; an integration test in
+  =src/tests/integration.zig= flips reachability true → false against
+  a real server thread. =zig build test= passes; binary smoke-tested
+  showing =Server: running at 127.0.0.1:17890= → =Server: not
+  reachable …= after kill.
+- 2026-05-14: Drafted by supervisor after user noted =ever status=
+  reports =Lock: not held= even while a daemon is running against a
+  different data dir. State set to =ready= for a single implementing
+  agent to pick up.

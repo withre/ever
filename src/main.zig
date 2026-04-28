@@ -986,10 +986,17 @@ fn handleStatus(ctx: *cli.Context, allocator: std.mem.Allocator) !void {
     };
     defer store_status.deinit(allocator);
 
+    const addr_info = parseStoreAddress(ctx);
+    store_status.server = .{
+        .address = addr_info.address,
+        .port = addr_info.port,
+        .reachable = ever.status.probeServer(ctx.io, addr_info.address, addr_info.port, 500),
+    };
+
     if (json_output) {
         ever.status.printJson(&store_status, allocator);
     } else {
-        ever.status.printHuman(&store_status);
+        ever.status.printHuman(&store_status, allocator);
     }
 }
 

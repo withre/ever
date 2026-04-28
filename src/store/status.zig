@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
+const net = Io.net;
 const Event = @import("store.zig").Event;
 
 pub const TopicInfo = struct {
@@ -23,8 +24,15 @@ pub const HookInfo = struct {
     cursor: u64,
 };
 
+pub const ServerProbe = struct {
+    address: []const u8,
+    port: u16,
+    reachable: bool,
+};
+
 pub const StoreStatus = struct {
     data_dir: []const u8,
+    server: ?ServerProbe = null,
     segments: u64,
     total_bytes: u64,
     total_events: u64,
@@ -42,6 +50,46 @@ pub const StoreStatus = struct {
         alloc.free(self.hooks);
     }
 };
+
+/// Probe whether the configured TCP server endpoint accepts a connection.
+pub fn probeServer(io_: Io, address: []const u8, port: u16, timeout_ms: u32) bool {
+    _ = io_; // Raw linux syscalls are used so the timeout is bounded on all Io backends.
+    const ip4 = net.Ip4Address.parse(address, port) catch return false;
+
+    const fd_raw = std.os.linux.socket(2, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.NONBLOCK | std.os.linux.SOCK.CLOEXEC, 0);
+    if (std.os.linux.errno(fd_raw) != .SUCCESS) return false;
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = std.os.linux.close(fd);
+
+    var addr: [16]u8 = undefined;
+    @memset(&addr, 0);
+    addr[0] = 2; // AF_INET
+    addr[1] = 0;
+    addr[2] = @intCast(port >> 8);
+    addr[3] = @intCast(port & 0xFF);
+    addr[4] = ip4.bytes[0];
+    addr[5] = ip4.bytes[1];
+    addr[6] = ip4.bytes[2];
+    addr[7] = ip4.bytes[3];
+
+    const rc = std.os.linux.connect(fd, @ptrCast(&addr), addr.len);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => return true,
+        .INPROGRESS, .AGAIN, .ALREADY => {},
+        else => return false,
+    }
+
+    var pfds = [_]std.os.linux.pollfd{.{ .fd = fd, .events = std.os.linux.POLL.OUT, .revents = 0 }};
+    const poll_rc = std.os.linux.poll(&pfds, 1, @intCast(@min(timeout_ms, 500)));
+    if (std.os.linux.errno(poll_rc) != .SUCCESS or poll_rc == 0) return false;
+    if ((pfds[0].revents & (std.os.linux.POLL.OUT | std.os.linux.POLL.ERR | std.os.linux.POLL.HUP)) == 0) return false;
+
+    var so_error: i32 = 0;
+    var opt_len: std.os.linux.socklen_t = @sizeOf(i32);
+    const opt_rc = std.os.linux.getsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.ERROR, @ptrCast(&so_error), &opt_len);
+    if (std.os.linux.errno(opt_rc) != .SUCCESS) return false;
+    return so_error == 0;
+}
 
 /// Scan a data directory and return store status.
 pub fn getStatus(alloc: Allocator, io_: Io, data_dir_path: []const u8) !StoreStatus {
@@ -364,34 +412,39 @@ fn formatNumber(buf: []u8, n: u64) []const u8 {
     return buf[0..pos];
 }
 
-/// Print human-readable store status to stderr.
-pub fn printHuman(status: *const StoreStatus) void {
+/// Format human-readable store status. Caller owns returned memory.
+pub fn formatHuman(alloc: Allocator, status: *const StoreStatus) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
     var size_buf: [32]u8 = undefined;
     var num_buf: [32]u8 = undefined;
 
-    std.debug.print("\nEver Store: {s}\n", .{status.data_dir});
-    std.debug.print("══════════════════════════════════════\n\n", .{});
+    try out.appendSlice(alloc, "\n");
+    appendFmt(&out, alloc, "Ever Store: {s}\n", .{status.data_dir});
+    try out.appendSlice(alloc, "══════════════════════════════════════\n\n");
 
-    std.debug.print("  Log\n", .{});
-    std.debug.print("    Segments:    {d}\n", .{status.segments});
-    std.debug.print("    Total size:  {s}\n", .{formatSize(&size_buf, status.total_bytes)});
-    std.debug.print("    Events:      {s}\n", .{formatNumber(&num_buf, status.total_events)});
+    if (status.server) |server| {
+        const state: []const u8 = if (server.reachable) "running" else "not reachable";
+        appendFmt(&out, alloc, "  Server: {s} at {s}:{d}\n\n", .{ state, server.address, server.port });
+    }
 
-    std.debug.print("\n  Topics ({d})\n", .{status.topics.len});
+    try out.appendSlice(alloc, "  Log\n");
+    appendFmt(&out, alloc, "    Segments:    {d}\n", .{status.segments});
+    appendFmt(&out, alloc, "    Total size:  {s}\n", .{formatSize(&size_buf, status.total_bytes)});
+    appendFmt(&out, alloc, "    Events:      {s}\n", .{formatNumber(&num_buf, status.total_events)});
+
+    appendFmt(&out, alloc, "\n  Topics ({d})\n", .{status.topics.len});
     if (status.topics.len == 0) {
-        std.debug.print("    (none)\n", .{});
+        try out.appendSlice(alloc, "    (none)\n");
     } else {
-        // First pass: find max topic name width (including marker)
         var max_name_w: usize = 0;
         for (status.topics) |t| {
-            const w = t.name.len + if (t.deleted) @as(usize, 10) else @as(usize, 0); // " (deleted)" = 10
+            const w = t.name.len + if (t.deleted) @as(usize, 10) else @as(usize, 0);
             if (w > max_name_w) max_name_w = w;
         }
-        // Ensure minimum column width and add padding
         if (max_name_w < 20) max_name_w = 20;
-        max_name_w += 2; // extra spacing before count
+        max_name_w += 2;
 
-        // Second pass: print with alignment
         for (status.topics) |t| {
             var evt_buf: [32]u8 = undefined;
             const evt_str = formatNumber(&evt_buf, t.events);
@@ -399,19 +452,16 @@ pub fn printHuman(status: *const StoreStatus) void {
             const name_w = t.name.len + marker.len;
             const padding = if (max_name_w > name_w) max_name_w - name_w else 0;
             const suffix: []const u8 = if (t.events == 1) " event" else " events";
-            // Print: indent + name + marker + padding + right-aligned count + suffix
-            std.debug.print("    {s}{s}", .{ t.name, marker });
-            var i: usize = 0;
-            while (i < padding) : (i += 1) std.debug.print(" ", .{});
-            std.debug.print("{s:>6}{s}\n", .{ evt_str, suffix });
+            appendFmt(&out, alloc, "    {s}{s}", .{ t.name, marker });
+            try out.appendNTimes(alloc, ' ', padding);
+            appendFmt(&out, alloc, "{s:>6}{s}\n", .{ evt_str, suffix });
         }
     }
 
-    std.debug.print("\n  Hooks ({d})\n", .{status.hooks.len});
+    appendFmt(&out, alloc, "\n  Hooks ({d})\n", .{status.hooks.len});
     if (status.hooks.len == 0) {
-        std.debug.print("    (none)\n", .{});
+        try out.appendSlice(alloc, "    (none)\n");
     } else {
-        // First pass: find max widths for pattern and command columns
         var max_pat_w: usize = 0;
         var max_cmd_w: usize = 0;
         for (status.hooks) |h| {
@@ -423,83 +473,86 @@ pub fn printHuman(status: *const StoreStatus) void {
         max_pat_w += 2;
         max_cmd_w += 2;
 
-        // Second pass: print with alignment
         for (status.hooks) |h| {
             var cursor_buf: [32]u8 = undefined;
             const cursor_str = formatNumber(&cursor_buf, h.cursor);
-            // Print id
-            std.debug.print("    #{d:<3} {s}", .{ h.id, h.pattern });
-            // Pad pattern
-            var p: usize = h.pattern.len;
-            while (p < max_pat_w) : (p += 1) std.debug.print(" ", .{});
-            std.debug.print("→ {s}", .{h.command});
-            // Pad command
-            var c: usize = h.command.len;
-            while (c < max_cmd_w) : (c += 1) std.debug.print(" ", .{});
-            std.debug.print("cursor: {s}\n", .{cursor_str});
+            appendFmt(&out, alloc, "    #{d:<3} {s}", .{ h.id, h.pattern });
+            try out.appendNTimes(alloc, ' ', max_pat_w - h.pattern.len);
+            appendFmt(&out, alloc, "→ {s}", .{h.command});
+            try out.appendNTimes(alloc, ' ', max_cmd_w - h.command.len);
+            appendFmt(&out, alloc, "cursor: {s}\n", .{cursor_str});
         }
     }
 
     if (status.lock_held) {
-        std.debug.print("\n  Lock: held (server running)\n\n", .{});
+        try out.appendSlice(alloc, "\n  Lock: held (server running)\n\n");
     } else {
-        std.debug.print("\n  Lock: not held\n\n", .{});
+        try out.appendSlice(alloc, "\n  Lock: not held\n\n");
     }
+    return out.toOwnedSlice(alloc);
 }
 
-/// Print JSON store status to stderr.
-pub fn printJson(status: *const StoreStatus, alloc: Allocator) void {
-    var json: std.ArrayList(u8) = .empty;
-    defer json.deinit(alloc);
+/// Print human-readable store status to stderr.
+pub fn printHuman(status: *const StoreStatus, alloc: Allocator) void {
+    const text = formatHuman(alloc, status) catch return;
+    defer alloc.free(text);
+    std.debug.print("{s}", .{text});
+}
 
-    json.appendSlice(alloc, "{\n  \"data_dir\": \"") catch return;
-    json.appendSlice(alloc, status.data_dir) catch return;
-    json.appendSlice(alloc, "\",\n  \"log\": {\n") catch return;
+/// Format JSON store status. Caller owns returned memory.
+pub fn formatJson(status: *const StoreStatus, alloc: Allocator) ![]u8 {
+    var json: std.ArrayList(u8) = .empty;
+    errdefer json.deinit(alloc);
+
+    try json.appendSlice(alloc, "{\n  \"data_dir\": \"");
+    try json.appendSlice(alloc, status.data_dir);
+    try json.appendSlice(alloc, "\"");
+    if (status.server) |server| {
+        try json.appendSlice(alloc, ",\n  \"server\": {\n");
+        try json.appendSlice(alloc, "    \"address\": \"");
+        try json.appendSlice(alloc, server.address);
+        appendFmt(&json, alloc, "\",\n    \"port\": {d},\n", .{server.port});
+        appendFmt(&json, alloc, "    \"reachable\": {s}\n", .{if (server.reachable) "true" else "false"});
+        try json.appendSlice(alloc, "  }");
+    }
+    try json.appendSlice(alloc, ",\n  \"log\": {\n");
 
     appendFmt(&json, alloc, "    \"segments\": {d},\n", .{status.segments});
     appendFmt(&json, alloc, "    \"total_bytes\": {d},\n", .{status.total_bytes});
     appendFmt(&json, alloc, "    \"total_events\": {d}\n", .{status.total_events});
-    json.appendSlice(alloc, "  },\n  \"topics\": [\n") catch return;
+    try json.appendSlice(alloc, "  },\n  \"topics\": [\n");
 
     for (status.topics, 0..) |t, i| {
-        json.appendSlice(alloc, "    {\"name\": \"") catch return;
-        json.appendSlice(alloc, t.name) catch return;
+        try json.appendSlice(alloc, "    {\"name\": \"");
+        try json.appendSlice(alloc, t.name);
         appendFmt(&json, alloc, "\", \"events\": {d}", .{t.events});
-        if (t.deleted) {
-            json.appendSlice(alloc, ", \"deleted\": true") catch return;
-        }
-        json.appendSlice(alloc, "}") catch return;
-        if (i + 1 < status.topics.len) {
-            json.appendSlice(alloc, ",\n") catch return;
-        } else {
-            json.appendSlice(alloc, "\n") catch return;
-        }
+        if (t.deleted) try json.appendSlice(alloc, ", \"deleted\": true");
+        try json.appendSlice(alloc, "}");
+        try json.appendSlice(alloc, if (i + 1 < status.topics.len) ",\n" else "\n");
     }
 
-    json.appendSlice(alloc, "  ],\n  \"hooks\": [\n") catch return;
+    try json.appendSlice(alloc, "  ],\n  \"hooks\": [\n");
 
     for (status.hooks, 0..) |h, i| {
         appendFmt(&json, alloc, "    {{\"id\": {d}, \"pattern\": \"", .{h.id});
-        json.appendSlice(alloc, h.pattern) catch return;
-        json.appendSlice(alloc, "\", \"command\": \"") catch return;
+        try json.appendSlice(alloc, h.pattern);
+        try json.appendSlice(alloc, "\", \"command\": \"");
         appendJsonEscaped(&json, alloc, h.command);
         appendFmt(&json, alloc, "\", \"cursor\": {d}}}", .{h.cursor});
-        if (i + 1 < status.hooks.len) {
-            json.appendSlice(alloc, ",\n") catch return;
-        } else {
-            json.appendSlice(alloc, "\n") catch return;
-        }
+        try json.appendSlice(alloc, if (i + 1 < status.hooks.len) ",\n" else "\n");
     }
 
-    json.appendSlice(alloc, "  ],\n") catch return;
-    if (status.lock_held) {
-        json.appendSlice(alloc, "  \"lock_held\": true\n") catch return;
-    } else {
-        json.appendSlice(alloc, "  \"lock_held\": false\n") catch return;
-    }
-    json.appendSlice(alloc, "}\n") catch return;
+    try json.appendSlice(alloc, "  ],\n");
+    try json.appendSlice(alloc, if (status.lock_held) "  \"lock_held\": true\n" else "  \"lock_held\": false\n");
+    try json.appendSlice(alloc, "}\n");
+    return json.toOwnedSlice(alloc);
+}
 
-    std.debug.print("{s}", .{json.items});
+/// Print JSON store status to stderr.
+pub fn printJson(status: *const StoreStatus, alloc: Allocator) void {
+    const json = formatJson(status, alloc) catch return;
+    defer alloc.free(json);
+    std.debug.print("{s}", .{json});
 }
 
 fn appendFmt(json: *std.ArrayList(u8), alloc: Allocator, comptime fmt: []const u8, args: anytype) void {
@@ -537,6 +590,45 @@ test "formatSize" {
     try std.testing.expectEqualStrings("512 B", formatSize(&buf, 512));
     try std.testing.expectEqualStrings("1.0 KB", formatSize(&buf, 1024));
     try std.testing.expectEqualStrings("1.0 MB", formatSize(&buf, 1024 * 1024));
+}
+
+test "formatHuman includes server line" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "./data",
+        .server = .{ .address = "127.0.0.1", .port = 7890, .reachable = true },
+        .segments = 0,
+        .total_bytes = 0,
+        .total_events = 0,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = false,
+    };
+    const text = try formatHuman(alloc, &status);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Server: running at 127.0.0.1:7890\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Lock: not held\n") != null);
+}
+
+test "formatJson includes server object and lock field" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "./data",
+        .server = .{ .address = "127.0.0.1", .port = 7890, .reachable = false },
+        .segments = 0,
+        .total_bytes = 0,
+        .total_events = 0,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = false,
+    };
+    const json = try formatJson(&status, alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "  \"server\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "    \"address\": \"127.0.0.1\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "    \"port\": 7890,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "    \"reachable\": false\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "  \"lock_held\": false\n") != null);
 }
 
 test "getStatus on data dir with events" {
