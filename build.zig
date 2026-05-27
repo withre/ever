@@ -1,5 +1,27 @@
 const std = @import("std");
 
+// Forward `zig build run -- <args>` to the run step.
+//
+// The two toolchains we support disagree on the API: 0.16.0 has `b.args` +
+// `Run.addArgs`, while 0.17-dev removed `b.args` in favour of
+// `Run.addPassthruArgs`. Neither call site compiles under the other version,
+// so this is feature-detected at comptime -- only the branch valid for the
+// active toolchain is analyzed.
+//
+// Why not just call addPassthruArgs directly: it fails to compile on 0.16.0,
+// which is still our declared `minimum_zig_version` and deployment baseline.
+// Picking one call site would quietly drop a supported toolchain.
+fn passthruArgs(b: *std.Build, run: *std.Build.Step.Run) void {
+    if (@hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        run.addPassthruArgs();
+    } else if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run.addArgs(args);
+    } else {
+        // Fail loudly rather than silently dropping the user's args.
+        @compileError("no passthrough-args API found on this Zig version");
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -31,9 +53,7 @@ pub fn build(b: *std.Build) void {
     // Run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    passthruArgs(b, run_cmd);
 
     const run_step = b.step("run", "Run the Ever CLI");
     run_step.dependOn(&run_cmd.step);
@@ -89,9 +109,7 @@ pub fn build(b: *std.Build) void {
     bench_exe.root_module.addImport("ever", ever_module);
 
     const bench_run = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        bench_run.addArgs(args);
-    }
+    passthruArgs(b, bench_run);
 
     const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
