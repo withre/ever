@@ -1,0 +1,68 @@
+#+title: Hook Name Resolution in hook logs
+#+state: draft
+#+FILETAGS: :cli:orchestrator:
+
+* Summary
+=ever hook rm= accepts either a numeric hook ID or a hook name; =ever hook logs= accepts only a numeric ID and dies on anything else. Make =hook logs= (and any future hook subcommand that takes an ID) resolve its argument exactly the way =hook rm= already does: try integer first, fall back to name lookup.
+
+* Motivation
+The ever field report (=docs/ever.org=, Incident 2, verified at =142d5e6=) documents the asymmetry:
+
+#+begin_example
+$ ever hook rm wutest-wever-h1
+Hook 'wutest-wever-h1' (#47) removed.
+$ ever hook logs wutest-wever-h1
+error: invalid hook ID 'wutest-wever-h1'.     # exit 1, stderr-only
+#+end_example
+
+Code facts, spot-checked in this tree at =142d5e66=:
+
+- =handleHookLogs= (=src/main.zig:511=) parses its argument strictly as an integer: =std.fmt.parseInt(u64, id_str, 10) catch std.process.fatal("invalid hook ID '{s}'.", ...)= (lines 518–519). Exit 1, message on stderr.
+- =handleHookRm= (=src/main.zig:543=) already implements the full resolution strategy: try =parseInt= — on success remove by ID; on failure call =listHooks()=, scan for a hook whose =name= matches, and remove by the found ID (=Hook '<name>' (#<id>) removed.=). Unknown name prints =error: hook '<name>' not found= and exits 1.
+- Every hook has a name to resolve: =HookTable.addWithCursor= (=src/store/hooks.zig=) auto-generates ={pattern}-{id}= when =--name= is not given, so name addressing is universally applicable.
+
+The failure is worse than a plain error because of the CLI's stream choice (see [[file:stdout-stderr-split.org][v0.1/stdout-stderr-split.org]]): the =fatal= message goes to stderr, so in any stdout-capturing context — pipes, =$( )=, redirection, a supervising agent reading command output — =hook logs <name>= is byte-for-byte identical to "this hook has no logs". The round-1 review (=reviews/round-1/ever.org=) reproduced this verbatim: exit 1, stderr-only, stdout 0 bytes. And =--name= is the flag the tool itself encourages for hook management, so the asymmetry punishes exactly the users who followed the advice.
+
+** Goals
+- =ever hook logs <name>= works wherever =ever hook logs <id>= works, with identical output.
+- The resolution logic is shared, not duplicated, so future hook subcommands that take an ID get name support for free.
+
+** Non-Goals
+- Fixing the stdout/stderr stream split — that is [[file:stdout-stderr-split.org][v0.1/stdout-stderr-split.org]] (P1).
+- JSON output for =hook logs= — that is =v0.1/hook-logs-json.org= (P2b).
+- Changing =hook rm= behaviour in any way.
+- Server/protocol changes — resolution stays client-side; the =hook_logs= wire request (=Client.hookLogs(hook_id: u64)=, =src/net/client.zig:574=) continues to take a numeric ID.
+
+* Proposal
+Extract the ID-or-name resolution that =handleHookRm= already contains into a shared helper in =src/main.zig= and use it from both =handleHookRm= and =handleHookLogs=:
+
+#+begin_src zig
+/// Resolve a CLI hook argument to a numeric hook ID.
+/// Strategy (identical to today's `hook rm`): try integer first;
+/// on parse failure, list hooks and return the first whose name matches.
+/// Unknown name: print "error: hook '<name>' not found" and exit 1.
+fn resolveHookId(allocator, io, addr_info, id_or_name: []const u8) u64
+#+end_src
+
+The fix is reusing the existing code path, not designing a new one. Semantics are inherited from =hook rm= verbatim:
+
+- Integer parse wins: a hook literally named ="42"= is unreachable by name (same as =hook rm= today).
+- Duplicate names resolve to the first match in =listHooks()= order (same as =hook rm= today).
+- Unknown name: =error: hook '<name>' not found=, exit 1 — distinct from the current =invalid hook ID= wording, matching what =hook rm= prints.
+
+=handleHookLogs= then becomes: resolve → connect → =hookLogs(id)= → print, with the numeric fast path unchanged.
+
+* Design Details
+- =src/main.zig= =handleHookLogs= (line 511): replace the =parseInt ... catch fatal= with a call to the shared resolver.
+- =src/main.zig= =handleHookRm= (line 543): refactor to use the same resolver; behaviour must remain byte-identical (messages =Hook #<id> removed.= / =Hook '<name>' (#<id>) removed.= are printed by the caller, which knows whether a name was resolved).
+- Connection handling: =listHooks()= consumes the client connection (=handleHookRm= already reconnects via a second =connectToStore= after name resolution). The resolver either takes its own connection or documents that the caller must use a fresh connection for the follow-up request — mirror the existing =hook rm= structure.
+- No changes to =src/net/client.zig= or the wire protocol.
+
+* Acceptance Criteria
+- For a hook registered with =--name my-hook= (ID =N=): =ever hook logs my-hook= produces the same output as =ever hook logs N=.
+- For an unknown name: =ever hook logs no-such-hook= prints a clear error naming the argument (=error: hook 'no-such-hook' not found=) and exits 1.
+- Numeric IDs behave exactly as today: =ever hook logs N= output is unchanged for both existing and missing IDs.
+- =ever hook rm= behaviour (by ID and by name) is unchanged.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
