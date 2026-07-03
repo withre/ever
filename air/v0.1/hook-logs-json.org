@@ -1,0 +1,112 @@
+#+title: JSON Output for Hook Logs
+#+state: draft
+#+FILETAGS: :cli:subscriber:orchestrator:
+
+* Summary
+Add =--json= to =ever hook logs=: emit a JSON array of execution records, each mirroring the structured metadata header the hook daemon already writes to every per-execution log file (hook ID + name, pattern, command, topic, offset, timestamp, payload) plus the captured command output. The in-flight =cli-json-list-output.org= draft (uncommitted at time of writing) lists =hook logs --json= as future work — this doc is that follow-up.
+
+* Motivation
+The ever field report (=docs/ever.org= in the notes repo, P2, verified at =142d5e6= and re-verified by two review rounds) credits hook execution logs as one of the few things that *worked* during the read-path blackout: "the per-execution log file captures a metadata header (hook ID + name, pattern, command, topic, offset, timestamp, payload) followed by command output. That log completeness is what made 'hook-log archaeology' a viable fallback when the CLI read path failed — the forensics story is genuinely good."
+
+The data is structured at the source — =executeHookCommand= (=src/store/hooks.zig=, header written around lines 969–1041) records fixed, labelled fields into =<data-dir>/hooks/<hook-id>-<timestamp-ms>.log=, one file per execution:
+
+#+begin_example
+=== Hook Execution ===
+Hook:      #47 (wutest-wever-h1)
+Pattern:   wutest.wever.subtest
+Command:   sh -c cat >> /tmp/a.log
+Topic:     wutest.wever.subtest
+Offset:    162
+Timestamp: 2026-06-30 09:14:03
+Payload:   {"topic":"wutest.wever.subtest","offset":162,...}
+===
+
+<command stdout/stderr>
+#+end_example
+
+But the CLI flattens it back to prose: =handleHookLogs= (=src/main.zig:511=) prints =Log file: <path>=, a =---= separator, and the raw content. A supervising agent doing hook-log archaeology ("which offset did this execution consume? what did the handler print?") must regex a format that was machine-generated one layer down. There is no structured mode.
+
+** Goals
+- =ever hook logs <id> --json= emits machine-readable execution records: header fields + captured output, parseable with =jq= with no scraping.
+- Output is always valid JSON: a hook with no executions yields =[]=, exit 0.
+- Human-readable output unchanged (modulo the stream fix in =v0.1/stdout-stderr-split.org=).
+
+** Non-Goals
+- Name resolution for the =<id>= argument — =v0.1/hook-logs-name-resolution.org= (sibling, P5) specs =hook logs <name>=; =--json= applies identically to whatever argument resolution is in effect, and nothing here depends on it.
+- Per-execution exit status / failure metadata — the log header records none today; =v0.1/hook-failure-visibility.org= (P7) owns failure visibility. The record shape below leaves room for those fields.
+- Retrieving more than the most recent execution — see Future Work.
+- =--json= for =hook list= / =hook ps= — in-flight draft =cli-json-list-output.org=.
+
+* Proposal
+
+** Output format
+A JSON array of execution records, one object per execution record returned:
+
+#+begin_src json
+[
+  {
+    "hook_id": 47,
+    "hook_name": "wutest-wever-h1",
+    "pattern": "wutest.wever.subtest",
+    "command": "sh -c cat >> /tmp/a.log",
+    "topic": "wutest.wever.subtest",
+    "offset": 162,
+    "executed_at": 1751274843123,
+    "payload": {"topic":"wutest.wever.subtest","offset":162,"timestamp":1751274843101,"key":null,"value":"{\"n\":4\"}"},
+    "output": "handler output line\n",
+    "log_path": "/srv/ever/data/hooks/47-1751274843123.log"
+  }
+]
+#+end_src
+
+Field mapping (header line → JSON field):
+- =Hook: #<id> (<name>)= → =hook_id= (number), =hook_name= (string, =null= when the hook is unnamed — the header then reads =Hook: #<id>=).
+- =Pattern:= → =pattern= (string).
+- =Command:= → =command= (string).
+- =Topic:= → =topic= (string) — the concrete topic that matched, not the pattern.
+- =Offset:= → =offset= (number) — the triggering event's global log offset (=event.offset=, written verbatim by =executeHookCommand=).
+- =executed_at= (number, epoch ms) — taken from the log filename's timestamp component (=<hook-id>-<timestamp-ms>.log=), which is the same instant the daemon opened the log. It supersedes the header's second-resolution formatted =Timestamp:= line, which is not separately emitted.
+- =Payload:= → =payload= — embedded verbatim as a JSON *object*. The header line's bytes are produced by =buildEventJsonFromStore= (=src/store/hooks.zig:1164=) and are guaranteed valid single-line JSON, so embedding raw avoids double-escaping; consumers read =.payload.value= (itself a string, per the envelope contract — see =v0.1/sub-json-output.org=).
+- Everything after the ====\n\n= terminator → =output= (string, JSON-escaped) — the command's interleaved stdout/stderr, possibly truncated by the existing transfer cap (=max_bytes=, default 65536, hard cap 1MB in =handleHookLogs=, =src/net/server.zig:486=).
+- =log_path= (string) — the log file path the server already returns.
+
+** Empty vs unknown
+Array over NDJSON, and =[]= for empty: =hook logs= is a bounded query over recorded history, not an unbounded stream — the sibling =cli-json-list-output.org= draft establishes "bounded query ⇒ always-valid JSON, empty ⇒ =[]=" for exactly this doc family, while NDJSON is reserved for streams (=v0.1/sub-json-output.org=). So:
+- Known hook, no executions yet → =[]= on stdout, exit 0. An empty history is not an error.
+- Unknown hook → error on stderr, nothing on stdout, exit 1. A typo'd ID must not read as "no executions".
+
+Today the server conflates the two: =handleHookLogs= (=src/net/server.zig:486=) never consults the hook table — it scans =<data-dir>/hooks/= for =<id>-*.log= files and answers =not_found= ("no logs found for this hook") in both cases. The Design Details below distinguish them.
+
+** Dependency on P1
+Composes on =v0.1/stdout-stderr-split.org=: without it, =--json= output would land on stderr and =| jq= would see zero bytes. If this lands first, emit =--json= output on stdout anyway — new output, no compatibility burden.
+
+* Design Details
+
+** Server: distinguish "no such hook" from "no logs"
+In =handleHookLogs=, check the hook table (already in scope as =ht=) for the requested ID before scanning the log directory:
+- ID not in the table → =not_found= error =no such hook: <id>= (unchanged wire shape; better message).
+- ID present, no matching log files → respond =hook_logs_ok= with empty =log_path= and empty =content= instead of =not_found=.
+Old CLI binaries render the empty-success case as =Log file: \n---\n(empty)= — cosmetic, acceptable. The human-mode CLI should print a =(no executions)= diagnostic on stderr and exit 0 in that case, consistent with "an error is an error, an empty history is not".
+
+** CLI: parse and re-emit
+=--json= is a boolean flag on the =hook logs= subcommand (command table, =src/main.zig= near line 1400). In JSON mode, =handleHookLogs= parses =result.content= against the fixed header grammar (exactly as shown in the Motivation example: the sentinel first line, labelled fields in fixed order, the three-equals terminator line followed by a blank line, remainder is command output) and emits the record array on =ctx.stdout=. The grammar is safe to parse because the header is machine-written, always first in the file, and its field order is fixed; the =Payload:= value is always a single line. A content blob that does not start with the header sentinel (pre-change log files, hand-edited files) yields a degraded record: header-derived fields =null=, full content in =output=, plus =log_path= — never a parse failure.
+
+Parsing lives client-side; no new protocol messages. (=hook_id= is also echoed in the wire response; the header parse cross-checks it.)
+
+** Test strategy
+Integration: register a named and an unnamed hook, fire each once with a handler that writes known output (including quotes and newlines), then assert =hook logs <id> --json= parses with =jq= and every field matches the published event (topic, global offset, payload round-trip). Assert the never-fired hook yields =[]= exit 0, and a bogus ID yields stderr + exit 1 + empty stdout. Regression: human mode byte-identical (modulo the P1 stream change).
+
+* Acceptance Criteria
+With a running store, a hook =<id>= that has executed at least once, and =v0.1/stdout-stderr-split.org= landed:
+- =ever hook logs <id> --json 2>/dev/null | jq .= parses; the result is an array of objects.
+- Each record carries =hook_id=, =hook_name= (or =null=), =pattern=, =command=, =topic=, =offset= (number, matching the triggering event's global offset), =executed_at= (epoch ms), =payload= (object; =.payload.value= is the published payload string), =output=, and =log_path=.
+- For a hook that has never executed: stdout is exactly =[]=, exit 0.
+- For an unknown hook ID: stdout is empty, an error is printed to stderr, exit 1.
+- Human-readable output without =--json= is unchanged apart from its stream.
+
+* Future Work
+- Full execution history: the per-execution files already exist on disk, but the wire response returns only the newest (=best_ts= scan in =handleHookLogs=). An additive =max_records= field on =HookLogsRequest= is backward compatible (=decodeBody= uses =ignore_unknown_fields= and defaulted struct fields) and would let =--json= return the array this schema already promises, e.g. via =--last N=.
+- =exit_status= / failure fields per record, once =v0.1/hook-failure-visibility.org= (P7) makes the daemon record them.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
