@@ -1,0 +1,117 @@
+#+title: Status Over TCP: Query the Running Store, Not the Local Data Directory
+#+state: draft
+#+FILETAGS: :cli:protocol:store:
+
+* Summary
+=ever status= reads and validates a data directory on the /client's/ filesystem (default =./data=, flag =--data-dir=) before reporting anything: =handleStatus= in =src/main.zig= (line 952) opens the directory, scans for store marker files, and computes statistics from local files. Run from any directory other than the store's working directory it fails with =error: cannot open data directory './data'= (exit 1) — even when a healthy server is reachable. Every other read command works over TCP against =--address=/=--port=; =status= is the one command that cannot.
+
+This doc adds a =status= request to the wire protocol so =ever status= queries the running server by default; the local filesystem scan remains available behind an explicit =--data-dir= for offline/forensic inspection.
+
+* Motivation
+A supervisor checking store health runs from its own cwd, often on a different filesystem view than the store daemon. Today that check is impossible via the CLI even though the server is reachable. From the ever field report (=docs/ever.org=, Incident 3, verified at =142d5e6=):
+
+#+begin_quote
+=ever status= — the one health/statistics command — does not query the running store at all. It validates and reads =./data= (or =--data-dir=) from the local filesystem before contacting anything, so run from any directory other than the store's it prints =error: cannot open data directory './data'= and exits 1.
+#+end_quote
+
+Reproduced live by both the round-1 and round-2 reviewers from a non-store cwd against a healthy default-port store: =error: cannot open data directory './data'= on stderr, exit 1, zero bytes on stdout. The asymmetry also misleads: "cannot open data directory" reads as store corruption when the store is fine.
+
+Verified against =src/main.zig= in this workspace: =handleStatus= (line 952) resolves =actual_dir= to =./data= when =--data-dir= is absent, attempts =openDir=, and exits 1 on failure (line 961) — all before any network activity.
+
+** What already landed vs. what this doc adds
+=v0.1/status-server-check.org= (state: complete) added a =Server: running at <host>:<port>= / =Server: not reachable at <host>:<port>= line to =status= output, backed by a bounded TCP connect *probe* (=probeServer= in =src/store/status.zig=). That work answers "is the endpoint alive?" — but it runs /after/ the local data-dir validation and scan, so the probe is unreachable from any cwd that lacks a valid store directory. The statistics themselves (topics, events, log size, hooks) still come exclusively from the local filesystem.
+
+This doc adds the missing half: serve the /statistics/ over the wire, so the default =ever status= needs no local data directory at all. The probe line's contract is preserved — in server mode the =Server: running= line becomes trivially true (we just spoke the protocol, a strictly stronger signal than a bare TCP connect); in offline =--data-dir= mode the landed probe behaviour is unchanged.
+
+** Goals
+- =ever status= (and =status --json=) returns store statistics by querying the running server over the existing TCP protocol, honouring =--address= / =--port= / =EVER_HOST= / =EVER_PORT= like every other command, from any cwd.
+- Local-directory mode remains available behind an explicit =--data-dir= for offline/forensic inspection of a stopped store, byte-compatible with today's output.
+- Error message for an unreachable server names the =address:port=, not a data directory.
+- The =Server:= line and =lock_held= JSON field from =v0.1/status-server-check.org= keep their meaning in both modes.
+
+** Non-Goals
+- New statistics beyond what the local path computes today, except the live-only fields the server holds trivially (uptime, timer count) — see Proposal.
+- HTTP API changes (a =GET /status= endpoint is a natural follow-up but not required for CLI parity).
+- Changing the offline scan's implementation (=src/store/status.zig getStatus= stays as is).
+- Fixing the stderr-vs-stdout stream choice — that is =v0.1/stdout-stderr-split.org= (P1); this doc's output rides on it.
+
+* Proposal
+Add a =status= request/response pair to the wire protocol (=src/protocol/message.zig=); implement the handler server-side where =TopicManager=, =HookTable=, and =TimerTable= already hold the live numbers; switch =handleStatus= to the client path by default, taking the existing local-scan branch only when =--data-dir= is explicitly given.
+
+** CLI behaviour matrix
+| Invocation | Behaviour |
+|---|---|
+| =ever status= | Query server at resolved =address:port=. No local filesystem access. |
+| =ever status --address H --port P= | Same, against =H:P=. |
+| =ever status --data-dir ./data= | Offline scan of the local directory, exactly today's code path (including the reachability probe line). |
+| =ever status= with server down | =error: cannot reach Ever server at 127.0.0.1:7890. Is the store running? For offline inspection use --data-dir <path>.= — exit 1. |
+
+** Wire protocol
+New message types in =src/protocol/message.zig= (next free request/response codepoints, continuing the existing scheme):
+
+#+begin_src zig
+// MessageType additions
+status = 0x10,
+status_ok = 0x90,
+
+pub const StatusRequest = struct {
+    _unused: u8 = 0, // no parameters; mirrors HookPsRequest
+};
+
+pub const StatusTopicInfo = struct {
+    name: []const u8,
+    events: u64,
+    deleted: bool = false,
+};
+
+pub const StatusHookInfo = struct {
+    id: u64,
+    pattern: []const u8,
+    command: []const u8,
+    cursor: u64,
+};
+
+pub const StatusResponse = struct {
+    data_dir: []const u8,
+    segments: u64,
+    total_bytes: u64,
+    total_events: u64,
+    topics: []const StatusTopicInfo,
+    hooks: []const StatusHookInfo,
+    timer_count: u64,
+    uptime_ms: u64,
+};
+#+end_src
+
+The response mirrors the offline =StoreStatus= (=src/store/status.zig=: =segments=, =total_bytes=, =total_events=, =topics=, =hooks=, =lock_held=) plus two live-only fields the server knows trivially: =uptime_ms= (from a start timestamp recorded in =Server.init=) and =timer_count= (from =TimerTable=). =lock_held= is omitted from the wire response — it is true by construction when a server answers — and the CLI renders it as =true= in server-sourced JSON for schema compatibility.
+
+** Server-side data sources
+All numbers come from live state the server already maintains — no data-dir rescan:
+- Topics and per-topic event counts: =TopicManager.topics= map — each index holds =non_marker_count= (=src/store/topic.zig=) and a deleted flag; matches what the offline scan derives from markers/tombstones.
+- Total events / log size / segment count: the shared =Log= tracks =segments= (each with =size=) and =nextOffset()= (=src/store/store.zig=); total non-marker events is the sum of per-topic =non_marker_count=.
+- Hooks: =HookTable= snapshot (id, pattern, command, cursor) — the same source =list_hooks= uses.
+- Timers: =TimerTable= count.
+- =data_dir=: the resolved =actual_data_dir= string from =startServer=, passed into the server config so the response can report which directory the /server/ is actually using (something the probe-only design explicitly could not do).
+
+** CLI changes (=handleStatus= in =src/main.zig=)
+- If =ctx.flag("data-dir")= is non-empty: run today's code path unchanged (validate dir, =getStatus=, probe, print).
+- Otherwise: =connectToStore= with =parseStoreAddress(ctx)= (same helper every other command uses), send =status=, render the response through the existing =printHuman= / =printJson= formatters in =src/store/status.zig= (extended to accept the two new fields and a source annotation). Connection failure exits 1 with the endpoint-naming error above.
+- Output stream: data goes to stdout per =v0.1/stdout-stderr-split.org= (P1); if this lands first, it follows whatever stream convention is current, and P1 sweeps it with the rest.
+
+* Design Details
+- =src/protocol/message.zig= — =status= / =status_ok= message types, =StatusRequest= / =StatusResponse= structs (JSON bodies like all existing messages).
+- =src/net/server.zig= — =handleFrame= dispatch for =.status=; =handleStatus= handler assembling the response under the =TopicManager= lock (consistent snapshot); =Server.Config= gains =data_dir: []const u8= and =Server.init= records =start_time= for uptime.
+- =src/net/client.zig= — =Client.status()= returning an owned response, following the =listHooks= pattern.
+- =src/main.zig handleStatus= — branch on explicit =--data-dir= as described; delete the unconditional up-front directory validation from the default path.
+- =src/store/status.zig= — formatters accept optional =uptime_ms= / =timer_count= / source-mode so both modes share rendering; JSON gains ="source": "server" | "local-scan"= so scripts can tell which mode produced the numbers.
+- Tests: unit tests for =StatusResponse= encode/decode round-trip; integration test (pattern of the existing one in =src/tests/integration.zig= from =v0.1/status-server-check.org=): start a server in a temp dir, publish events, run the client status call from a different cwd, assert counters; stop the server, assert the endpoint-naming error; assert =--data-dir= offline mode still works against the stopped store and agrees with the server-sourced counters taken before shutdown.
+
+* Acceptance Criteria
+- From an arbitrary cwd with no =./data= present, =ever status --port <P>= against a running store exits 0 and reports live stats: topic list with event counts, total events, log size/segments, hook count, timer count, uptime, and the server's =data_dir=.
+- =ever status --json= in the same setting emits the same data as JSON including ="source": "server"= (stream per P1).
+- =ever status --data-dir <path>= with the server stopped performs the offline scan and exits 0 — today's behaviour, unchanged.
+- With no server listening and no =--data-dir=, =ever status= exits 1 and the error names the resolved =address:port= (e.g. =127.0.0.1:7890=); the string ='./data'= does not appear.
+- On a quiesced store, server-sourced counters (topics, per-topic events, total events, segments, total bytes, hook count) equal the offline scan's numbers for the same data dir.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 3, verified at 142d5e6). Imported and adapted from the round-1 review's pre-draft (notes/reviews/round-1/proposed-air/ever--status-over-tcp.org); reconciled with the landed v0.1/status-server-check.org probe (this doc adds server-served statistics; that doc added endpoint reachability only).
