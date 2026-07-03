@@ -1,5 +1,5 @@
 #+title: Hook Failure Visibility
-#+state: draft
+#+state: ready
 #+FILETAGS: :store:subscriber:cli:
 
 * Summary
@@ -92,3 +92,4 @@ $ ever hook list --json | jq '.[0] | {fired_count, failure_count, last_exit_stat
 
 * History
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).

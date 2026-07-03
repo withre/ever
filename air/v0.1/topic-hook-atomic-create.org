@@ -1,5 +1,5 @@
 #+title: Atomic Topic + Hook Creation
-#+state: draft
+#+state: ready
 #+FILETAGS: :cli:store:orchestrator:
 
 * Summary
@@ -89,3 +89,4 @@ If the store crashes between hook registration and marker append, the surviving 
 
 * History
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6). Deviation from the report: the =topic list --deleted= / tombstone-display split that P6 bundles is moved to Non-Goals (belongs with v0.1/cli-json-list-output.org).
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
