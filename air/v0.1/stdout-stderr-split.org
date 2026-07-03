@@ -1,5 +1,5 @@
 #+title: Stdout/Stderr Split for CLI Output
-#+state: ready
+#+state: work-in-progress
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
