@@ -1,5 +1,5 @@
 #+title: JSON Output for Hook Logs
-#+state: draft
+#+state: ready
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
@@ -110,3 +110,4 @@ With a running store, a hook =<id>= that has executed at least once, and =v0.1/s
 
 * History
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).

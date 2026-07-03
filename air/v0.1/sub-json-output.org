@@ -1,5 +1,5 @@
 #+title: JSON Output for Sub (NDJSON Event Stream)
-#+state: draft
+#+state: ready
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
@@ -79,3 +79,4 @@ With =v0.1/stdout-stderr-split.org= landed, a running store, and a topic =t= hol
 
 * History
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
