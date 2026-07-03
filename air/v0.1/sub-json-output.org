@@ -1,0 +1,81 @@
+#+title: JSON Output for Sub (NDJSON Event Stream)
+#+state: draft
+#+FILETAGS: :cli:subscriber:orchestrator:
+
+* Summary
+Add =--json= to =ever sub=: emit one full event object per line (NDJSON) — =topic=, global =offset=, =timestamp=, =key=, =value= — including under =--follow=. This is the stream-command counterpart to the in-flight =cli-json-list-output.org= draft (uncommitted at time of writing), which covers the *list* commands (=topic list=, =hook list=, =hook ps=, =timer list=) and explicitly defers the stream commands. The existing =--json-values= (bare payload per line) is kept unchanged.
+
+* Motivation
+The ever field report (=docs/ever.org= in the notes repo, P2, verified at =142d5e6= and re-verified by two review rounds) found that the only structured, machine-readable read path onto the event log is the HTTP API — =GET /topics/<name>/events= "became the session's primary read path", which the report calls "also an indictment of the CLI". Over TCP, =sub='s default format is a human-oriented =[topic:offset] value= line that must be scraped with regex, and =--json-values= deliberately drops the envelope (topic, offset, timestamp, key) — so a supervising agent that needs cursors ("what offset did I last see?") or provenance ("which topic under this prefix fired?") has no CLI option at all and shells out to =curl= + =jq=.
+
+The envelope serializer already exists, twice, with an identical shape: =buildEventJson= (=src/main.zig:1130=, feeds the triggered command's stdin in =ever on=) and =buildEventJsonFromStore= (=src/store/hooks.zig:1164=, feeds server-side hook stdin). Both verified in this workspace. Hook consumers have received exactly this JSON envelope since hooks shipped — =sub --json= makes the same contract available to pull-side consumers, so a script can be moved between hook-stdin delivery and =sub=-polling without a parser change.
+
+** Goals
+- =ever sub <topic-or-pattern> --json= emits one standalone JSON object per event, one per line (NDJSON).
+- Field set and encoding are byte-compatible with the hook-stdin envelope: ={"topic":...,"offset":...,"timestamp":...,"key":...,"value":...}=.
+- Works with =--from=, =--max=, prefixes/wildcards, and =--follow= (each event flushed as it arrives).
+- =--json-values= behaviour unchanged.
+
+** Non-Goals
+- =--json= for the list commands — in-flight draft =cli-json-list-output.org= (uncommitted at time of writing).
+- =--json= for =ever wait= — natural follow-on sharing =printEvent=; keep this doc to one command.
+- =--json= for =hook logs= — =v0.1/hook-logs-json.org=.
+- Changing the default human format or the =[topic:offset]= tag (=v0.1/offset-coherence.org= owns offset display/flag coherence).
+- Pretty-printing or a =--format= system.
+
+* Proposal
+
+** Output format
+One event per line; each line is a complete JSON object:
+
+#+begin_example
+$ ever sub wutest.wever.subtest --json
+{"topic":"wutest.wever.subtest","offset":159,"timestamp":1751500000123,"key":null,"value":"{\"n\":1}"}
+{"topic":"wutest.wever.subtest","offset":160,"timestamp":1751500001456,"key":null,"value":"{\"n\":2}"}
+{"topic":"wutest.wever.subtest","offset":161,"timestamp":1751500002789,"key":"worker-3","value":"{\"n\":3}"}
+#+end_example
+
+- =topic= — string. For prefix/wildcard subscriptions the server supplies it per event; for exact-topic fetches the response may omit the per-event topic (=printEvent= at =src/main.zig:1105= already handles the null case) — populate it from the subscribed topic name rather than emitting ="".
+- =offset= — number, the *global log offset*, identical to the offset the default format displays and the hook envelope carries. (Its mismatch with =--from= is pre-existing and owned by =v0.1/offset-coherence.org=.)
+- =timestamp= — number, epoch milliseconds, as stored on the event.
+- =key= — string, or =null= when the event has no key.
+- =value= — *always a JSON string* containing the raw payload, escaped.
+
+** Decision: =value= is always a string
+Both existing envelope builders (=buildEventJson=, =buildEventJsonFromStore=) emit =value= as an escaped string, never as embedded raw JSON — verified in this workspace. =sub --json= matches: consistency beats novelty, and every existing hook script that parses stdin keeps working unmodified against =sub --json= output. Embedding the payload raw when it happens to parse as JSON was considered and rejected: (a) it would fork the envelope contract into two variants, (b) payloads are not required to be JSON, so consumers would face a union type per line, and (c) =jq= handles the string form fine: =jq -r '.value | fromjson | .n'=.
+
+** Relationship to =--json-values=
+Unchanged, byte-for-byte: =--json-values= prints only the raw payload per line (=printEvent=, =src/main.zig:1105=) — right when the consumer only wants payloads. =--json= adds the envelope. The two flags are mutually exclusive; passing both is a usage error (message on stderr, non-zero exit).
+
+** Empty results
+In =--json= mode an empty result is zero output lines on stdout, exit 0 (the =No events.= diagnostic stays on stderr, per =v0.1/stdout-stderr-split.org=). NDJSON has no array wrapper, so "no events" is naturally "no lines" — unlike the list commands, whose =--json= arrays print =[]= (see =cli-json-list-output.org=).
+
+** Dependency on P1
+This doc composes on =v0.1/stdout-stderr-split.org=: without it, =--json= output would join everything else on stderr and =| jq= would still see zero bytes. If this lands first, emit =--json= output on stdout anyway — it is new output with no compatibility burden.
+
+* Design Details
+CLI-only change; no protocol or server work.
+
+- Register the flag on the =sub= subcommand definition (=src/main.zig=, command table near line 1300): =.{ .name = "json", .takes_value = false, .description = "Output full event objects as NDJSON", .conflicts = &.{"json-values"} }=.
+- Extend the =printEvent(event, json_values)= call path (=src/main.zig:1105=) to a three-way output mode (default / json-values / json). In json mode, build the line with the existing =buildEventJson= (=src/main.zig:1130=) and write it followed by =\n=.
+- Output goes to the =ctx.stdout= writer with a flush after each line — required under =--follow= so consumers see events as they arrive (see =v0.1/stdout-stderr-split.org=, "Trap 2"), and =BrokenPipe= on stdout terminates cleanly ("Trap 3").
+- =--follow= needs no other change: both the initial fetch and the =fetchBlocking= loop in =handleSub= (=src/main.zig:60=) funnel through the same per-event print call.
+- Do not duplicate the serializer: =buildEventJson= already handles escaping via =appendJsonEscaped= (=src/main.zig:1159=). If =buildEventJsonFromStore= and =buildEventJson= are ever unified into a shared module, =sub --json= rides along.
+
+** Test strategy
+Integration: publish events with and without keys, with JSON and non-JSON payloads (including quotes, newlines, control characters); run =sub --json= capturing stdout; parse each line with a JSON parser and assert field values round-trip. Under =--follow=, publish after subscribing and assert the line arrives promptly. Regression: default and =--json-values= outputs byte-identical to pre-change.
+
+* Acceptance Criteria
+With =v0.1/stdout-stderr-split.org= landed, a running store, and a topic =t= holding events:
+- =ever sub t --json 2>/dev/null | jq -r .offset= prints one offset per event.
+- Every output line parses as a standalone JSON object: =ever sub t --json 2>/dev/null | jq -c .= succeeds line-for-line.
+- =ever sub t --json --follow 2>/dev/null | head -1 | jq .= parses — =--follow= streams valid NDJSON with per-line flush.
+- A prefix subscription (=ever sub <prefix>. --json=) carries the correct per-event =topic=; an exact-topic subscription carries the subscribed topic name, never ="".
+- For a JSON payload ={"n":3}=, =jq -r '.value | fromjson | .n'= yields =3=; for a non-JSON payload, =.value= round-trips the exact bytes.
+- Events without a key emit ="key":null=; keyed events emit the key string.
+- =ever sub t --json-values= output is byte-identical to pre-change behaviour.
+- =ever sub t --json --json-values= fails as a usage error: message on stderr, nothing on stdout, non-zero exit.
+- Empty topic: =ever sub empty.topic --json 2>/dev/null | wc -c= = 0, exit 0.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
