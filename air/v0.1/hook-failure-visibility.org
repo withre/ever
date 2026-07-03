@@ -1,0 +1,94 @@
+#+title: Hook Failure Visibility
+#+state: draft
+#+FILETAGS: :store:subscriber:cli:
+
+* Summary
+A hook whose command fails — spawn failure or nonzero exit — still consumes every event it matches: the cursor advances, the only evidence is a line in the store's log stream and the per-execution log file, and =hook list= shows nothing. Track per-hook execution counters (=fired_count=, =failure_count=, =last_exit_status=, =last_failed_offset=), persist them like timers already persist =fire_count=, and surface them in =hook list= (human and =--json=). The advance-and-log delivery semantics stay unchanged — the fix is observability, not blocking.
+
+* Motivation
+The ever field report (=docs/ever.org=, Incident 2, verified at =142d5e6=):
+
+#+begin_quote
+Delivery is therefore at-most-once with respect to handler success, and the only evidence of a failing handler is buried in log files. A hook whose command is broken (typo'd path, missing binary, bad permissions) silently eats every event it matches. =hook list= shows no failure count, no last exit status; =hook ps= shows only currently-running processes.
+#+end_quote
+
+Code facts, spot-checked in this tree at =142d5e66= (=src/store/hooks.zig=):
+
+- *Spawn failures advance the cursor.* In =processHook= (line 846), errors from =executeHookCommand= other than =ConcurrentLimitReached= are logged (="Hook #N command failed"=, line 874) and execution falls through to =updateCursor= — the event is consumed. The only no-advance path is =ConcurrentLimitReached= (lines 868–872), which exists for retry-next-tick, not failure handling.
+- *Nonzero exits are observed after the cursor has already moved.* The cursor advances at spawn time; the child's exit status is only seen later by the reaper — =reapChildren= (line 752) logs ="Hook #N (pid P) exited with status S"= at line 764 and discards the information. The round-1 review (=reviews/round-1/ever.org=) confirmed both paths at these locations.
+- *Signal deaths are invisible even to the log line.* The reaper computes =exit_code = (status >> 8) & 0xFF=, which is =0= for a signal-killed child (including hooks killed by the daemon's own timeout enforcement, =checkTimeouts=), so a SIGKILLed handler is indistinguishable from success.
+- *Nothing surfaces.* =hook list= (=handleHookList=, =src/main.zig:445=) renders only ID / NAME / Pattern / Command / Last Offset; =hook ps= shows only live processes; =ProcessEntry= (=src/store/hooks.zig:519=) does not even record the triggering event's offset, so the reaper could not attribute a failure to an event if it wanted to.
+
+The practically dominant broken-command class — typo'd path, missing binary, bad permissions — does not even spawn-fail: hooks run via =/bin/sh -c=, so the shell spawns fine and exits 127/126. Every such event is consumed with a real, recordable exit status that today goes nowhere.
+
+** Goals
+- Per-hook, persisted: =fired_count=, =failure_count=, =last_exit_status=, =last_failed_offset=.
+- Surfaced in =hook list= human output (e.g. =Fired: 12 (2 failed)=) and in =hook list --json=.
+- Counters survive store restart, exactly as timers' =fire_count= already does.
+- One shared execution-tracking design with =v0.1/hook-list-legibility.org= (P4) — its lifetime =Fired= counter *is* this doc's =fired_count=; neither doc re-specs the other's fields.
+
+** Non-Goals
+- Changing delivery semantics. Today's advance-and-log is a defensible default — a broken hook must not head-of-line-block the daemon or other events. At-most-once w.r.t. handler success stays.
+- Dead-letter listing and replay (=ever hook deadletter <name>=) — Future Work below.
+- Opt-in retry before cursor advance (=--retry N=) — Future Work below.
+- The =Pending= column and table redesign of =hook list= — that is =v0.1/hook-list-legibility.org= (P4). This doc owns the data; P4 owns the presentation.
+- The =--json= flag machinery itself — specified by the in-flight draft =v0.1/cli-json-list-output.org= (uncommitted at time of writing); this doc adds fields to whatever JSON listing that work establishes.
+
+* Proposal
+
+** The shared mechanism: per-hook execution counters
+Persisted counter fields on the hook record in =hooks.json=, updated by the daemon, reported through =ListHooks=. The precedent is timers: =Timer.fire_count= (=src/store/timers.zig=) is incremented on fire, persisted in =timers.json=, and displayed as =FIRES= in =timer list= ([[file:timers.org][v0.1/timers.org]]). Hooks get the same treatment. P4 (=v0.1/hook-list-legibility.org=) consumes =fired_count= (and =failure_count= for its annotations) from this design; this doc defines the fields once for both.
+
+** New fields on =Hook= / =HookJson= / =HookInfo=
+
+| Field                | Type   | Semantics                                                                                                        |
+|----------------------+--------+------------------------------------------------------------------------------------------------------------------|
+| =fired_count=        | =u64=  | Delivery attempts that consumed an event (cursor advanced). Incremented at spawn time — on spawn success *and* spawn failure — matching the cursor-advance semantics. |
+| =failure_count=      | =u64=  | Subset of =fired_count= that failed: spawn failure, nonzero exit, or death by signal.                              |
+| =last_exit_status=   | =?u8=  | Status of the most recently reaped child: exit code if it exited (=0= = success), =128 + signum= (shell convention) if signal-killed. =null= until the first child is reaped; unchanged by spawn failures (which produce no child). |
+| =last_failed_offset= | =?u64= | Global log offset of the event whose delivery most recently failed (any failure class). =null= if no failure yet.  |
+
+=last_failed_offset= uses the global offset because that is what event listings display and what a future dead-letter/replay surface would consume (=src/store= events carry global offsets; see also =v0.1/offset-coherence.org=, P3, for the display/flag coherence work).
+
+** Update points (all in =src/store/hooks.zig=)
+- =processHook=: at the existing cursor-advance point, also increment =fired_count=; in the non-=ConcurrentLimitReached= error branch (spawn failure), additionally increment =failure_count= and set =last_failed_offset = event.offset=. Fold both into the existing =updateCursor= persistence call so no extra =hooks.json= write is added on the hot path (the table is already saved on every cursor advance).
+- =reapChildren=: decode the =waitpid= status properly (=WIFEXITED= / =WIFSIGNALED= instead of the raw =(status >> 8) & 0xFF=). On nonzero exit or signal death, call a new =HookTable.recordExit(hook_id, status, offset)= that sets =last_exit_status=, increments =failure_count=, sets =last_failed_offset=, and saves. On clean exit, record =last_exit_status = 0= (persist-on-change only, to avoid a guaranteed extra write per successful execution — an exit status equal to the stored one is not re-saved).
+- =ProcessEntry= (line 519): add =offset: u64= carrying the triggering event's global offset, so the reaper can attribute the exit to an event. (The original hook-execution design, [[file:hook-execution.org][v0.1/hook-execution.org]], specified this field; the implementation dropped it.)
+
+** Persistence and compatibility
+- =saveLocked= (line 385) serializes the new =HookJson= fields; on load, missing fields default to =0= / =null= so existing =hooks.json= files from older stores load cleanly.
+- Protocol: =HookInfo= (=src/protocol/message.zig:144=) gains the four fields with defaults, so a new CLI against an old store (and vice versa) degrades gracefully.
+
+** Surfacing
+Human =hook list= gains a =Fired= column rendering =12 (2 failed)= when =failure_count > 0=, plus the last exit status when the most recent reap failed — minimal layout change here; P4 may restyle the table wholesale, consuming the same fields. =hook list --json= carries all four fields verbatim:
+
+#+begin_example
+$ ever hook list
+ID   NAME        Pattern        Command              Last Offset   Fired
+#3   notify      agent.done     ./notify.sh          210           12 (2 failed, last exit 127)
+
+$ ever hook list --json | jq '.[0] | {fired_count, failure_count, last_exit_status, last_failed_offset}'
+{"fired_count": 12, "failure_count": 2, "last_exit_status": 127, "last_failed_offset": 208}
+#+end_example
+
+* Design Details
+- Failure classes and their recording:
+  - /Spawn failure/ (fork/pipe/log-file setup — rare resource errors): counted at =processHook= time; =last_exit_status= untouched (no child existed). Detail remains in the store log line.
+  - /Nonzero exit/ (the dominant class — =/bin/sh -c= yields 127 for missing binaries, 126 for permission errors): counted at reap time with the real exit code.
+  - /Signal death/ (including daemon-enforced timeouts): counted at reap time as =128 + signum=. This also fixes the current reaper bug where signal deaths read as exit 0 and are logged as nothing.
+- Thread safety: counter updates go through =HookTable= methods that take the table's existing mutex, same as =updateCursor= — the daemon thread is the only writer.
+- Write amplification: none on the success path beyond today (=updateCursor= already rewrites =hooks.json= per delivered event); failures add at most one save per reaped failure.
+- Tests: (a) hook with =-- /nonexistent/handler=, publish 2 events, wait for reap → =failure_count=2=, =last_exit_status=127=, =last_failed_offset= = second event's offset; (b) healthy hook → =failure_count=0=, =last_exit_status=0= after one event; (c) signal-killed child → counted as failure with =128+signum=; (d) restart store → counters preserved; (e) old-format =hooks.json= loads with zeroed counters; (f) =ConcurrentLimitReached= increments nothing (no event consumed).
+
+* Future Work (explicitly not in the Acceptance Criteria)
+- =ever hook deadletter <name>=: list the events whose handler spawn-failed or exited nonzero, replayable by offset. Requires recording failed offsets as a set rather than only the last one — a small append-only per-hook file under =data/hooks/=, or markers in the log. =last_failed_offset= is deliberately the minimal, schema-compatible first step.
+- =--retry N= on =hook add=: opt-in bounded retries before the cursor advances past a failed event. Must remain opt-in — the no-head-of-line-blocking default is correct.
+
+* Acceptance Criteria
+- A hook registered with a failing command (e.g. =-- /nonexistent/handler=) shows, after events are published and reaped: a nonzero failure count and the last exit status in =ever hook list= human output, and =fired_count= / =failure_count= / =last_exit_status= / =last_failed_offset= in =hook list --json=.
+- A healthy hook shows zero failures (=failure_count=0=, =last_exit_status=0=) after at least one delivered event.
+- Counters survive a store restart (verify: fail deliveries, restart, =hook list= values unchanged).
+- Delivery semantics are unchanged: the failing hook's cursor still advances past failed events, and =ConcurrentLimitReached= still leaves the cursor (and counters) untouched.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
