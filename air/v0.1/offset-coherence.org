@@ -1,0 +1,101 @@
+#+title: Offset Coherence Between Display and Flags
+#+state: draft
+#+FILETAGS: :cli:protocol:subscriber:
+
+* Summary
+=ever sub= prints each event tagged with its /global log offset/ (=[topic:160]=), but the =--from= flag consumes a /topic-local skip count/ — feeding a printed offset back into the flag that looks like it accepts offsets silently returns =No events.= with exit 0. The HTTP API has the same trap: =?offset== is a skip count while response bodies carry global =offset= fields, so cursor loops that feed response offsets back read nothing. This doc adds =--after-offset <global>= (CLI) and =?after_offset== (HTTP) as an explicit global-offset cursor, documents =--from= / =?offset== as skip counts, and adds a stderr warning that distinguishes "start beyond end" from "topic is empty".
+
+* Motivation
+From the ever field report (=docs/ever.org=, Incident 1, Mode B, verified at =142d5e6=; independently re-reproduced byte-for-byte by the round-1 review):
+
+#+begin_example
+$ ever sub wutest.wever.subtest
+[wutest.wever.subtest:159] {"n":1}
+[wutest.wever.subtest:160] {"n":2}
+[wutest.wever.subtest:161] {"n":3}
+$ ever sub wutest.wever.subtest --from 160      # "resume after 159", per the printed tags
+No events.                                       # exit 0
+$ ever sub wutest.wever.subtest --from 2        # what --from actually means
+[wutest.wever.subtest:161] {"n":3}
+#+end_example
+
+The natural supervision loop — read, note the last offset, come back later and resume after it — silently reads nothing. During the report's session this compounded Mode A (the stderr stream bug, =v0.1/stdout-stderr-split.org=) into a full CLI read-path outage.
+
+Code facts, verified in this workspace:
+- =printEvent= (=src/main.zig= line 1105) prints =[{topic}:{offset}]= where =offset= is the event's global log offset — the same value =pub= acks (=Published to ... at offset N=), hook execution logs, and HTTP response bodies carry. Global offsets are the system-wide currency.
+- =TopicManager.fetch= (=src/store/topic.zig= line 263) treats =start= as a skip count over the topic's non-marker events (=if (i - skipped < start) ... continue=). =fetchPattern= (line 365) does the same per matching topic. =handleSub= / =handleWait= (=src/main.zig=) pass =--from= straight through as this skip count.
+- HTTP (=src/net/http.zig=): =?offset== (line 291) is passed to the same =TopicManager.fetch= (line 299) as the skip count, while each returned event carries its global =offset= field (line 316). A cursor loop that feeds a response-body offset back into =?offset== silently reads nothing — the round-1 review reproduced =?offset=294= (a response-body global offset) returning ={"events":[]}=.
+- "Empty topic" and "start beyond end" are indistinguishable: both print =No events.= to stderr and exit 0 (=handleSub=, =src/main.zig= line ~122). Only a missing topic is distinct (exit 1).
+
+The one place a global-vs-local distinction is /documented/ is the hook cursor (=v0.1/hook-registration-cursor.org=: exact patterns use topic-local skip counts, prefix/wildcard use global offsets) — but that is internal daemon state. The user-facing read commands display one unit and consume another, with no warning when the mismatch produces an impossible read.
+
+** Goals
+- A displayed offset can be fed back to the CLI and HTTP API to resume reading strictly after that event.
+- =--from= / =?offset== keep today's semantics, but are documented as skip counts (help text, HTTP doc comment).
+- A read whose start position exceeds the topic's event count produces a stderr warning distinguishing it from a genuinely empty topic.
+- Exit codes are unchanged.
+
+** Non-Goals
+- Changing or removing =--from= / =?offset== semantics — existing scripts and the hook =--from= flag depend on them; this is additive.
+- Changing the default human display format (global offsets stay: they are what =pub= acks, hook logs, and HTTP bodies already speak, so removing them would break cross-correlation — the report's "stop displaying global offsets" alternative is rejected for this reason).
+- Exit-code changes for empty/beyond-end reads — scripts already rely on exit 0 for "nothing there yet" polling loops; the warning is diagnostic, not data.
+- Structured output for =sub= (that is =v0.1/sub-json-output.org=, P2a) or the output-stream fix (=v0.1/stdout-stderr-split.org=, P1). The warning introduced here lands on stderr, which is correct under P1's split.
+- Consumer groups / server-side acks.
+
+* Proposal
+Three concrete decisions (the field report's P3 offers alternatives; this spec chooses):
+
+1. *Add =--after-offset <global>= to =sub= and =wait=*: resume strictly after a displayed global offset — the natural "resume after what I just saw" cursor. Mutually exclusive with =--from= (the CLI framework's =.conflicts= mechanism, as used by =hook add --from-beginning=/=--from=). =--from= keeps today's topic-local semantics; its help text changes from "Start offset" to "Skip the first N events of the topic (topic-local count, not a log offset)".
+2. *Warn on stderr when the start position exceeds the topic's event count*: =warning: start 160 is beyond the end of topic 'wutest.wever.subtest' (3 events)= — wording per the error-message examples in =air/context/interface-design.org=. =No events.= and exit 0 are unchanged.
+3. *HTTP: add =?after_offset== with global semantics*; document =?offset== as a skip count. Supplying both is a 400.
+
+* Design Details
+
+** Wire protocol (=src/protocol/message.zig=)
+=FetchRequest= gains an optional field (additive; JSON bodies tolerate absence via defaults):
+
+#+begin_src zig
+pub const FetchRequest = struct {
+    topic: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
+    offset: u64 = 0,          // topic-local skip count (existing)
+    after_offset: ?u64 = null, // NEW: resume strictly after this global offset
+    max_count: u32 = 100,
+    block_ms: u32 = 0,
+};
+#+end_src
+
+When =after_offset= is set the server ignores =offset= (clients enforce exclusivity; the server rule keeps the protocol total). Applies to blocking fetches (=block_ms > 0=) identically.
+
+To support the beyond-end warning, =FetchResponse= gains =topic_events: ?u64 = null= — populated with the topic's =non_marker_count= for exact-topic requests, =null= for pattern requests (patterns aggregate several topics; no warning there, noted as out of scope).
+
+** Store (=src/store/topic.zig=)
+- Exact topic + =after_offset=: each topic index already stores its events' /global/ offsets (=idx.offsets=, ordered). New fetch variant: binary-search for the first stored offset => after_offset + 1=, then read forward skipping markers, up to =max_count=. No new state.
+- Pattern + =after_offset=: =fetchPatternByOffset= (line 304) already implements exactly these global semantics for the hook daemon — call it with =start_offset = after_offset + 1=. Marker/tombstone filtering is built in.
+
+** Server (=src/net/server.zig handleFetch=)
+Dispatch on =after_offset != null= to the new paths; populate =topic_events= for exact-topic requests from =non_marker_count= under the manager lock. Blocking-fetch loop re-issues with the same =after_offset= until events arrive or =block_ms= elapses.
+
+** CLI (=src/main.zig=)
+- =sub= and =wait= gain =--after-offset= (=.conflicts = &.{"from"}=, and vice versa).
+- In =--follow= / =wait= loops under =--after-offset=, the loop cursor becomes "last delivered =event.offset=" (advance to =event.offset + 1= semantics via =after_offset=) instead of today's =offset += result.events.len= skip arithmetic. Skip-count loops are unchanged when =--from= (or neither flag) is used.
+- Beyond-end warning in the non-follow =sub= path: when the result is empty, =--from N= was given with =N > 0=, and the response carries =topic_events = M= with =N > M=, print the warning to stderr before =No events.=. (=N == M= is a legitimate at-the-tail read — no warning.) Same check in =wait= before it starts blocking.
+
+** HTTP (=src/net/http.zig=)
+- Parse =after_offset= alongside =offset= (line 291); both present → =400= with a JSON error body. Route =after_offset= to the same new fetch paths.
+- Update the endpoint doc comment (line 11) and any usage docs: =?offset== is "skip the first N events", =?after_offset== is "resume strictly after global offset N"; response =offset= fields round-trip into =?after_offset==.
+
+** Tests
+- Unit: exact-topic after-offset variant (mid-stream, at-tip, beyond-tip, markers interleaved); =fetchPatternByOffset= reuse path.
+- Integration: publish 3 events; assert =--after-offset <offset of 2nd>= yields exactly the 3rd; =--from <global offset>= repro asserts the stderr warning text and exit 0; empty topic asserts no warning; HTTP round-trip: response offset → =?after_offset== → =[]=, then one more publish → exactly the new event; =offset=&after_offset== → 400.
+
+* Acceptance Criteria
+- Publish three events to a fresh topic; =ever sub <t>= prints them tagged =[t:G1] [t:G2] [t:G3]=; =ever sub <t> --after-offset G2= returns exactly the third event; =ever sub <t> --after-offset G3= returns none (exit 0, no warning).
+- =ever sub <t> --from 160= against the 3-event topic prints =warning: start 160 is beyond the end of topic '<t>' (3 events)= on stderr, then =No events.=, exit 0.
+- =ever sub <empty-topic>= prints =No events.= with no warning, exit 0 — the two empty cases are now distinguishable.
+- =ever sub <t> --from 1 --after-offset G1= is rejected as a usage error.
+- =ever wait <t> --after-offset G3 --count 1= returns the next event published after G3.
+- HTTP: =GET /topics/<t>/events?after_offset=G= where =G= is the last =offset= from a previous response returns ={"events":[]}=; after one more publish it returns exactly the new event. =GET ...?offset=1= keeps today's skip-count behaviour. Supplying both parameters returns 400.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 1 Mode B and proposal P3, verified at 142d5e6). Chose the additive =--after-offset= / =?after_offset== shape over changing the display format, and stderr warning without exit-code change.
