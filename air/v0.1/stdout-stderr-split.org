@@ -1,0 +1,124 @@
+#+title: Stdout/Stderr Split for CLI Output
+#+state: draft
+#+FILETAGS: :cli:subscriber:orchestrator:
+
+* Summary
+Every CLI command handler writes its output — event data, list rows, JSON, and diagnostics alike — to *stderr* via =std.debug.print=. The stdout writer that =main= constructs and hands to the CLI framework is used only for =--help= text. As a result every piped read (=ever sub <t> | jq=, =ever topic list | grep=, =ever status --json | jq=, =$(...)=, => file=) sees zero bytes. This doc specifies the split: *data goes to stdout, diagnostics stay on stderr*, with a command-by-command classification so the change is mechanical.
+
+* Motivation
+This is the headline bug (Incident 1, Mode A) and top-priority proposal (P1) of the ever field report (=docs/ever.org= in the notes repo, verified live at exactly this base commit =142d5e6=, and independently re-verified byte-for-byte by two review rounds). During a multi-agent supervision session, every =ever sub= read composed with a pipe returned empty for topics that demonstrably held events — the same topics fetched fine over the HTTP API the whole time. An entire session's "is the worker done?" checks degraded to HTTP polling plus hook-log archaeology. The durable log was fine; the CLI window onto it was not.
+
+** Root cause (verified in this workspace)
+- =src/main.zig= contains exactly 117 =std.debug.print= call sites (=grep -c 'std.debug.print' src/main.zig= → 117); =std.debug.print= writes to stderr.
+- The status renderer adds 2 more (=src/store/status.zig:499= in =printHuman=, =:555= in =printJson= — so even =status --json=, the one machine-readable output mode, is unpipeable).
+- =src/net/client.zig= adds 2 (lines 138, 142 — server-error diagnostics; these are correctly stderr, listed for completeness per the round-1 review).
+- =main= constructs a buffered stdout writer (=src/main.zig:1489=) and passes it to =app.run= (=:1497=), but command handlers never touch it — only the framework's =--help= renderer does.
+
+** Reproduction (from the report; store and CLI both 0.1.0 at =142d5e6=)
+#+begin_example
+$ ever topic create wutest.wever.subtest
+$ ever pub wutest.wever.subtest '{"n":1}'   # Published to wutest.wever.subtest at offset 159
+$ ever pub wutest.wever.subtest '{"n":2}'   # ... at offset 160
+$ ever pub wutest.wever.subtest '{"n":3}'   # ... at offset 161
+$ ever sub wutest.wever.subtest             # terminal: 3 events shown
+$ ever sub wutest.wever.subtest 2>/dev/null | wc -c
+0
+#+end_example
+
+Which forms fail and which work (middle column is what a terminal or =2>&1= sees; right column is stdout-only — pipes, =$( )=, redirection):
+
+| Invocation                             | Human terminal (stderr visible) | Piped / captured stdout       |
+|----------------------------------------+---------------------------------+-------------------------------|
+| =sub <topic>=                          | events shown                    | empty (0 bytes)               |
+| =sub <topic> --from 0=                 | events shown                    | empty                         |
+| =sub <prefix>.=                        | events shown                    | empty                         |
+| =sub <topic> --json-values=            | payloads shown                  | empty — =jq= receives nothing |
+| =sub <topic> --from <printed-offset>=  | "No events.", exit 0            | empty, exit 0                 |
+| =curl .../topics/<t>/events=           | JSON on stdout                  | works                         |
+
+The HTTP asymmetry is exact: same store, same =TopicManager.fetch=, same data — =curl= writes the response body to stdout, the CLI writes everything to stderr. Because =No events.= and error messages also share the stream with data, a script cannot distinguish data from diagnostics at all.
+
+** Goals
+- Data — anything a script would consume — goes to stdout.
+- Diagnostics — acks, errors, progress chatter, empty-result notices — stay on stderr.
+- A single classification rule plus a command-by-command table, so an implementer never re-decides per call site.
+- Exit codes unchanged everywhere.
+
+** Non-Goals
+- New =--json= output modes — =v0.1/sub-json-output.org=, =v0.1/hook-logs-json.org=, and the in-flight =cli-json-list-output.org= draft cover those; they all compose on top of this doc.
+- Changing =--from= / offset semantics (=v0.1/offset-coherence.org=).
+- Making =status= query the running store over TCP (=v0.1/status-over-tcp.org=) — this doc only fixes which stream =status= writes to.
+- Changing any human-readable output *format* — only the file descriptor changes.
+- =src/bench.zig= (24 =std.debug.print= sites — dev tool, not user-facing CLI) and server-side daemon logging (=server.zig=, =hooks.zig=, =timers.zig= — store logs, correctly stderr).
+
+* Proposal
+
+** Classification rule
+For every output line, ask: *would a script consume it?* If yes → stdout. If it is feedback about the operation (ack, error, progress, prompt, "nothing here" notice) → stderr. When in doubt, the test is composition: =ever <cmd> | consumer= must deliver exactly the data and nothing else.
+
+** Command-by-command split
+
+*** Data → stdout
+| Command                | stdout content                                                          |
+|------------------------+-------------------------------------------------------------------------|
+| =sub=                  | event lines (default =[topic:offset] value= format and =--json-values= payloads), including under =--follow= |
+| =wait=                 | matched event lines printed on success (same =printEvent= path as =sub=) |
+| =topic list=           | topic rows                                                              |
+| =hook list=            | table header + hook rows                                                |
+| =hook ps=              | table header + process rows                                             |
+| =hook logs=            | entire output: the =Log file: <path>= line, =---= separator, and log content |
+| =timer list=           | table header + timer rows                                               |
+| =timer info=           | the detail block                                                        |
+| =status=               | full report, both human format and =--json=                             |
+| =version=              | version string                                                          |
+
+*** Diagnostics → stderr
+| Output                                                              | Examples                                                        |
+|---------------------------------------------------------------------+-----------------------------------------------------------------|
+| Publish acks                                                        | =Published to <topic> at offset <N>=                            |
+| Mutation acks                                                       | =Topic 'x' created.=, =Hook #3 removed.=, =Timer 'x' added.=    |
+| Errors                                                              | every =error: ...= line, in handlers and in =main='s catch arms |
+| Empty-result notices                                                | =No events.=, =No topics.=, =No hooks registered.=, =(empty)=   |
+| Progress / watch chatter                                            | =ever on='s =Watching '<pattern>' from offset <N>...=           |
+| Interactive prompts                                                 | =hook new= / =timer new= prompt text                            |
+
+Empty-result notices are diagnostics on purpose: =ever sub empty.topic | wc -l= must yield 0, not 1, so "no data" is representable as no bytes. Scripts branch on content or exit code, never on prose.
+
+** Exit codes
+Unchanged. This doc moves bytes between file descriptors; it does not touch success/failure semantics. (The "empty vs beyond-end both exit 0" ambiguity is =v0.1/offset-coherence.org='s scope.)
+
+* Design Details
+
+** The plumbing already exists
+=zig-cli-kit='s =cli.Context= carries =stdout: *std.Io.Writer= and =stderr: *std.Io.Writer= (see =Context= in the vendored =zig-cli-kit= =src/cli/types.zig=), populated from the buffered writers =main= builds at =src/main.zig:1489–1497=. Every handler already receives =ctx=. The work is mechanical: for each of the 117 =src/main.zig= sites (plus the 2 in =src/store/status.zig=), replace =std.debug.print(fmt, args)= with =ctx.stdout.print(fmt, args)= or =ctx.stderr.print(fmt, args)= per the table above. =src/store/status.zig='s =printHuman= / =printJson= take no writer today — thread a =*std.Io.Writer= parameter through from =handleStatus=.
+
+** Trap 1: flushing before =process.exit=
+=main= flushes the writers via =defer=, but handlers exit error paths with =std.process.exit(1)=, which bypasses deferred flushes. =std.debug.print= was unbuffered so this never mattered; with buffered writers it silently drops output. Introduce a small helper (e.g. =fatal(ctx, fmt, args)= that flushes both writers then exits) and use it on every early-exit path; flush stdout at the end of each handler that produced data.
+
+** Trap 2: streaming must flush per event
+=sub --follow=, =wait=, and =on= produce output incrementally. A 4096-byte buffered stdout writer would hold events back for minutes — flush after each event line so =ever sub t --follow | while read ...= sees events as they arrive.
+
+** Trap 3: =BrokenPipe= on stdout
+Once data flows to stdout, =ever sub t --follow | head -1= will close the pipe and the next write fails with =error.BrokenPipe=. Follow Unix convention: treat =BrokenPipe= on stdout as normal termination (exit 0, no error message). =main= already has a =BrokenPipe= catch arm (=src/main.zig=, =app.run= error handling) that prints =error: connection lost= — that arm must distinguish stdout-pipe closure from store-connection loss, or the handlers should catch =BrokenPipe= from stdout writes locally and exit cleanly.
+
+** Out-of-scope call sites
+The 2 =std.debug.print= sites in =src/net/client.zig= (server-error diagnostics) already target the correct stream and can stay as-is — =client.zig= has no =Context=. Same for the fatal catch arms in =main= (they are errors → stderr).
+
+** Test strategy
+Extend the integration tests (see =v0.1/integration-testing.org=): for each read command, run it with stdout and stderr captured separately against a store with known content and assert (a) stdout contains exactly the expected data, (b) stderr contains no data lines; for each write/error path, assert stdout is byte-empty. A cheap regression guard: assert =grep -c 'std.debug.print' src/main.zig= is 0 (or an allow-listed handful) after the migration.
+
+* Acceptance Criteria
+With a running store and a topic =t= holding ≥1 event:
+- =ever sub t 2>/dev/null | wc -c= > 0, and the bytes are the event lines.
+- =ever sub t --json-values 2>/dev/null | jq .= parses each payload.
+- =ever sub t --follow 2>/dev/null | head -1= prints the first event promptly and exits 0 (per-event flush + BrokenPipe handling).
+- =ever topic list 2>/dev/null | grep <name>= matches an existing topic.
+- =ever status --json 2>/dev/null | jq .= parses (run with a valid =--data-dir=, per current =status= semantics).
+- =ever hook logs <id> 2>/dev/null | wc -c= > 0 for a hook that has fired.
+- =ever pub t '{"x":1}' 2>/dev/null= emits zero bytes on stdout; the =Published to ... at offset N= ack still appears on stderr.
+- =ever sub missing.topic 2>/dev/null= emits zero bytes on stdout, prints the error to stderr, exits 1.
+- =ever sub empty.topic 2>/dev/null | wc -c= = 0, exit 0; =No events.= appears on stderr only.
+- Exit codes for every command are identical to pre-change behaviour.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
