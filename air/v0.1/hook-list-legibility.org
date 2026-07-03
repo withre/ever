@@ -3,7 +3,7 @@
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
-=ever hook list= shows a =Last Offset= column that prints the hook's raw cursor — a value whose meaning depends on pattern shape (topic-local skip count for exact topics, global log offset for prefix/wildcard patterns, per =v0.1/hook-registration-cursor.org=). Two hooks armed in the same second with zero firings each can show =4= and =164= in the same column, and both read as "already fired N times". This doc replaces the raw cursor in the human table with two derived, uniform columns — =Pending= (matching events not yet processed) and =Fired= (lifetime execution count, a new persisted per-hook counter mirroring the timers' =FIRES=) — moves the overflow-prone =Command= column last so the table stays positionally parseable, and keeps raw cursors available in =hook list --json= as =cursor= + =cursor_kind=.
+=ever hook list= shows a =Last Offset= column that prints the hook's raw cursor — a value whose meaning depends on pattern shape (topic-local skip count for exact topics, global log offset for prefix/wildcard patterns, per =v0.1/hook-registration-cursor.org=). Two hooks armed in the same second with zero firings each can show =4= and =164= in the same column, and both read as "already fired N times". This doc replaces the raw cursor in the human table with two derived, uniform columns — =Pending= (matching events not yet processed) and =Fired= (lifetime execution count, consuming the persisted =fired_count= counter defined by =v0.1/hook-failure-visibility.org=) — moves the overflow-prone =Command= column last so the table stays positionally parseable, and keeps raw cursors available in =hook list --json= as =cursor= + =cursor_kind=.
 
 * Motivation
 From the ever field report (=docs/ever.org=, Incident 2 "=Last Offset= dual semantics", verified at =142d5e6=). Two hooks registered in the same second, /zero/ firings each (columns compressed for layout; the binary renders wider NAME/Pattern columns):
@@ -26,11 +26,11 @@ Code facts, verified in this workspace:
 - A freshly armed hook reads =Pending: 0, Fired: 0= at a glance, regardless of pattern shape.
 - The table stays column-aligned for arbitrarily long commands.
 - Raw cursors remain available for debugging in =hook list --json= as =cursor= + =cursor_kind=.
-- The =Fired= counter uses the same persisted per-hook mechanism that =v0.1/hook-failure-visibility.org= (P7) needs for its failure counters — one design, two docs.
+- The =Fired= column consumes the =fired_count= counter defined by =v0.1/hook-failure-visibility.org= (P7) — one data design, owned there; this doc owns the presentation.
 
 ** Non-Goals
 - Changing cursor semantics or the hook daemon's delivery behaviour (=v0.1/hook-registration-cursor.org= stands).
-- Failure counts, last exit status, dead-lettering — that is =v0.1/hook-failure-visibility.org= (P7); this doc only provides the shared counter mechanism and the =Fired= column it plugs into.
+- The execution-counter data model — field definitions, increment points, persistence, compatibility — is owned by =v0.1/hook-failure-visibility.org= (P7): "this doc owns the data; P4 owns the presentation". This doc only consumes =fired_count= and specs how the table renders it.
 - Re-specifying =hook list --json= — owned by =v0.1/cli-json-list-output.org= (in-flight draft, uncommitted at time of writing); this doc proposes additions to that schema by reference only.
 - The output-stream fix (=v0.1/stdout-stderr-split.org=, P1) — table rendering rides on it.
 
@@ -46,7 +46,7 @@ ID   NAME                 Pattern                   Pending   Fired     Command
 #+end_example
 
 - =Pending= — number of events matching the pattern that the hook has not yet processed. Uniform meaning for both cursor kinds (computation below).
-- =Fired= — lifetime number of events delivered to the hook (execution attempts), a new persisted per-hook counter. Mirrors the timers' =FIRES= precedent.
+- =Fired= — lifetime number of events delivered to the hook, rendering the =fired_count= counter from =v0.1/hook-failure-visibility.org= (P7). Mirrors the timers' =FIRES= precedent.
 - Column-overflow fix (explicit decision): =Command= — the only unbounded-width field — moves to the /last/ position and is printed un-padded, the classic =ps= layout. All preceding columns keep fixed widths, so the table is positionally parseable no matter how long the command is. No truncation.
 
 ** =Pending= computation (server-side, at =list_hooks= time)
@@ -55,29 +55,31 @@ The server handler (=src/net/server.zig handleListHooks=) has both the =HookTabl
 - /Prefix or wildcard/ (cursor = global log offset): count of non-marker events with =offset >= cursor= whose topic matches the pattern. Implemented as a count-only variant of =fetchPatternByOffset= (same scan-from-cursor loop: skip markers, =matchTopic=, tally instead of allocating event bodies). To bound the scan on a hook that is far behind a large log, the count caps at 1000 and renders as =1000+=. (The per-topic offset lists alone cannot answer this — they include marker offsets — so the log scan is the honest computation.)
 =Pending= is a point-in-time snapshot racing live publishes; that is fine for a status display and worth a one-line note in the column legend.
 
-** =Fired= counter (shared mechanism with P7)
-- New field =fire_count: u64= on =Hook= (=src/store/hooks.zig=), persisted in =hooks.json= like =cursor=; legacy records without the field load as =0= (the loader already tolerates schema evolution — cf. the legacy-hook parsing path).
-- Incremented in =HookDaemon.processHook= at the same site =updateCursor= is called — once per delivered event. This counts /execution attempts/: spawn failures and nonzero exits also advance the cursor today (only =ConcurrentLimitReached= does not), so they count as fired. That is deliberate: =v0.1/hook-failure-visibility.org= (P7) subdivides this same number with sibling counters (=failure_count=, =last_exit_status=) maintained at the same persistence point, rendering as =Fired: 12 (2 failed)=. The shared design both docs name: *persisted per-hook execution counters in =hooks.json=, updated by the daemon alongside the cursor*. This doc ships =fire_count= and the plumbing; P7 adds its counters to the same struct without a second mechanism.
+** =Fired= column (counter owned by P7)
+The field definition, increment point, and persistence of =fired_count= are OWNED by =v0.1/hook-failure-visibility.org= (P7) and are not re-specified here — see its "New fields" table and "Update points". One-line semantics summary for readers of this doc: =fired_count= counts /execution attempts/, i.e. every delivered event that advanced the cursor, including spawn failures and nonzero exits (only =ConcurrentLimitReached= leaves cursor and counter untouched) — P7 subdivides it with =failure_count= and friends.
+
+What this doc adds on top: the =Fired= human-table column renders =fired_count= (and, once P7's =failure_count= is nonzero, P7's =12 (2 failed)= annotation style applies in this table unchanged). Implementation dependency, stated honestly: the =Fired= column depends on P7's counters landing — if this doc is implemented first, the column renders =0= for all hooks until P7 ships.
 
 ** Wire and JSON
-- =HookInfo= (=src/protocol/message.zig=) gains additive fields: =pending: u64=, =fired: u64=, =cursor_kind: []const u8= (="topic_local"= | ="global"=). Existing =cursor= stays.
-- =hook list --json=: =v0.1/cli-json-list-output.org= (in-flight draft, uncommitted at time of writing) specs the hook object with a bare =cursor= field. Proposed additions to that schema, by reference: =cursor_kind= as above, plus =pending= and =fired=. Rationale for =cursor_kind=: a bare =cursor= number reproduces the dual-semantics trap in machine-readable form; the kind tag makes it self-describing.
+- =HookInfo= (=src/protocol/message.zig=) gains additive fields from this doc: =pending: u64= and =cursor_kind: []const u8= (="topic_local"= | ="global"=). Existing =cursor= stays. =fired_count= (and the other counter fields) are added to =HookInfo= by =v0.1/hook-failure-visibility.org=, not here.
+- =hook list --json=: =v0.1/cli-json-list-output.org= (in-flight draft, uncommitted at time of writing) specs the hook object with a bare =cursor= field. Proposed additions to that schema, by reference: =cursor_kind= and =pending= from this doc; =fired_count= per P7. Rationale for =cursor_kind=: a bare =cursor= number reproduces the dual-semantics trap in machine-readable form; the kind tag makes it self-describing.
 
 * Design Details
-- =src/store/hooks.zig= — =Hook.fire_count= + persistence (save/load, default 0); increment in =processHook= next to =updateCursor=; expose in the table snapshot used by =list_hooks=.
+- =src/store/hooks.zig= — no changes owned by this doc; the =fired_count= field, its increment in =processHook=, and =hooks.json= persistence are specced in =v0.1/hook-failure-visibility.org=. This doc only requires the counter be exposed in the table snapshot used by =list_hooks=.
 - =src/store/topic.zig= — =countPatternByOffset= (count-only sibling of =fetchPatternByOffset=, with cap parameter); exact-topic pending needs no new code (=non_marker_count= is public state).
-- =src/net/server.zig handleListHooks= — populate =pending= / =fired= / =cursor_kind= per hook under the manager lock.
+- =src/net/server.zig handleListHooks= — populate =pending= / =fired_count= / =cursor_kind= per hook under the manager lock (=fired_count= copied from the P7-owned counter).
 - =src/net/client.zig= — carry the new fields through =HookInfoOwned=.
 - =src/main.zig handleHookList= — new header/row rendering: fixed-width =ID NAME Pattern Pending Fired=, then un-padded =Command= last. =1000+= rendering for the capped count.
-- Tests: unit — =fire_count= persists across =HookTable= reload; count-only pattern scan (markers excluded, cap honoured); integration — fresh exact + prefix hooks both list =Pending 0 / Fired 0=; publish N matching events, wait for the daemon, assert =Fired: N= and =Pending: 0=; publish while daemon is stopped, assert =Pending= grows identically for both hook kinds; register a hook with a 60-char command and assert header/row column positions still agree.
+- Tests (presentation-side only; counter persistence/increment tests live in P7): unit — count-only pattern scan (markers excluded, cap honoured); integration — fresh exact + prefix hooks both list =Pending 0 / Fired 0=; publish N matching events, wait for the daemon, assert =Fired: N= and =Pending: 0= (consumes =fired_count=); publish while daemon is stopped, assert =Pending= grows identically for both hook kinds; register a hook with a 60-char command and assert header/row column positions still agree.
 
 * Acceptance Criteria
 - A freshly armed hook (exact or prefix, with prior events on the log) lists =Pending: 0, Fired: 0= — never a raw cursor.
-- A hook that has consumed N matching events lists =Fired: N=; after N more with the handler command broken (spawn failure), =Fired: 2N= (failure subdivision is P7's).
+- A hook that has consumed N matching events lists =Fired: N=; after N more with the handler command broken, =Fired: 2N= (per =fired_count='s execution-attempt semantics; failure subdivision is P7's).
 - An exact-topic hook and a prefix hook armed at the same instant show comparable values in every column (the =4= vs =164= discrepancy is impossible by construction).
 - With events published while a hook cannot run, =Pending= reports the backlog for both cursor kinds; a backlog beyond the cap renders =1000+=.
 - A hook whose command exceeds 30 characters does not shift any column: =Command= is rendered last and un-padded, and all preceding columns remain aligned with the header.
-- =hook list --json= (per =v0.1/cli-json-list-output.org= + this doc's additions) carries =cursor=, =cursor_kind=, =pending=, =fired= for each hook.
+- =hook list --json= (per =v0.1/cli-json-list-output.org= + this doc's additions + P7's fields) carries =cursor=, =cursor_kind=, =pending=, =fired_count= for each hook.
 
 * History
+- 2026-07-03: Reconciled counter ownership with the landed v0.1/hook-failure-visibility.org (P7): renamed =fire_count=/=fired= to =fired_count=, dropped this doc's duplicate field/increment/persistence specs in favour of references — P7 owns the data, this doc owns the presentation. Noted the Fired column's implementation dependency on P7.
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 2 and proposal P4, verified at 142d5e6). Names the persisted per-hook execution-counter mechanism shared with v0.1/hook-failure-visibility.org; JSON additions specced by reference to the in-flight v0.1/cli-json-list-output.org draft.
