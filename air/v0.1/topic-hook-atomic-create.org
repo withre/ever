@@ -1,0 +1,91 @@
+#+title: Atomic Topic + Hook Creation
+#+state: draft
+#+FILETAGS: :cli:store:orchestrator:
+
+* Summary
+Add a single command that creates a named topic and registers an armed hook on it in one server-side operation, executed under the same lock the hook-registration cursor already uses. Today the caller must run =ever topic create= and =ever hook add= as two separate commands, and any event published between (or before) them is invisible to the hook by construction. The new surface makes "no event can precede the hook" a structural guarantee instead of a discipline.
+
+* Motivation
+The ever field report (=docs/ever.org=, Incident 2, verified at =142d5e6=) describes the failure class:
+
+#+begin_quote
+The no-replay default makes registration order load-bearing: any event published before its hook exists is invisible to the push path by construction. In the session this bit hard — topics introduced by a follow-up instruction never got hooks, and their events sat durable-but-unobserved for hours. [...] There is no way to create a topic with its hook already armed, atomically, in one command; the caller must remember a two-step dance for every topic, including ones invented mid-flight.
+#+end_quote
+
+Code facts, spot-checked in this tree at =142d5e66=:
+
+- Publishing requires the topic to exist: =TopicManager.publish= (=src/store/topic.zig:240=) returns =TopicError.NotFound= for unknown topics, and neither the server (=handlePublish=, =src/net/server.zig:171=) nor the CLI auto-creates. So every new topic already forces a =topic create= — the hook-arming step is the one the caller can forget, and forgetting it is silent: publishes succeed, events are durable, and the push path never sees them.
+- The registration-cursor design ([[file:hook-registration-cursor.org][v0.1/hook-registration-cursor.org]]) deliberately made no-replay the default: a hook observes only events published after registration. That is the right default for orchestration (verified live in the report), but it is exactly what makes registration order load-bearing.
+- The primitive needed for the fix already exists: =handleRegisterHook= (=src/net/server.zig:290=) resolves a new hook's cursor by taking =TopicManager.lockForHookRegistration()= (=src/store/topic.zig:101= — the same mutex the publish path uses), computing =tipForPatternLocked=, and inserting the hook before unlocking, so no publish can interleave. Topic creation (=TopicManager.createTopic=, =src/store/topic.zig:156=) serializes on the same mutex. Combining the two under one critical section gives "topic exists ∧ hook armed ∧ zero events" as a single observable transition.
+
+** Goals
+- One command yields a named topic with its hook already armed.
+- An event published immediately after the command returns is delivered to the hook — no window in which a publish can land before the hook exists.
+- Failure of either half leaves neither: no armed-topic-without-hook, no error path that leaves a stray topic behind.
+- The existing two-step flow (=topic create= then =hook add=) is untouched.
+
+** Non-Goals
+- Auto-generated private scratch topics for pattern-less =hook add= — that is the in-flight draft =v0.1/hook-ergonomics/hook-auto-topic.org= (uncommitted at time of writing). See "Relationship to hook-auto-topic" below for the boundary.
+- Tombstone display: the report bundles a =topic list --deleted= / default-hide-tombstones split into P6. This doc *deviates from the report* and excludes it: tombstone rendering belongs with the topic-list output work — the in-flight draft =v0.1/cli-json-list-output.org= (uncommitted at time of writing) already carries a =deleted= field in =topic list --json=.
+- Changing replay semantics or the registration-cursor design.
+- Crash-consistency (two-phase commit) across =hooks.json= and the event log — see Design Details for why the crash window is benign.
+
+* Proposal
+
+** Primary surface: =ever hook add --create-topic=
+
+#+begin_example
+$ ever hook add --create-topic agent.results -- ./notify.sh
+Hook #12 registered: agent.results → ./notify.sh (topic created)
+#+end_example
+
+Justification for putting the flag on =hook add= rather than =topic create=: =hook add= already carries the full hook option surface — =--once=, =--name=, =--timeout=, the =--= command form (=handleHookAdd=, =src/main.zig:372=) — and =--create-topic= composes with all of it for free. A =topic create <name> --with-hook 'CMD'= surface would either duplicate that flag set or offer a crippled subset. The report proposes both forms; one implementation serves both, and the =topic create --with-hook= spelling can be added later as sugar over the same protocol operation (Future Work).
+
+** Semantics
+- =--create-topic= requires the pattern argument to be an exact topic name — no trailing-dot prefix, no =*= wildcard. Violations exit 1 with a clear error; nothing is created.
+- If the topic already exists (including tombstoned names — =createTopic= returns =AlreadyExists= for both), the command fails and *no hook is registered*. Rationale: silently attaching a fresh no-replay hook to a topic with existing history would recreate, in disguise, exactly the trap this doc closes — the pre-existing events would be invisible to the hook. Failing forces the caller to acknowledge that history exists and use plain =hook add= (optionally with =--from-beginning= / =--from N=) deliberately.
+- =--create-topic= combined with =--from-beginning= / =--from N= is rejected: a freshly created topic has no history to replay, so the combination is always a caller error.
+- On success the new hook's cursor is the fresh topic's tip (=0= non-marker events), so the first event ever published to the topic is the first event delivered.
+
+** Protocol
+Extend =RegisterHookRequest= (=src/protocol/message.zig:121=) with =create_topic: bool = false=. No new message type. =handleRegisterHook= (=src/net/server.zig:290=) handles the flag inside the critical section it already takes:
+
+#+begin_src
+lockForHookRegistration()            // same mutex as publish — src/store/topic.zig:101
+  validate name; fail AlreadyExists  // nothing created on failure
+  tip = tipForPatternLocked(topic)   // 0 for a fresh topic
+  id = hook_table.addWithCursor(...) // hook durable in hooks.json
+  createTopicLocked(topic)           // append creation marker to the log
+unlockForHookRegistration()
+#+end_src
+
+Because the TopicManager mutex is held for the whole operation, no publish can interleave anywhere inside it: at the moment the topic becomes publishable, the hook is already armed. This is the same consistency-under-single-writer-discipline argument as the registration cursor (see the =lockForHookRegistration= doc comment and [[file:hook-registration-cursor.org][v0.1/hook-registration-cursor.org]], M1).
+
+* Design Details
+
+** Ordering and command-level atomicity
+Under the lock, all fallible validation happens first (topic-name validity, non-existence), so the common failure — =AlreadyExists= — creates nothing. The hook is registered before the topic marker is appended; if the marker append fails, the hook record is removed before the error is returned, leaving neither half. The reverse order would be worse: a created topic cannot be un-created (deletion writes a permanent tombstone), while a hook record can be removed cleanly.
+
+** Crash window
+If the store crashes between hook registration and marker append, the surviving state is a hook on a not-yet-existing exact topic. This is benign and already legal: =tipForPatternLocked= returns =0= for nonexistent topics, hooks on nonexistent topics simply wait, and publishes to the topic still fail with =NotFound= until it is created — so no event can be missed. The caller retries the command; =hook list= shows the orphan hook, which can be removed. No two-phase commit across =hooks.json= and the log is warranted for this.
+
+** Code changes
+- =src/store/topic.zig=: split =createTopic= into a locking wrapper plus a =createTopicLocked= body — the TopicManager mutex is a non-reentrant spinlock (=lock()= spins on =tryLock=), so =handleRegisterHook= cannot call today's =createTopic= while holding the registration lock.
+- =src/protocol/message.zig=: =RegisterHookRequest.create_topic: bool = false= (defaulted, so old clients are unaffected).
+- =src/net/server.zig=: =handleRegisterHook= branch as sketched above; new error mapping for =AlreadyExists= and invalid-pattern-shape.
+- =src/net/client.zig=: thread the flag through the register-hook call.
+- =src/main.zig=: =--create-topic= flag on =hook add=; pattern-shape and flag-conflict validation client-side (mirrored server-side — the server must not trust the client).
+- Tests: (a) one command → topic exists, hook armed, next publish delivered exactly once; (b) =AlreadyExists= → exit 1, no hook added; (c) wildcard/prefix pattern with =--create-topic= → exit 1, nothing created; (d) marker-append failure injected → hook removed, error returned; (e) two-step flow unchanged.
+
+** Relationship to hook-auto-topic (in-flight draft)
+=v0.1/hook-ergonomics/hook-auto-topic.org= (uncommitted draft at time of writing) covers the pattern-less =ever hook add -- CMD= form that auto-generates a *private scratch* topic (=ever.hook.<id>.auto=) whose lifecycle is tied to the hook: deleted on =hook rm=, deleted when a =--once= hook fires. This doc covers *named, caller-owned* topics: the caller picks the name, other agents publish to it, and =hook rm= does *not* delete the topic. The boundary is ownership and lifecycle; the surfaces are complementary, not overlapping. The server-side create-topic-plus-register-hook critical section specified here is the natural implementation substrate for that draft's registration step.
+
+* Acceptance Criteria
+- =ever hook add --create-topic t.new -- CMD= (one command, topic previously nonexistent) creates the topic and registers the hook; an =ever pub t.new '{...}'= issued immediately after the command returns is delivered to the hook exactly once (verifiable via the hook's execution log).
+- If the topic already exists: exit 1 with a clear error, and =ever hook list= shows no new hook.
+- If the pattern is a prefix or wildcard: exit 1, and neither topic nor hook is created.
+- Induced failure of the topic-creation half (fault injection in tests) leaves no hook registered — failure of either half leaves neither.
+- The existing two-step flow is unchanged: =ever topic create t= followed by =ever hook add t -- CMD= behaves exactly as today, including cursor semantics.
+
+* History
+- 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6). Deviation from the report: the =topic list --deleted= / tombstone-display split that P6 bundles is moved to Non-Goals (belongs with v0.1/cli-json-list-output.org).
