@@ -1,5 +1,5 @@
 #+title: Hook List Legibility: Pending and Fired Columns
-#+state: draft
+#+state: ready
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
@@ -81,5 +81,6 @@ What this doc adds on top: the =Fired= human-table column renders =fired_count= 
 - =hook list --json= (per =v0.1/cli-json-list-output.org= + this doc's additions + P7's fields) carries =cursor=, =cursor_kind=, =pending=, =fired_count= for each hook.
 
 * History
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-03: Reconciled counter ownership with the landed v0.1/hook-failure-visibility.org (P7): renamed =fire_count=/=fired= to =fired_count=, dropped this doc's duplicate field/increment/persistence specs in favour of references — P7 owns the data, this doc owns the presentation. Noted the Fired column's implementation dependency on P7.
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 2 and proposal P4, verified at 142d5e6). Names the persisted per-hook execution-counter mechanism shared with v0.1/hook-failure-visibility.org; JSON additions specced by reference to the in-flight v0.1/cli-json-list-output.org draft.

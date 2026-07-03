@@ -1,5 +1,5 @@
 #+title: Status Over TCP: Query the Running Store, Not the Local Data Directory
-#+state: draft
+#+state: ready
 #+FILETAGS: :cli:protocol:store:
 
 * Summary
@@ -114,4 +114,5 @@ All numbers come from live state the server already maintains — no data-dir re
 - On a quiesced store, server-sourced counters (topics, per-topic events, total events, segments, total bytes, hook count) equal the offline scan's numbers for the same data dir.
 
 * History
+- 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 3, verified at 142d5e6). Imported and adapted from the round-1 review's pre-draft (notes/reviews/round-1/proposed-air/ever--status-over-tcp.org); reconciled with the landed v0.1/status-server-check.org probe (this doc adds server-served statistics; that doc added endpoint reachability only).
