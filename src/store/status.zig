@@ -492,11 +492,11 @@ pub fn formatHuman(alloc: Allocator, status: *const StoreStatus) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Print human-readable store status to stderr.
-pub fn printHuman(status: *const StoreStatus, alloc: Allocator) void {
-    const text = formatHuman(alloc, status) catch return;
+/// Write human-readable store status to `out` (the caller's stdout).
+pub fn printHuman(status: *const StoreStatus, alloc: Allocator, out: *std.Io.Writer) !void {
+    const text = try formatHuman(alloc, status);
     defer alloc.free(text);
-    std.debug.print("{s}", .{text});
+    try out.print("{s}", .{text});
 }
 
 /// Format JSON store status. Caller owns returned memory.
@@ -548,11 +548,11 @@ pub fn formatJson(status: *const StoreStatus, alloc: Allocator) ![]u8 {
     return json.toOwnedSlice(alloc);
 }
 
-/// Print JSON store status to stderr.
-pub fn printJson(status: *const StoreStatus, alloc: Allocator) void {
-    const json = formatJson(status, alloc) catch return;
+/// Write JSON store status to `out` (the caller's stdout).
+pub fn printJson(status: *const StoreStatus, alloc: Allocator, out: *std.Io.Writer) !void {
+    const json = try formatJson(status, alloc);
     defer alloc.free(json);
-    std.debug.print("{s}", .{json});
+    try out.print("{s}", .{json});
 }
 
 fn appendFmt(json: *std.ArrayList(u8), alloc: Allocator, comptime fmt: []const u8, args: anytype) void {

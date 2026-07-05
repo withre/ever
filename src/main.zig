@@ -15,8 +15,7 @@ pub fn parseStoreAddress(ctx: *const cli.Context) struct {
     const addr = ctx.flag("address");
     const port_str = ctx.flag("port");
     const port = std.fmt.parseInt(u16, port_str, 10) catch {
-        std.debug.print("error: invalid port '{s}'\n", .{port_str});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid port '{s}'\n", .{port_str});
     };
     return .{
         .address = if (addr.len > 0) addr else "127.0.0.1",
@@ -24,46 +23,63 @@ pub fn parseStoreAddress(ctx: *const cli.Context) struct {
     };
 }
 
+/// Print a diagnostic to stderr. Flushes stdout first so terminal ordering
+/// matches the old unbuffered behaviour when data and diagnostics interleave,
+/// and flushes stderr so diagnostics appear immediately even in long-running
+/// commands (`sub --follow`, `on`, interactive prompts).
+fn diag(ctx: *const cli.Context, comptime fmt: []const u8, args: anytype) void {
+    ctx.stdout.flush() catch {};
+    ctx.stderr.print(fmt, args) catch {};
+    ctx.stderr.flush() catch {};
+}
+
+/// Print a diagnostic and exit with status 1. `std.process.exit` bypasses
+/// `main`'s deferred flushes, so every early-exit path must go through here
+/// (or `exitFlushed`) or buffered output is silently dropped.
+fn fatal(ctx: *const cli.Context, comptime fmt: []const u8, args: anytype) noreturn {
+    diag(ctx, fmt, args);
+    std.process.exit(1);
+}
+
+/// Flush both writers, then exit with the given code.
+fn exitFlushed(ctx: *const cli.Context, code: u8) noreturn {
+    ctx.stdout.flush() catch {};
+    ctx.stderr.flush() catch {};
+    std.process.exit(code);
+}
+
 /// Connect to the store, printing a clean error and exiting on failure.
-fn connectToStore(allocator: std.mem.Allocator, io: std.Io, addr: []const u8, port: u16) ever.client.Client {
-    return ever.client.Client.connect(allocator, io, addr, port) catch {
-        std.debug.print("error: cannot connect to store at {s}:{d}\n", .{ addr, port });
-        std.process.exit(1);
+fn connectToStore(allocator: std.mem.Allocator, ctx: *const cli.Context, addr: []const u8, port: u16) ever.client.Client {
+    return ever.client.Client.connect(allocator, ctx.io, addr, port) catch {
+        fatal(ctx, "error: cannot connect to store at {s}:{d}\n", .{ addr, port });
     };
 }
 
 fn handlePub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const topic = ctx.arg("topic");
     const data = ctx.arg("data");
 
     if (topic.len == 0) {
-        std.debug.print("error: topic is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic is required\n", .{});
     }
     if (data.len == 0) {
-        std.debug.print("error: data is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: data is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const offset = c.publish(topic, null, data) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
-    std.debug.print("Published to {s} at offset {d}\n", .{ topic, offset });
+    diag(ctx, "Published to {s} at offset {d}\n", .{ topic, offset });
 }
 
 fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const topic_name = ctx.arg("topic");
     if (topic_name.len == 0) {
-        std.debug.print("error: topic is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic is required\n", .{});
     }
 
     const from_offset = try ctx.flagInt(u64, "from");
@@ -73,7 +89,7 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 
     const addr_info = parseStoreAddress(ctx);
 
-    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var client = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
@@ -89,7 +105,7 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             const fetch_count: u32 = if (remaining > 0) remaining else max_count;
             var result = if (!did_initial)
                 (if (is_pattern) client.fetchPattern(topic_name, offset, fetch_count) else client.fetch(topic_name, offset, fetch_count)) catch |err| switch (err) {
-                    error.ServerError => std.process.exit(1),
+                    error.ServerError => exitFlushed(ctx, 1),
                     else => return err,
                 }
             else
@@ -100,12 +116,13 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                     @min(100, fetch_count),
                     5000,
                 ) catch |err| switch (err) {
-                    error.ServerError => std.process.exit(1),
+                    error.ServerError => exitFlushed(ctx, 1),
                     else => return err,
                 };
             defer result.deinit();
             for (result.events) |event| {
-                printEvent(event, json_values);
+                try printEvent(ctx.stdout, event, json_values);
+                try ctx.stdout.flush();
                 emitted += 1;
                 if (emitted >= max_count) break;
             }
@@ -115,25 +132,22 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         }
     } else {
         var result = (if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
-            error.ServerError => std.process.exit(1),
+            error.ServerError => exitFlushed(ctx, 1),
             else => return err,
         };
         defer result.deinit();
         if (result.events.len == 0) {
-            std.debug.print("No events.\n", .{});
+            diag(ctx, "No events.\n", .{});
         } else {
-            for (result.events) |event| printEvent(event, json_values);
+            for (result.events) |event| try printEvent(ctx.stdout, event, json_values);
         }
     }
 }
 
 fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const topic_name = ctx.arg("topic");
     if (topic_name.len == 0) {
-        std.debug.print("error: topic is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic is required\n", .{});
     }
 
     const count = try ctx.flagInt(u32, "count");
@@ -143,7 +157,7 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 
     const addr_info = parseStoreAddress(ctx);
 
-    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var client = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer client.deinit();
 
     const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
@@ -156,7 +170,7 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const block_interval_ms: u32 = 2000;
 
     while (collected < count) {
-        if (timeout_secs > 0 and elapsed_ms >= timeout_ms) std.process.exit(1);
+        if (timeout_secs > 0 and elapsed_ms >= timeout_ms) exitFlushed(ctx, 1);
         const remaining_ms: u32 = if (timeout_secs > 0)
             @intCast(@min(block_interval_ms, timeout_ms - elapsed_ms))
         else
@@ -167,10 +181,11 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             offset,
             @min(100, count - collected),
             remaining_ms,
-        ) catch std.process.fatal("fetch failed.", .{});
+        ) catch fatal(ctx, "error: fetch failed.\n", .{});
         defer result.deinit();
         for (result.events) |event| {
-            printEvent(event, json_values);
+            try printEvent(ctx.stdout, event, json_values);
+            try ctx.stdout.flush();
             collected += 1;
         }
         if (result.events.len > 0) offset += result.events.len;
@@ -179,7 +194,6 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 }
 
 fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const envp = ctx.envp;
 
     const pattern = ctx.arg("pattern");
@@ -187,32 +201,30 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
-        std.debug.print("error: pattern is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: pattern is required\n", .{});
     }
     if (rest_args.len == 0) {
-        std.debug.print("error: command is required after --\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: command is required after --\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
     const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
         (pattern.len > 0 and pattern[pattern.len - 1] == '.');
 
-    var client = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var client = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer client.deinit();
 
     var probe = (if (is_pattern)
         client.fetchBlocking(null, pattern, 0, 1_000_000, 0)
     else
         client.fetchBlocking(pattern, null, 0, 1_000_000, 0)) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     const next_offset: u64 = probe.events.len;
     probe.deinit();
 
-    std.debug.print("Watching '{s}' from offset {d}...\n", .{ pattern, next_offset });
+    diag(ctx, "Watching '{s}' from offset {d}...\n", .{ pattern, next_offset });
 
     var offset = next_offset;
     while (true) {
@@ -220,7 +232,7 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             client.fetchBlocking(null, pattern, offset, 100, 5000)
         else
             client.fetchBlocking(pattern, null, offset, 100, 5000)) catch |err| switch (err) {
-            error.ServerError => std.process.exit(1),
+            error.ServerError => exitFlushed(ctx, 1),
             else => return err,
         };
         defer result.deinit();
@@ -271,7 +283,7 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             var pipe_fds: [2]i32 = undefined;
             const pipe_rc = std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
             if (@as(isize, @bitCast(pipe_rc)) < 0) {
-                std.debug.print("pipe2 failed\n", .{});
+                diag(ctx, "pipe2 failed\n", .{});
                 continue;
             }
 
@@ -281,7 +293,7 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             if (pid_i < 0) {
                 _ = std.os.linux.close(pipe_fds[0]);
                 _ = std.os.linux.close(pipe_fds[1]);
-                std.debug.print("fork failed\n", .{});
+                diag(ctx, "fork failed\n", .{});
                 continue;
             }
 
@@ -305,7 +317,7 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
             const exit_code = (status >> 8) & 0xFF;
             if (exit_code != 0) {
-                std.debug.print("Command exited with status {d} for event on '{s}'\n", .{ exit_code, if (event.topic) |t| t else pattern });
+                diag(ctx, "Command exited with status {d} for event on '{s}'\n", .{ exit_code, if (event.topic) |t| t else pattern });
             }
         }
 
@@ -315,62 +327,55 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 }
 
 fn handleTopicCreate(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const name = ctx.arg("name");
 
     if (name.len == 0) {
-        std.debug.print("error: topic name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic name is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.createTopic(name) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
-    std.debug.print("Created topic: {s}\n", .{name});
+    diag(ctx, "Created topic: {s}\n", .{name});
 }
 
 fn handleTopicList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const topics = c.listTopics() catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer {
         for (topics) |t| allocator.free(t);
         allocator.free(topics);
     }
-    if (topics.len == 0) std.debug.print("No topics.\n", .{}) else for (topics) |t| std.debug.print("{s}\n", .{t});
+    if (topics.len == 0) diag(ctx, "No topics.\n", .{}) else for (topics) |t| try ctx.stdout.print("{s}\n", .{t});
 }
 
 fn handleTopicDelete(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const name = ctx.arg("name");
 
     if (name.len == 0) {
-        std.debug.print("error: topic name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic name is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.deleteTopic(name) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
-    std.debug.print("Deleted topic: {s}\n", .{name});
+    diag(ctx, "Deleted topic: {s}\n", .{name});
 }
 
 fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const pattern = ctx.arg("pattern");
     const once = ctx.flagBool("once");
     const name_flag = ctx.flag("name");
@@ -379,16 +384,13 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
-        std.debug.print("error: pattern is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: pattern is required\n", .{});
     }
     if (rest_args.len == 0) {
-        std.debug.print("error: command is required after --\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: command is required after --\n", .{});
     }
     if (from_beginning and from_flag.len > 0) {
-        std.debug.print("error: --from-beginning and --from are mutually exclusive\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: --from-beginning and --from are mutually exclusive\n", .{});
     }
 
     // Resolve start cursor: null = tip (server resolves), 0 = full replay,
@@ -397,8 +399,7 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         if (from_beginning) break :blk 0;
         if (from_flag.len > 0) {
             const n = std.fmt.parseInt(u64, from_flag, 10) catch {
-                std.debug.print("error: --from must be a non-negative integer, got '{s}'\n", .{from_flag});
-                std.process.exit(1);
+                fatal(ctx, "error: --from must be a non-negative integer, got '{s}'\n", .{from_flag});
             };
             break :blk n;
         }
@@ -422,10 +423,10 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const name: ?[]const u8 = if (name_flag.len > 0) name_flag else null;
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const id = c.registerHookFullNamedCursor(pattern, cmd_str.items, cwd, once, null, name, start_cursor) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
 
@@ -436,28 +437,26 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     else
         "";
     if (once) {
-        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
+        diag(ctx, "Hook #{d} registered (once): {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
     } else {
-        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
+        diag(ctx, "Hook #{d} registered: {s} \u{2192} {s}{s}\n", .{ id, pattern, cmd_str.items, mode_suffix });
     }
 }
 
 fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listHooks() catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer result.deinit();
 
     if (result.hooks.len == 0) {
-        std.debug.print("No hooks registered.\n", .{});
+        diag(ctx, "No hooks registered.\n", .{});
     } else {
-        std.debug.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset" });
+        try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset" });
         for (result.hooks) |hook| {
             var id_buf: [20]u8 = undefined;
             const id_str = std.fmt.bufPrint(&id_buf, "#{d}", .{hook.id}) catch "?";
@@ -465,7 +464,7 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
             const name_str = if (hook.name) |n| n else "-";
 
-            std.debug.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{
+            try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{
                 id_str,
                 name_str,
                 hook.pattern,
@@ -477,21 +476,19 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 }
 
 fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookPs() catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer result.deinit();
 
     if (result.processes.len == 0) {
-        std.debug.print("No running hook processes.\n", .{});
+        diag(ctx, "No running hook processes.\n", .{});
     } else {
-        std.debug.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{ "HOOK", "PID", "PATTERN", "COMMAND", "ELAPSED" });
+        try ctx.stdout.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{ "HOOK", "PID", "PATTERN", "COMMAND", "ELAPSED" });
         const now = getMilliTimestamp();
         for (result.processes) |p| {
             var hook_buf: [20]u8 = undefined;
@@ -501,7 +498,7 @@ fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             const elapsed_s = @divTrunc(now - p.start_time, 1000);
             var elapsed_buf: [20]u8 = undefined;
             const elapsed_str = std.fmt.bufPrint(&elapsed_buf, "{d}s", .{elapsed_s}) catch "?";
-            std.debug.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{
+            try ctx.stdout.print("{s:<6} {s:<8} {s:<25} {s:<30} {s:<12}\n", .{
                 hook_str, pid_str, p.pattern, p.command, elapsed_str,
             });
         }
@@ -509,61 +506,57 @@ fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 }
 
 fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const id_str = ctx.arg("id");
 
     if (id_str.len == 0) {
-        std.debug.print("error: hook ID is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: hook ID is required\n", .{});
     }
     const id = std.fmt.parseInt(u64, id_str, 10) catch
-        std.process.fatal("invalid hook ID '{s}'.", .{id_str});
+        fatal(ctx, "error: invalid hook ID '{s}'.\n", .{id_str});
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookLogs(id) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer result.deinit();
 
-    std.debug.print("Log file: {s}\n---\n", .{result.log_path});
+    try ctx.stdout.print("Log file: {s}\n---\n", .{result.log_path});
     if (result.content.len > 0) {
-        std.debug.print("{s}", .{result.content});
+        try ctx.stdout.print("{s}", .{result.content});
         // Ensure trailing newline
         if (result.content[result.content.len - 1] != '\n') {
-            std.debug.print("\n", .{});
+            try ctx.stdout.print("\n", .{});
         }
     } else {
-        std.debug.print("(empty)\n", .{});
+        diag(ctx, "(empty)\n", .{});
     }
 }
 
 fn handleHookRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const id_or_name = ctx.arg("id");
 
     if (id_or_name.len == 0) {
-        std.debug.print("error: hook ID or name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: hook ID or name is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
 
     // Try parsing as numeric ID first
     if (std.fmt.parseInt(u64, id_or_name, 10)) |id| {
         c.removeHook(id) catch |err| switch (err) {
-            error.ServerError => std.process.exit(1),
+            error.ServerError => exitFlushed(ctx, 1),
             else => return err,
         };
-        std.debug.print("Hook #{d} removed.\n", .{id});
+        diag(ctx, "Hook #{d} removed.\n", .{id});
     } else |_| {
         // Treat as name — list hooks to find the ID
         var result = c.listHooks() catch |err| switch (err) {
-            error.ServerError => std.process.exit(1),
+            error.ServerError => exitFlushed(ctx, 1),
             else => return err,
         };
         defer result.deinit();
@@ -580,22 +573,20 @@ fn handleHookRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 
         if (found_id) |id| {
             // Reconnect since we consumed the connection for listHooks
-            var c2 = connectToStore(allocator, io, addr_info.address, addr_info.port);
+            var c2 = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
             defer c2.deinit();
             c2.removeHook(id) catch |err| switch (err) {
-                error.ServerError => std.process.exit(1),
+                error.ServerError => exitFlushed(ctx, 1),
                 else => return err,
             };
-            std.debug.print("Hook '{s}' (#{d}) removed.\n", .{ id_or_name, id });
+            diag(ctx, "Hook '{s}' (#{d}) removed.\n", .{ id_or_name, id });
         } else {
-            std.debug.print("error: hook '{s}' not found\n", .{id_or_name});
-            std.process.exit(1);
+            fatal(ctx, "error: hook '{s}' not found\n", .{id_or_name});
         }
     }
 }
 
 fn handleTimerAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const name_arg = ctx.arg("name");
     const name_flag = ctx.flag("name");
     const every = ctx.flag("every");
@@ -641,29 +632,23 @@ fn handleTimerAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const schedule_count = @as(u8, if (has_every) 1 else 0) + @as(u8, if (has_cron) 1 else 0) + @as(u8, if (has_in) 1 else 0);
 
     if (schedule_count == 0) {
-        std.debug.print("error: one of --every, --cron, or --in is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: one of --every, --cron, or --in is required\n", .{});
     }
     if (schedule_count > 1) {
-        std.debug.print("error: --every, --cron, and --in are mutually exclusive\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: --every, --cron, and --in are mutually exclusive\n", .{});
     }
     // Validate non-empty values
     if (has_every and every.len == 0) {
-        std.debug.print("error: invalid duration format\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid duration format\n", .{});
     }
     if (has_cron and cron.len == 0) {
-        std.debug.print("error: invalid cron expression\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid cron expression\n", .{});
     }
     if (has_in and in_flag.len == 0) {
-        std.debug.print("error: invalid duration format\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid duration format\n", .{});
     }
     if (topic.len == 0) {
-        std.debug.print("error: topic is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic is required\n", .{});
     }
 
     const schedule_type: []const u8 = if (has_in) "one_shot" else if (has_every) "interval" else "cron";
@@ -671,47 +656,44 @@ fn handleTimerAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const actual_payload = if (payload.len > 0) payload else "{}";
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     // Auto-generate name if not provided
     const actual_name = if (name.len > 0) name else blk: {
         const auto = std.fmt.allocPrint(allocator, "{s}-{s}", .{ topic, schedule_value }) catch {
-            std.debug.print("error: failed to generate timer name\n", .{});
-            std.process.exit(1);
+            fatal(ctx, "error: failed to generate timer name\n", .{});
         };
         break :blk auto;
     };
 
     c.addTimer(actual_name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
 
     if (has_in) {
-        std.debug.print("Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ actual_name, in_flag, topic });
+        diag(ctx, "Timer '{s}' registered (one-shot): in {s} → {s}\n", .{ actual_name, in_flag, topic });
     } else {
-        std.debug.print("Timer '{s}' registered: {s} {s} → {s}\n", .{ actual_name, if (has_every) "every" else "cron", schedule_value, topic });
+        diag(ctx, "Timer '{s}' registered: {s} {s} → {s}\n", .{ actual_name, if (has_every) "every" else "cron", schedule_value, topic });
     }
 }
 
 fn handleTimerList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listTimers() catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer result.deinit();
 
     if (result.timers.len == 0) {
-        std.debug.print("No timers registered.\n", .{});
+        diag(ctx, "No timers registered.\n", .{});
     } else {
-        std.debug.print("{s:<20} {s:<15} {s:<25} {s:<10}\n", .{ "NAME", "SCHEDULE", "TOPIC", "FIRES" });
+        try ctx.stdout.print("{s:<20} {s:<15} {s:<25} {s:<10}\n", .{ "NAME", "SCHEDULE", "TOPIC", "FIRES" });
         for (result.timers) |timer| {
-            std.debug.print("{s:<20} {s:<15} {s:<25} {d:<10}\n", .{
+            try ctx.stdout.print("{s:<20} {s:<15} {s:<25} {d:<10}\n", .{
                 timer.name,
                 timer.schedule,
                 timer.topic,
@@ -722,38 +704,34 @@ fn handleTimerList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 }
 
 fn handleTimerRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const name = ctx.arg("name");
 
     if (name.len == 0) {
-        std.debug.print("error: timer name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: timer name is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.removeTimer(name) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
-    std.debug.print("Timer '{s}' removed.\n", .{name});
+    diag(ctx, "Timer '{s}' removed.\n", .{name});
 }
 
 fn handleTimerInfo(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
     const name = ctx.arg("name");
 
     if (name.len == 0) {
-        std.debug.print("error: timer name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: timer name is required\n", .{});
     }
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const timer = c.timerInfo(name) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
     defer {
@@ -763,41 +741,36 @@ fn handleTimerInfo(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         allocator.free(timer.payload);
     }
 
-    std.debug.print("Name:        {s}\n", .{timer.name});
-    std.debug.print("Schedule:    {s}\n", .{timer.schedule});
-    std.debug.print("Topic:       {s}\n", .{timer.topic});
-    std.debug.print("Payload:     {s}\n", .{timer.payload});
-    std.debug.print("Last fired:  ", .{});
+    try ctx.stdout.print("Name:        {s}\n", .{timer.name});
+    try ctx.stdout.print("Schedule:    {s}\n", .{timer.schedule});
+    try ctx.stdout.print("Topic:       {s}\n", .{timer.topic});
+    try ctx.stdout.print("Payload:     {s}\n", .{timer.payload});
+    try ctx.stdout.print("Last fired:  ", .{});
     if (timer.last_fired_at > 0) {
-        std.debug.print("{d}\n", .{timer.last_fired_at});
+        try ctx.stdout.print("{d}\n", .{timer.last_fired_at});
     } else {
-        std.debug.print("never\n", .{});
+        try ctx.stdout.print("never\n", .{});
     }
-    std.debug.print("Next fire:   (calculated on server)\n", .{});
-    std.debug.print("Fire count:  {d}\n", .{timer.fire_count});
-    std.debug.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
+    try ctx.stdout.print("Next fire:   (calculated on server)\n", .{});
+    try ctx.stdout.print("Fire count:  {d}\n", .{timer.fire_count});
+    try ctx.stdout.print("Persistent:  {s}\n", .{if (timer.persistent) "yes" else "no"});
 }
 
 fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     // Prompt: Timer name
-    std.debug.print("Timer name: ", .{});
+    diag(ctx, "Timer name: ", .{});
     const name = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(name);
     if (name.len == 0) {
-        std.debug.print("error: timer name is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: timer name is required\n", .{});
     }
 
     // Prompt: Schedule type
-    std.debug.print("Schedule type (every/cron/in): ", .{});
+    diag(ctx, "Schedule type (every/cron/in): ", .{});
     const sched_type_input = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(sched_type_input);
 
@@ -805,45 +778,39 @@ fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const is_cron = std.mem.eql(u8, sched_type_input, "cron");
     const is_in = std.mem.eql(u8, sched_type_input, "in");
     if (!is_every and !is_cron and !is_in) {
-        std.debug.print("error: schedule type must be 'every', 'cron', or 'in'\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: schedule type must be 'every', 'cron', or 'in'\n", .{});
     }
 
     // Prompt: Schedule value
     if (is_every) {
-        std.debug.print("Interval: ", .{});
+        diag(ctx, "Interval: ", .{});
     } else if (is_cron) {
-        std.debug.print("Cron expression: ", .{});
+        diag(ctx, "Cron expression: ", .{});
     } else {
-        std.debug.print("Delay: ", .{});
+        diag(ctx, "Delay: ", .{});
     }
     const sched_value = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(sched_value);
     if (sched_value.len == 0) {
-        std.debug.print("error: schedule value is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: schedule value is required\n", .{});
     }
 
     // Prompt: Topic
-    std.debug.print("Topic: ", .{});
+    diag(ctx, "Topic: ", .{});
     const topic = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(topic);
     if (topic.len == 0) {
-        std.debug.print("error: topic is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic is required\n", .{});
     }
 
     // Prompt: Payload
-    std.debug.print("Payload [{{}}]: ", .{});
+    diag(ctx, "Payload [{{}}]: ", .{});
     const payload_input = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(payload_input);
     const payload = if (payload_input.len > 0) payload_input else "{}";
@@ -851,10 +818,9 @@ fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     // Prompt: Persistent (only for non-one-shot)
     var persistent = true;
     if (!is_in) {
-        std.debug.print("Persistent (y/n) [y]: ", .{});
+        diag(ctx, "Persistent (y/n) [y]: ", .{});
         const persist_input = readLine(allocator) catch {
-            std.debug.print("\nerror: failed to read input\n", .{});
-            std.process.exit(1);
+            fatal(ctx, "\nerror: failed to read input\n", .{});
         };
         defer allocator.free(persist_input);
         if (std.mem.eql(u8, persist_input, "n") or std.mem.eql(u8, persist_input, "N")) {
@@ -865,53 +831,46 @@ fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const schedule_type: []const u8 = if (is_in) "one_shot" else if (is_every) "interval" else "cron";
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
 
-    std.debug.print("\n", .{});
+    diag(ctx, "\n", .{});
     if (is_in) {
-        std.debug.print("Timer '{s}' registered: in {s} \u{2192} {s}\n", .{ name, sched_value, topic });
+        diag(ctx, "Timer '{s}' registered: in {s} \u{2192} {s}\n", .{ name, sched_value, topic });
     } else {
-        std.debug.print("Timer '{s}' registered: {s} {s} \u{2192} {s}\n", .{ name, sched_type_input, sched_value, topic });
+        diag(ctx, "Timer '{s}' registered: {s} {s} \u{2192} {s}\n", .{ name, sched_type_input, sched_value, topic });
     }
 }
 
 fn handleHookNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-
     // Prompt: Topic pattern
-    std.debug.print("Topic pattern: ", .{});
+    diag(ctx, "Topic pattern: ", .{});
     const pattern = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(pattern);
     if (pattern.len == 0) {
-        std.debug.print("error: topic pattern is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: topic pattern is required\n", .{});
     }
 
     // Prompt: Command
-    std.debug.print("Command: ", .{});
+    diag(ctx, "Command: ", .{});
     const cmd_input = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(cmd_input);
     if (cmd_input.len == 0) {
-        std.debug.print("error: command is required\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "error: command is required\n", .{});
     }
 
     // Prompt: One-shot
-    std.debug.print("One-shot (y/n) [n]: ", .{});
+    diag(ctx, "One-shot (y/n) [n]: ", .{});
     const once_input = readLine(allocator) catch {
-        std.debug.print("\nerror: failed to read input\n", .{});
-        std.process.exit(1);
+        fatal(ctx, "\nerror: failed to read input\n", .{});
     };
     defer allocator.free(once_input);
     const once = std.mem.eql(u8, once_input, "y") or std.mem.eql(u8, once_input, "Y");
@@ -924,18 +883,18 @@ fn handleHookNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const cwd: []const u8 = if (cwd_i > 0) cwd_buf[0..@intCast(cwd_i)] else "/tmp";
 
     const addr_info = parseStoreAddress(ctx);
-    var c = connectToStore(allocator, io, addr_info.address, addr_info.port);
+    var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const id = c.registerHookFull(pattern, cmd_input, cwd, once, null) catch |err| switch (err) {
-        error.ServerError => std.process.exit(1),
+        error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
 
-    std.debug.print("\n", .{});
+    diag(ctx, "\n", .{});
     if (once) {
-        std.debug.print("Hook #{d} registered (once): {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
+        diag(ctx, "Hook #{d} registered (once): {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
     } else {
-        std.debug.print("Hook #{d} registered: {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
+        diag(ctx, "Hook #{d} registered: {s} \u{2192} {s}\n", .{ id, pattern, cmd_input });
     }
 }
 
@@ -944,9 +903,7 @@ fn readLine(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn handleStart(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const io = ctx.io;
-    const envp = ctx.envp;
-    try startServer(allocator, io, ctx, envp);
+    try startServer(allocator, ctx.io, ctx, ctx.envp);
 }
 
 fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
@@ -958,8 +915,7 @@ fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     // Validate directory looks like an Ever store
     {
         const dir = std.Io.Dir.cwd().openDir(ctx.io, actual_dir, .{ .iterate = true }) catch {
-            std.debug.print("error: cannot open data directory '{s}'\n", .{actual_dir});
-            std.process.exit(1);
+            fatal(ctx, "error: cannot open data directory '{s}'\n", .{actual_dir});
         };
         defer dir.close(ctx.io);
         var found_store_marker = false;
@@ -976,13 +932,12 @@ fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             }
         }
         if (!found_store_marker) {
-            std.debug.print("error: '{s}' does not appear to be an Ever data directory\n", .{actual_dir});
-            std.process.exit(1);
+            fatal(ctx, "error: '{s}' does not appear to be an Ever data directory\n", .{actual_dir});
         }
     }
 
     var store_status = ever.status.getStatus(allocator, ctx.io, actual_dir) catch |err| {
-        std.process.fatal("failed to get store status: {}", .{err});
+        fatal(ctx, "error: failed to get store status: {}\n", .{err});
     };
     defer store_status.deinit(allocator);
 
@@ -994,10 +949,11 @@ fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     };
 
     if (json_output) {
-        ever.status.printJson(&store_status, allocator);
+        try ever.status.printJson(&store_status, allocator, ctx.stdout);
     } else {
-        ever.status.printHuman(&store_status, allocator);
+        try ever.status.printHuman(&store_status, allocator, ctx.stdout);
     }
+    ctx.stdout.flush() catch {};
 }
 
 fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, envp: [*:null]const ?[*:0]const u8) !void {
@@ -1006,8 +962,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     const data_dir = ctx.flag("data-dir");
 
     const port = std.fmt.parseInt(u16, port_str, 10) catch {
-        std.debug.print("error: invalid port '{s}'\n", .{port_str});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid port '{s}'\n", .{port_str});
     };
     const actual_data_dir = if (data_dir.len > 0) data_dir else "./data";
 
@@ -1060,8 +1015,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     const http_port_str = ctx.flag("http-port");
     const no_http = ctx.flagBool("no-http");
     const http_port = std.fmt.parseInt(u16, http_port_str, 10) catch {
-        std.debug.print("error: invalid http-port '{s}'\n", .{http_port_str});
-        std.process.exit(1);
+        fatal(ctx, "error: invalid http-port '{s}'\n", .{http_port_str});
     };
 
     if (!no_http) {
@@ -1102,17 +1056,15 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     std.debug.print("Server shut down gracefully.\n", .{});
 }
 
-fn printEvent(event: ever.client.Event, json_values: bool) void {
+fn printEvent(out: *std.Io.Writer, event: ever.client.Event, json_values: bool) !void {
     if (json_values) {
-        std.debug.print("{s}\n", .{event.value});
+        try out.print("{s}\n", .{event.value});
     } else {
         const t = if (event.topic) |tp| tp else "";
         if (t.len > 0) {
-            if (event.key) |k| std.debug.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value })
-            else std.debug.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
+            if (event.key) |k| try out.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value }) else try out.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
         } else {
-            if (event.key) |k| std.debug.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value })
-            else std.debug.print("[{d}] {s}\n", .{ event.offset, event.value });
+            if (event.key) |k| try out.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value }) else try out.print("[{d}] {s}\n", .{ event.offset, event.value });
         }
     }
 }
@@ -1498,28 +1450,70 @@ pub fn main(init: std.process.Init) !void {
         &stderr.interface,
         env_block,
         args_list.items,
-    ) catch |err| switch (err) {
-        error.UnsupportedVersion => {
-            std.debug.print("error: protocol version mismatch (is the server an Ever store?)\n", .{});
-            std.process.exit(1);
-        },
-        error.BrokenPipe, error.ConnectionResetByPeer => {
-            std.debug.print("error: connection lost\n", .{});
-            std.process.exit(1);
-        },
-        error.IncompleteHeader, error.IncompleteBody => {
-            std.debug.print("error: incomplete response from server\n", .{});
-            std.process.exit(1);
-        },
-        error.MessageTooLarge => {
-            std.debug.print("error: server response too large\n", .{});
-            std.process.exit(1);
-        },
-        else => return err,
+    ) catch |err| {
+        // Deliver whatever output was produced before the failure; the
+        // deferred flushes above never run past std.process.exit.
+        stdout.interface.flush() catch {};
+        stderr.interface.flush() catch {};
+        switch (err) {
+            // A closed stdout (e.g. `ever sub t --follow | head -1`) is
+            // normal termination per Unix convention: exit 0, no message.
+            error.WriteFailed => {
+                const stdout_broken = if (stdout.err) |e| e == error.BrokenPipe else false;
+                const stderr_broken = if (stderr.err) |e| e == error.BrokenPipe else false;
+                if (stdout_broken or stderr_broken) std.process.exit(0);
+                std.debug.print("error: failed to write output\n", .{});
+                std.process.exit(1);
+            },
+            error.UnsupportedVersion => {
+                std.debug.print("error: protocol version mismatch (is the server an Ever store?)\n", .{});
+                std.process.exit(1);
+            },
+            error.BrokenPipe, error.ConnectionResetByPeer => {
+                std.debug.print("error: connection lost\n", .{});
+                std.process.exit(1);
+            },
+            error.IncompleteHeader, error.IncompleteBody => {
+                std.debug.print("error: incomplete response from server\n", .{});
+                std.process.exit(1);
+            },
+            error.MessageTooLarge => {
+                std.debug.print("error: server response too large\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        }
     };
 }
 
 test "main module compiles" {
     _ = ever;
     _ = cli;
+}
+
+// Regression guard from air/v0.1/stdout-stderr-split.org: after the
+// stdout/stderr migration, `std.debug` printing may only appear where no
+// cli.Context is in scope and stderr is the correct stream — the server
+// daemon path (`ever start` warnings + lifecycle logs, logTimestamped*)
+// and main's post-run catch arms (writers may themselves be broken).
+// Client output must go through ctx.stdout / diag / fatal instead.
+// The needle is split so this test doesn't count itself.
+fn countDebugPrints(source: []const u8) usize {
+    const needle = "std.debug" ++ ".print";
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, source, idx, needle)) |pos| {
+        count += 1;
+        idx = pos + needle.len;
+    }
+    return count;
+}
+
+test "stdout/stderr split: debug printing confined to the stderr allow-list" {
+    // main.zig: 7 server-daemon sites + 5 post-run catch arms.
+    try std.testing.expectEqual(@as(usize, 12), countDebugPrints(@embedFile("main.zig")));
+    // status printers write data; they must use the threaded writer.
+    try std.testing.expectEqual(@as(usize, 0), countDebugPrints(@embedFile("store/status.zig")));
+    // client.zig has no Context; its 2 sites are server-error diagnostics.
+    try std.testing.expectEqual(@as(usize, 2), countDebugPrints(@embedFile("net/client.zig")));
 }
