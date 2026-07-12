@@ -381,6 +381,7 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const name_flag = ctx.flag("name");
     const from_beginning = ctx.flagBool("from-beginning");
     const from_flag = ctx.flag("from");
+    const create_topic = ctx.flagBool("create-topic");
     const rest_args = ctx.rest();
 
     if (pattern.len == 0) {
@@ -391,6 +392,14 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
     if (from_beginning and from_flag.len > 0) {
         fatal(ctx, "error: --from-beginning and --from are mutually exclusive\n", .{});
+    }
+    // Client-side validation for --create-topic; mirrored server-side (the
+    // server must not trust the client).
+    if (create_topic and (from_beginning or from_flag.len > 0)) {
+        fatal(ctx, "error: --create-topic cannot be combined with --from-beginning/--from (a fresh topic has no history to replay)\n", .{});
+    }
+    if (create_topic and ever.topic.isPatternShape(pattern)) {
+        fatal(ctx, "error: --create-topic requires an exact topic name (no trailing-dot prefix, no '*' wildcard)\n", .{});
     }
 
     // Resolve start cursor: null = tip (server resolves), 0 = full replay,
@@ -425,12 +434,20 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
-    const id = c.registerHookFullNamedCursor(pattern, cmd_str.items, cwd, once, null, name, start_cursor) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
-        else => return err,
-    };
+    const id = if (create_topic)
+        c.registerHookCreateTopic(pattern, cmd_str.items, cwd, once, null, name) catch |err| switch (err) {
+            error.ServerError => exitFlushed(ctx, 1),
+            else => return err,
+        }
+    else
+        c.registerHookFullNamedCursor(pattern, cmd_str.items, cwd, once, null, name, start_cursor) catch |err| switch (err) {
+            error.ServerError => exitFlushed(ctx, 1),
+            else => return err,
+        };
 
-    const mode_suffix: []const u8 = if (from_beginning)
+    const mode_suffix: []const u8 = if (create_topic)
+        " (topic created)"
+    else if (from_beginning)
         " [replaying from beginning]"
     else if (from_flag.len > 0)
         " [replaying from offset]"
@@ -1343,8 +1360,9 @@ const app = cli.App{
                     .flags = &.{
                         .{ .name = "once", .takes_value = false, .description = "Remove after first trigger" },
                         .{ .name = "name", .description = "Hook name (auto-generated if omitted)" },
-                        .{ .name = "from-beginning", .takes_value = false, .description = "Replay all historical events before following new ones", .conflicts = &.{"from"} },
-                        .{ .name = "from", .description = "Start at an explicit topic-local offset (replay from there)", .conflicts = &.{"from-beginning"} },
+                        .{ .name = "from-beginning", .takes_value = false, .description = "Replay all historical events before following new ones", .conflicts = &.{ "from", "create-topic" } },
+                        .{ .name = "from", .description = "Start at an explicit topic-local offset (replay from there)", .conflicts = &.{ "from-beginning", "create-topic" } },
+                        .{ .name = "create-topic", .takes_value = false, .description = "Create the (exact-name) topic and register the hook atomically", .conflicts = &.{ "from", "from-beginning" } },
                     },
                     .takes_rest = true,
                     .run = handleHookAdd,
