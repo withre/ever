@@ -56,6 +56,10 @@ pub const TopicManager = struct {
     topics: std.StringArrayHashMap(TopicIndex),
     deleted_topics: std.StringHashMap(void),
     mutex: std.atomic.Mutex ,
+    /// Test-only fault injection: when true, `createTopicLocked` fails just
+    /// before appending the topic-creation marker, simulating a log-append
+    /// failure. Never set in production code.
+    test_fail_marker_append: bool = false,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !TopicManager {
         const log = try Log.init(allocator, io, dir, .{
@@ -125,10 +129,7 @@ pub const TopicManager = struct {
     ///   where a single per-topic skip count could swallow events on
     ///   low-count or newly-created matching topics.
     pub fn tipForPatternLocked(self: *TopicManager, pattern: []const u8) u64 {
-        const is_pattern = std.mem.indexOfScalar(u8, pattern, '*') != null or
-            (pattern.len > 0 and pattern[pattern.len - 1] == '.');
-
-        if (!is_pattern) {
+        if (!isPatternShape(pattern)) {
             if (self.topics.getPtr(pattern)) |idx| return idx.non_marker_count;
             return 0;
         }
@@ -156,8 +157,19 @@ pub const TopicManager = struct {
     pub fn createTopic(self: *TopicManager, name: []const u8) !void {
         self.lock();
         defer self.mutex.unlock();
+        try self.createTopicLocked(name);
+    }
+
+    /// Body of `createTopic` — caller must already hold the TopicManager
+    /// mutex (e.g. via `lockForHookRegistration`). Split out because the
+    /// mutex is a non-reentrant spinlock: calling `createTopic` while
+    /// holding the lock deadlocks. Used by the server's atomic
+    /// create-topic-plus-register-hook path.
+    pub fn createTopicLocked(self: *TopicManager, name: []const u8) !void {
         try validateTopicName(name);
         if (self.topics.contains(name)) return TopicError.AlreadyExists;
+
+        if (self.test_fail_marker_append) return error.InjectedMarkerAppendFailure;
 
         // Write a marker event so rebuildIndex discovers this topic on restart
         const offset = try self.log.append(name, null, "");
@@ -191,6 +203,12 @@ pub const TopicManager = struct {
     pub fn hasTopic(self: *TopicManager, name: []const u8) bool {
         self.lock();
         defer self.mutex.unlock();
+        return self.topics.contains(name);
+    }
+
+    /// Like `hasTopic`, but the caller must already hold the TopicManager
+    /// mutex (e.g. via `lockForHookRegistration`).
+    pub fn hasTopicLocked(self: *TopicManager, name: []const u8) bool {
         return self.topics.contains(name);
     }
 
@@ -467,6 +485,13 @@ fn matchSegmentPattern(pattern: []const u8, name: []const u8) bool {
     }
 }
 
+/// True if `input` is a pattern — a trailing-dot prefix (including ".")
+/// or a '*' wildcard — rather than an exact topic name.
+pub fn isPatternShape(input: []const u8) bool {
+    return std.mem.indexOfScalar(u8, input, '*') != null or
+        (input.len > 0 and input[input.len - 1] == '.');
+}
+
 pub fn validateTopicName(name: []const u8) TopicError!void {
     if (name.len == 0 or name.len > 255) return TopicError.InvalidName;
     if (name[0] == '.' or name[name.len - 1] == '.') return TopicError.InvalidName;
@@ -593,6 +618,39 @@ test "TopicManager create delete list" {
     try std.testing.expect(tm.isTopicDeleted("a"));
     // Cannot delete again
     try std.testing.expectError(TopicError.NotFound, tm.deleteTopic("a"));
+}
+
+test "TopicManager createTopicLocked works under the registration lock" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // The mutex is a non-reentrant spinlock — calling createTopic here
+    // would deadlock. createTopicLocked is the reentrancy-safe body.
+    tm.lockForHookRegistration();
+    try tm.createTopicLocked("t.locked");
+    try std.testing.expectError(TopicError.AlreadyExists, tm.createTopicLocked("t.locked"));
+    try std.testing.expect(tm.hasTopicLocked("t.locked"));
+    tm.unlockForHookRegistration();
+
+    // Topic created under the lock behaves like any other topic.
+    try std.testing.expect(tm.hasTopic("t.locked"));
+    _ = try tm.publish("t.locked", null, "v");
+    const events = try tm.fetch(std.testing.allocator, "t.locked", 0, 10);
+    defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+}
+
+test "isPatternShape distinguishes exact names from patterns" {
+    try std.testing.expect(!isPatternShape("a.b"));
+    try std.testing.expect(!isPatternShape("agent.results"));
+    try std.testing.expect(isPatternShape("a."));
+    try std.testing.expect(isPatternShape("."));
+    try std.testing.expect(isPatternShape("a.*"));
+    try std.testing.expect(isPatternShape("*"));
+    try std.testing.expect(isPatternShape("a.*.c"));
 }
 
 test "TopicManager soft-delete blocks publish but allows fetch" {
