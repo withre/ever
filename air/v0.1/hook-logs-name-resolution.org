@@ -1,5 +1,5 @@
 #+title: Hook Name Resolution in hook logs
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:orchestrator:
 
 * Summary
@@ -68,3 +68,4 @@ The fix is reusing the existing code path, not designing a new one. Semantics ar
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-13: Implemented (0148d6d). Extracted =resolveHookId= helper in =src/main.zig= (returns ={id, by_name}=; name lookup uses its own connection since =listHooks()= consumes it); refactored =handleHookLogs= and =handleHookRm= onto it. Verified against a scratch store: =hook logs <name>= output byte-identical to =hook logs <id>=; unknown name → =error: hook '<name>' not found=, exit 1, empty stdout; numeric IDs and all =hook rm= behaviour (by ID, by name, unknown, missing) unchanged. =zig build test= green.
+- 2026-07-13: State: ready → complete.
