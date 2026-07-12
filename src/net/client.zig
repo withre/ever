@@ -44,6 +44,12 @@ pub const HookInfoOwned = struct {
     cursor: u64,
     once: bool = false,
     env: ?[]const []const u8 = null,
+    // Execution counters (hook-failure-visibility). Defaulted — an old store
+    // that omits them yields zeros/nulls.
+    fired_count: u64 = 0,
+    failure_count: u64 = 0,
+    last_exit_status: ?u8 = null,
+    last_failed_offset: ?u64 = null,
 
     pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
         if (self.name) |n| allocator.free(n);
@@ -456,6 +462,10 @@ pub const Client = struct {
                 .cursor = h.cursor,
                 .once = h.once,
                 .env = env_copy,
+                .fired_count = h.fired_count,
+                .failure_count = h.failure_count,
+                .last_exit_status = h.last_exit_status,
+                .last_failed_offset = h.last_failed_offset,
             };
             initialized = i + 1;
         }

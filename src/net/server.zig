@@ -397,6 +397,10 @@ pub const Server = struct {
                 .cursor = hook.cursor,
                 .once = hook.once,
                 .env = hook.env,
+                .fired_count = hook.fired_count,
+                .failure_count = hook.failure_count,
+                .last_exit_status = hook.last_exit_status,
+                .last_failed_offset = hook.last_failed_offset,
             };
         }
 

@@ -557,7 +557,7 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     if (result.hooks.len == 0) {
         diag(ctx, "No hooks registered.\n", .{});
     } else {
-        try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset" });
+        try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12} {s}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset", "Fired" });
         for (result.hooks) |hook| {
             var id_buf: [20]u8 = undefined;
             const id_str = std.fmt.bufPrint(&id_buf, "#{d}", .{hook.id}) catch "?";
@@ -565,12 +565,32 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
             const name_str = if (hook.name) |n| n else "-";
 
-            try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12}\n", .{
+            // Fired column: "12" for a healthy hook, "12 (2 failed)" or
+            // "12 (2 failed, last exit 127)" when deliveries have failed.
+            var fired_buf: [64]u8 = undefined;
+            const fired_str = blk: {
+                if (hook.failure_count > 0) {
+                    if (hook.last_exit_status) |les| {
+                        if (les != 0) {
+                            break :blk std.fmt.bufPrint(&fired_buf, "{d} ({d} failed, last exit {d})", .{
+                                hook.fired_count, hook.failure_count, les,
+                            }) catch "?";
+                        }
+                    }
+                    break :blk std.fmt.bufPrint(&fired_buf, "{d} ({d} failed)", .{
+                        hook.fired_count, hook.failure_count,
+                    }) catch "?";
+                }
+                break :blk std.fmt.bufPrint(&fired_buf, "{d}", .{hook.fired_count}) catch "?";
+            };
+
+            try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12} {s}\n", .{
                 id_str,
                 name_str,
                 hook.pattern,
                 hook.command,
                 cursor_str,
+                fired_str,
             });
         }
     }

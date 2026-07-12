@@ -170,6 +170,12 @@ pub const HookInfo = struct {
     cursor: u64,
     once: bool = false,
     env: ?[]const []const u8 = null,
+    // Execution counters (hook-failure-visibility). Defaulted so a new CLI
+    // against an old store (and vice versa) degrades gracefully.
+    fired_count: u64 = 0,
+    failure_count: u64 = 0,
+    last_exit_status: ?u8 = null,
+    last_failed_offset: ?u64 = null,
 };
 
 pub const ListHooksResponse = struct {
