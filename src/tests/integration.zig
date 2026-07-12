@@ -601,3 +601,161 @@ test "integration: --once hook with no prior events waits for next" {
     try testing.expectEqual(@as(usize, 1), pending.len);
     try testing.expectEqualStrings("fresh", pending[0].value);
 }
+
+// ── Atomic Topic + Hook Creation (P6) ───────────────────────────────────────
+//
+// Exercises `ever.net.createTopicAndRegisterHook` — the server-side critical
+// section behind `ever hook add --create-topic` — without standing up TCP.
+// See air/v0.1/topic-hook-atomic-create.org.
+
+const createTopicAndRegisterHook = ever.net.createTopicAndRegisterHook;
+
+test "integration: atomic create-topic-plus-hook arms hook before any publish" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("atomic");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // One call: topic exists AND hook is armed at the fresh topic's tip (0).
+    const id = try createTopicAndRegisterHook(&tm, &ht, "t.atomic", "echo", "/tmp", false, null, null);
+    try testing.expect(tm.hasTopic("t.atomic"));
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try testing.expectEqual(@as(usize, 1), snap.len);
+    try testing.expectEqual(id, snap[0].id);
+    try testing.expectEqualStrings("t.atomic", snap[0].pattern);
+    try testing.expectEqual(@as(u64, 0), snap[0].cursor);
+
+    // The very next publish is visible from the hook's cursor — exactly once.
+    _ = try tm.publish("t.atomic", null, "first");
+    const pending = try tm.fetch(allocator, "t.atomic", snap[0].cursor, 10);
+    defer freeEvents(pending);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("first", pending[0].value);
+
+    // After the daemon would advance the cursor past it, nothing remains.
+    const drained = try tm.fetch(allocator, "t.atomic", snap[0].cursor + 1, 10);
+    defer freeEvents(drained);
+    try testing.expectEqual(@as(usize, 0), drained.len);
+}
+
+test "integration: create-topic on existing or tombstoned topic registers no hook" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("exists");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // Existing topic → AlreadyExists, no hook.
+    try tm.createTopic("t.exists");
+    try testing.expectError(error.AlreadyExists, createTopicAndRegisterHook(&tm, &ht, "t.exists", "echo", "/tmp", false, null, null));
+
+    // Tombstoned topic → also AlreadyExists (soft-deleted names stay taken).
+    try tm.createTopic("t.dead");
+    try tm.deleteTopic("t.dead");
+    try testing.expectError(error.AlreadyExists, createTopicAndRegisterHook(&tm, &ht, "t.dead", "echo", "/tmp", false, null, null));
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try testing.expectEqual(@as(usize, 0), snap.len);
+}
+
+test "integration: create-topic rejects pattern shapes, nothing created" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("shape");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // Prefix, all-topics, and wildcard shapes are all rejected up front.
+    try testing.expectError(error.InvalidName, createTopicAndRegisterHook(&tm, &ht, "agent.", "echo", "/tmp", false, null, null));
+    try testing.expectError(error.InvalidName, createTopicAndRegisterHook(&tm, &ht, ".", "echo", "/tmp", false, null, null));
+    try testing.expectError(error.InvalidName, createTopicAndRegisterHook(&tm, &ht, "agent.*", "echo", "/tmp", false, null, null));
+
+    try testing.expect(!tm.hasTopic("agent."));
+    try testing.expect(!tm.hasTopic("agent.*"));
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try testing.expectEqual(@as(usize, 0), snap.len);
+}
+
+test "integration: marker-append failure removes the hook — neither half survives" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("inject");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // Inject a failure in the topic-creation half. The hook was registered
+    // first (it can be removed cleanly; a topic cannot be un-created), so
+    // the error path must remove it.
+    tm.test_fail_marker_append = true;
+    try testing.expectError(error.InjectedMarkerAppendFailure, createTopicAndRegisterHook(&tm, &ht, "t.inject", "echo", "/tmp", false, null, null));
+    tm.test_fail_marker_append = false;
+
+    try testing.expect(!tm.hasTopic("t.inject"));
+    {
+        const snap = try ht.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        try testing.expectEqual(@as(usize, 0), snap.len);
+    }
+
+    // The caller can simply retry once the fault clears.
+    _ = try createTopicAndRegisterHook(&tm, &ht, "t.inject", "echo", "/tmp", false, null, null);
+    try testing.expect(tm.hasTopic("t.inject"));
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try testing.expectEqual(@as(usize, 1), snap.len);
+}
+
+test "integration: two-step topic-create then hook-add flow is unchanged" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("twostep");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    // Step 1: create the topic and let history accumulate.
+    try tm.createTopic("t.twostep");
+    _ = try tm.publish("t.twostep", null, "pre-1");
+    _ = try tm.publish("t.twostep", null, "pre-2");
+
+    // Step 2: plain hook add — same registration path as before this change:
+    // tip computed under the lock, hook inserted with that cursor.
+    tm.lockForHookRegistration();
+    const tip = tm.tipForPatternLocked("t.twostep");
+    _ = try ht.addWithCursor("t.twostep", "echo", "/tmp", false, null, null, tip);
+    tm.unlockForHookRegistration();
+
+    // Cursor semantics unchanged: history skipped, next event delivered.
+    try testing.expectEqual(@as(u64, 2), tip);
+    _ = try tm.publish("t.twostep", null, "post-1");
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    const pending = try tm.fetch(allocator, "t.twostep", snap[0].cursor, 10);
+    defer freeEvents(pending);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("post-1", pending[0].value);
+}

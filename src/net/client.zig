@@ -318,7 +318,7 @@ pub const Client = struct {
     /// asks the server to resolve "current tip" atomically; `0` replays all
     /// history; any other value starts at that topic-local offset.
     pub fn registerHookFullNamedCursor(self: *Client, pattern: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8, start_cursor: ?u64) !u64 {
-        const req = protocol.RegisterHookRequest{
+        return self.sendRegisterHook(.{
             .pattern = pattern,
             .command = command,
             .cwd = cwd,
@@ -326,7 +326,26 @@ pub const Client = struct {
             .env = env,
             .name = name,
             .start_cursor = start_cursor,
-        };
+        });
+    }
+
+    /// Atomically create the exact topic `topic` AND register a hook on it
+    /// in one server-side critical section — no event can be published to
+    /// the topic before the hook is armed. Fails (registering nothing) if
+    /// the topic already exists, including tombstoned names.
+    pub fn registerHookCreateTopic(self: *Client, topic: []const u8, command: []const u8, cwd: []const u8, once: bool, env: ?[]const []const u8, name: ?[]const u8) !u64 {
+        return self.sendRegisterHook(.{
+            .pattern = topic,
+            .command = command,
+            .cwd = cwd,
+            .once = once,
+            .env = env,
+            .name = name,
+            .create_topic = true,
+        });
+    }
+
+    fn sendRegisterHook(self: *Client, req: protocol.RegisterHookRequest) !u64 {
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
         try protocol.writeFrame(self.fd(), .register_hook, body);

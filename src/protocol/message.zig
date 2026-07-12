@@ -131,6 +131,12 @@ pub const RegisterHookRequest = struct {
     /// slip between tip-read and hook insertion. Pass `0` for a full
     /// historical replay, or an explicit value for partial replay.
     start_cursor: ?u64 = null,
+    /// When true, `pattern` must be an exact topic name; the server creates
+    /// the topic AND registers the hook in one critical section under the
+    /// TopicManager's publish lock, so no event can precede the hook. Fails
+    /// (registering nothing) if the topic already exists. Defaulted so old
+    /// clients are unaffected. Mutually exclusive with `start_cursor`.
+    create_topic: bool = false,
 };
 
 pub const RegisterHookResponse = struct {

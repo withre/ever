@@ -296,6 +296,26 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
+        if (req.create_topic) {
+            // Server-side validation mirrors the client's — the server must
+            // not trust the client.
+            if (req.start_cursor != null)
+                return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "create_topic cannot be combined with an explicit start cursor (a fresh topic has no history to replay)");
+            if (topic_mod.isPatternShape(req.pattern))
+                return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "create_topic requires an exact topic name (no trailing-dot prefix, no '*' wildcard)");
+
+            const id = createTopicAndRegisterHook(self.topic_manager, ht, req.pattern, req.command, req.cwd, req.once, req.env, req.name) catch |err| return switch (err) {
+                error.AlreadyExists => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "topic already exists"),
+                error.InvalidName => sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "invalid topic name"),
+                else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "failed to create topic and register hook"),
+            };
+
+            const resp_body = try protocol.encodeBody(self.allocator, protocol.RegisterHookResponse{ .id = id });
+            defer self.allocator.free(resp_body);
+            try protocol.writeFrame(fd, .register_hook_ok, resp_body);
+            return;
+        }
+
         // Resolve start cursor. `null` means "current tip" — computed while
         // holding the TopicManager's publish lock so no event can slip in
         // between tip-read and hook insertion.
@@ -622,6 +642,53 @@ pub const Server = struct {
         try protocol.writeFrame(fd, .timer_info_ok, resp_body);
     }
 };
+
+/// Atomically create the exact topic `topic` and register a hook on it,
+/// all inside one critical section under the TopicManager registration
+/// lock (the same mutex the publish path uses). Because the lock is held
+/// for the whole operation, no publish can interleave anywhere inside it:
+/// at the moment the topic becomes publishable, the hook is already armed
+/// with a tip cursor of 0, so the first event ever published is the first
+/// event delivered.
+///
+/// Ordering inside the lock: all fallible validation first — so the
+/// common failure, AlreadyExists (including tombstoned names), creates
+/// nothing — then hook registration, then the topic-creation marker
+/// append. If the marker append fails the hook record is removed before
+/// the error propagates, leaving neither half. The reverse order would be
+/// worse: a created topic cannot be un-created (deletion writes a
+/// permanent tombstone), while a hook record can be removed cleanly.
+///
+/// Public (module-level, not a Server method) so integration tests can
+/// exercise the critical section without standing up TCP.
+pub fn createTopicAndRegisterHook(
+    tm: *TopicManager,
+    ht: *HookTable,
+    topic: []const u8,
+    command: []const u8,
+    cwd: []const u8,
+    once: bool,
+    env: ?[]const []const u8,
+    name: ?[]const u8,
+) !u64 {
+    if (topic_mod.isPatternShape(topic)) return topic_mod.TopicError.InvalidName;
+
+    tm.lockForHookRegistration();
+    defer tm.unlockForHookRegistration();
+
+    // Validate before registering anything.
+    try topic_mod.validateTopicName(topic);
+    if (tm.hasTopicLocked(topic)) return topic_mod.TopicError.AlreadyExists;
+
+    // Fresh topic ⇒ tip is 0. Computed through the same helper the plain
+    // registration path uses, for consistency.
+    const tip = tm.tipForPatternLocked(topic);
+    const id = try ht.addWithCursor(topic, command, cwd, once, env, name, tip);
+    errdefer ht.remove(id) catch {};
+
+    try tm.createTopicLocked(topic);
+    return id;
+}
 
 fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
     if (global_server) |s| {
