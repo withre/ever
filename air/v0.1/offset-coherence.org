@@ -1,5 +1,5 @@
 #+title: Offset Coherence Between Display and Flags
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:protocol:subscriber:
 
 * Summary
@@ -101,3 +101,4 @@ Dispatch on =after_offset != null= to the new paths; populate =topic_events= for
 - 2026-07-12: Implemented (everfix impl-p3). Wire protocol + store + server + client library with unit and TCP integration tests (7263de7); CLI =--after-offset= on =sub=/=wait=, follow/wait loop global-offset cursor, beyond-end stderr warning, =--from= help text reworded as skip count, and usage errors mapped to clean exit 1 (9fa424a); HTTP =?after_offset== + =offset=&after_offset= → 400 + endpoint doc comment, responses carry =topic_events= (af8980e). All Acceptance Criteria verified behaviorally against a scratch store; =zig build test= green.
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 1 Mode B and proposal P3, verified at 142d5e6). Chose the additive =--after-offset= / =?after_offset== shape over changing the display format, and stderr warning without exit-code change.
+- 2026-07-13: State: ready → complete.
