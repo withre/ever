@@ -1,5 +1,5 @@
 #+title: Hook Failure Visibility
-#+state: ready
+#+state: complete
 #+FILETAGS: :store:subscriber:cli:
 
 * Summary
@@ -95,3 +95,4 @@ $ ever hook list --json | jq '.[0] | {fired_count, failure_count, last_exit_stat
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-13: Implemented (everfix impl-p7). Counters recorded in the daemon (=1c5ca1b=): =Hook=/=HookJson= gain the four fields with load defaults, =recordDelivery= folds =fired_count=/spawn-failure accounting into the per-delivery save, =recordExit= handles reaped exits with persist-on-change for clean exits, =ProcessEntry= carries the triggering event's global offset, and =reapChildren= decodes =waitpid= status via =WIFEXITED=/=WIFSIGNALED= (signal death → =128 + signum=, fixing the exit-0 misread of signal-killed children). Surfaced over the protocol and in human =hook list= (=f92c8a7=): =HookInfo= gains the four fields (defaulted for old-store/new-CLI degradation) and =hook list= renders a =Fired= column — =2 (2 failed, last exit 127)=. Tests a–f from Design Details added in =src/store/hooks.zig=; behavioral check against a scratch store verified 127 (missing binary), 137 (SIGKILL), restart survival, and unchanged cursor advance past failed events.
 - 2026-07-13: *Design Divergence* — the =hook list --json= acceptance criterion is deferred: =hook list= has no =--json= flag on =main=; the flag machinery is owned by the in-flight draft =v0.1/cli-json-list-output.org= (uncommitted, per this doc's own Non-Goals). The four fields are protocol-ready and will flow into that JSON listing automatically when it lands. All other acceptance criteria (human output, persistence, restart survival, unchanged delivery semantics, =ConcurrentLimitReached= untouched) are met in full.
+- 2026-07-13: State: ready → complete.
