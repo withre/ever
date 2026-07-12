@@ -1017,3 +1017,126 @@ test "integration: after_offset cursor over TCP round-trips displayed offsets" {
         try testing.expectEqual(g4, next.events[0].offset);
     }
 }
+
+// ── Hook Logs over TCP ──────────────────────────────────────────────────────
+//
+// Server-side split from air/v0.1/hook-logs-json.org: an unknown hook ID is
+// a not_found error, while a known hook with no recorded executions answers
+// hook_logs_ok with empty log_path + content. A typo'd ID must not read as
+// "no executions", and an empty history is not an error.
+
+test "integration: hook logs distinguishes no-such-hook from no-executions" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const hook_dir = try makeHookDir("hooklogs");
+    defer cleanupHookDir(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    const hook_id = try ht.addFull("hl.topic", "true", "/tmp", false, null, "hl-hook");
+
+    // The daemon is attached but never started — handleHookLogs only
+    // requires its presence, not a polling thread.
+    const empty_envp: [0:null]?[*:0]const u8 = .{};
+    var hd = ever.hooks.HookDaemon.init(allocator, &ht, &tm, &empty_envp);
+
+    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+    const port: u16 = 33000 + pid_part;
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    server.setHookTable(&ht);
+    server.setHookDaemon(&hd);
+
+    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+
+    var reachable = false;
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+            reachable = true;
+            break;
+        }
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    try testing.expect(reachable);
+
+    // Known hook, no executions → empty-success, not an error.
+    {
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
+        defer client.deinit();
+        var res = try client.hookLogs(hook_id);
+        defer res.deinit();
+        try testing.expectEqual(hook_id, res.hook_id);
+        try testing.expectEqual(@as(usize, 0), res.log_path.len);
+        try testing.expectEqual(@as(usize, 0), res.content.len);
+    }
+
+    // Unknown hook ID → not_found error ("no such hook"). Spoken raw so
+    // the assertion covers the wire shape (code + message) and the client's
+    // stderr diagnostic doesn't fire inside the test runner.
+    {
+        const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
+        const ip_address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
+        const stream = try ip_address.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        const cfd = stream.socket.handle;
+
+        const req_body = try ever.protocol.encodeBody(allocator, ever.protocol.HookLogsRequest{ .hook_id = hook_id + 999 });
+        defer allocator.free(req_body);
+        try ever.protocol.writeFrame(cfd, .hook_logs, req_body);
+
+        const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;
+        defer allocator.free(frame.body);
+        try testing.expectEqual(ever.protocol.MessageType.error_response, frame.msg_type);
+        const parsed = try ever.protocol.decodeBody(ever.protocol.ErrorResponse, allocator, frame.body);
+        defer parsed.deinit();
+        try testing.expectEqual(ever.protocol.ErrorCode.not_found, parsed.value.code);
+        try testing.expect(std.mem.indexOf(u8, parsed.value.message, "no such hook") != null);
+    }
+
+    // With a recorded execution log on disk, content and path round-trip.
+    const hooks_subdir = try std.fmt.allocPrint(allocator, "{s}/hooks", .{hook_dir});
+    defer allocator.free(hooks_subdir);
+    const log_file = try std.fmt.allocPrint(allocator, "{s}/{d}-1751274843123.log", .{ hooks_subdir, hook_id });
+    defer allocator.free(log_file);
+    {
+        const subdir_z = try allocator.allocSentinel(u8, hooks_subdir.len, 0);
+        defer allocator.free(subdir_z);
+        @memcpy(subdir_z[0..hooks_subdir.len], hooks_subdir);
+        _ = std.os.linux.mkdir(subdir_z.ptr, 0o755);
+
+        const log_z = try allocator.allocSentinel(u8, log_file.len, 0);
+        defer allocator.free(log_z);
+        @memcpy(log_z[0..log_file.len], log_file);
+        const fd_rc = std.os.linux.open(log_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        try testing.expect(@as(isize, @bitCast(fd_rc)) >= 0);
+        const fd: i32 = @intCast(fd_rc);
+        const content = "=== Hook Execution ===\nHook:      #1 (hl-hook)\n===\n\nout\n";
+        var written: usize = 0;
+        while (written < content.len) {
+            const w = std.os.linux.write(fd, content[written..].ptr, content.len - written);
+            if (@as(isize, @bitCast(w)) <= 0) break;
+            written += @intCast(w);
+        }
+        _ = std.os.linux.close(fd);
+
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
+        defer client.deinit();
+        var res = try client.hookLogs(hook_id);
+        defer res.deinit();
+        try testing.expectEqualStrings(log_file, res.log_path);
+        try testing.expectEqualStrings(content, res.content);
+
+        _ = std.os.linux.unlink(log_z.ptr);
+        _ = std.os.linux.rmdir(subdir_z.ptr);
+    }
+
+    server.shutdown_requested.store(true, .release);
+    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
+    thread.join();
+    server.shutdown();
+}

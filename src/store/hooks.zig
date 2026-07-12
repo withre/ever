@@ -249,6 +249,17 @@ pub const HookTable = struct {
         return null;
     }
 
+    /// True when a hook with this ID is currently registered.
+    /// Safe for cross-thread use.
+    pub fn contains(self: *HookTable, id: u64) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.hooks.items) |hook| {
+            if (hook.id == id) return true;
+        }
+        return false;
+    }
+
     /// Return the number of registered hooks. Safe for cross-thread display.
     pub fn count(self: *HookTable) usize {
         self.lock();

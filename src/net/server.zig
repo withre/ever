@@ -541,6 +541,15 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
+        // Distinguish "no such hook" (error) from "known hook, no executions"
+        // (empty success): consult the hook table before scanning the log dir.
+        // See air/v0.1/hook-logs-json.org.
+        if (!ht.contains(req.hook_id)) {
+            var msg_buf: [64]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "no such hook: {d}", .{req.hook_id}) catch "no such hook";
+            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, msg);
+        }
+
         // Find the most recent log file for this hook ID by scanning the hooks dir
         const hooks_dir_path = std.fmt.allocPrint(self.allocator, "{s}/hooks", .{ht.data_dir}) catch
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "alloc failed");
@@ -563,7 +572,7 @@ pub const Server = struct {
         const dir_fd_rc = std.os.linux.open(hooks_dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
         const dir_fd_i: isize = @bitCast(dir_fd_rc);
         if (dir_fd_i < 0)
-            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "no hook logs directory");
+            return self.sendHookLogsEmpty(fd, req.hook_id);
         const dir_fd: i32 = @intCast(dir_fd_rc);
         defer _ = std.os.linux.close(dir_fd);
 
@@ -600,7 +609,7 @@ pub const Server = struct {
         }
 
         const log_file_path = best_path orelse
-            return sendError(self.allocator, fd, protocol.ErrorCode.not_found, "no logs found for this hook");
+            return self.sendHookLogsEmpty(fd, req.hook_id);
 
         // Read the log file content
         const log_z = self.allocator.allocSentinel(u8, log_file_path.len, 0) catch
@@ -632,6 +641,18 @@ pub const Server = struct {
             .hook_id = req.hook_id,
             .log_path = log_file_path,
             .content = content_buf[0..total],
+        });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .hook_logs_ok, resp_body);
+    }
+
+    /// Success response for a known hook that has no recorded executions:
+    /// empty log_path + empty content. An empty history is not an error.
+    fn sendHookLogsEmpty(self: *Server, fd: std.posix.fd_t, hook_id: u64) !void {
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.HookLogsResponse{
+            .hook_id = hook_id,
+            .log_path = "",
+            .content = "",
         });
         defer self.allocator.free(resp_body);
         try protocol.writeFrame(fd, .hook_logs_ok, resp_body);
