@@ -1140,3 +1140,163 @@ test "integration: hook logs distinguishes no-such-hook from no-executions" {
     thread.join();
     server.shutdown();
 }
+
+// ── Hook list legibility tests (air/v0.1/hook-list-legibility.org) ──────────
+//
+// Presentation-side derivation of the uniform Pending / Fired listing values
+// (counter persistence and increment tests live with hook-failure-visibility).
+
+const computeHookPending = ever.net.computeHookPending;
+const hook_pending_cap = ever.net.hook_pending_cap;
+const HookDaemon = ever.hooks.HookDaemon;
+
+const legibility_test_envp: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
+
+/// Scratch dir cleanup that also removes the daemon's hooks/ log tree.
+fn cleanupHookTree(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    allocator.free(path);
+}
+
+/// Register a hook at the current tip for `pattern`, mirroring the server
+/// registration path (tip computed under the publish lock).
+fn registerHookAtTip(tm: *TopicManager, ht: *HookTable, pattern: []const u8, command: []const u8) !u64 {
+    tm.lockForHookRegistration();
+    defer tm.unlockForHookRegistration();
+    const tip = tm.tipForPatternLocked(pattern);
+    return ht.addWithCursor(pattern, command, "/tmp", false, null, null, tip);
+}
+
+test "integration: fresh exact and prefix hooks both derive Pending 0 / Fired 0" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // Prior events on the log — the raw cursors of the two hooks will differ
+    // wildly (topic-local skip count vs global log offset), the derived
+    // Pending/Fired must not.
+    try tm.createTopic("wutest.wever.subtest");
+    try tm.createTopic("wutest.wever.other");
+    _ = try tm.publish("wutest.wever.other", null, "noise-1");
+    _ = try tm.publish("wutest.wever.subtest", null, "pre-1");
+    _ = try tm.publish("wutest.wever.subtest", null, "pre-2");
+    _ = try tm.publish("wutest.wever.other", null, "noise-2");
+
+    const hook_dir = try makeHookDir("legib-fresh");
+    defer cleanupHookTree(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    _ = try registerHookAtTip(&tm, &ht, "wutest.wever.subtest", "/bin/sh -c 'exit 0'");
+    _ = try registerHookAtTip(&tm, &ht, "wutest.wever.", "/bin/sh -c 'exit 0'");
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try testing.expectEqual(@as(usize, 2), snap.len);
+
+    // Raw cursors diverge by construction (the 4-vs-164 trap)…
+    try testing.expect(snap[0].cursor != snap[1].cursor);
+
+    // …but the derived listing values are uniform: Pending 0 / Fired 0.
+    const exact = try computeHookPending(&tm, allocator, snap[0].pattern, snap[0].cursor);
+    try testing.expectEqual(@as(u64, 0), exact.pending);
+    try testing.expectEqualStrings("topic_local", exact.cursor_kind);
+    try testing.expectEqual(@as(u64, 0), snap[0].fired_count);
+
+    const prefix = try computeHookPending(&tm, allocator, snap[1].pattern, snap[1].cursor);
+    try testing.expectEqual(@as(u64, 0), prefix.pending);
+    try testing.expectEqualStrings("global", prefix.cursor_kind);
+    try testing.expectEqual(@as(u64, 0), snap[1].fired_count);
+
+    // An exact hook on a topic that does not exist yet also derives 0.
+    const ghost = try computeHookPending(&tm, allocator, "wutest.wever.ghost", 0);
+    try testing.expectEqual(@as(u64, 0), ghost.pending);
+    try testing.expectEqualStrings("topic_local", ghost.cursor_kind);
+}
+
+test "integration: daemon consumption drives Fired to N and Pending back to 0" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.legib.fire");
+
+    const hook_dir = try makeHookDir("legib-fire");
+    defer cleanupHookTree(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    _ = try registerHookAtTip(&tm, &ht, "t.legib.fire", "/bin/sh -c 'exit 0'");
+    _ = try registerHookAtTip(&tm, &ht, "t.legib.", "/bin/sh -c 'exit 0'");
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, legibility_test_envp);
+    try daemon.start();
+    defer daemon.stop();
+
+    const n = 3;
+    var i: usize = 0;
+    while (i < n) : (i += 1) _ = try tm.publish("t.legib.fire", null, "evt");
+
+    // Wait for the daemon (500ms poll cadence) to deliver all N to both hooks.
+    var waited_ms: usize = 0;
+    while (waited_ms < 15_000) : (waited_ms += 50) {
+        const snap = try ht.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        if (snap[0].fired_count >= n and snap[1].fired_count >= n) break;
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 50_000_000 }, null);
+    }
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    for (snap) |hook| {
+        try testing.expectEqual(@as(u64, n), hook.fired_count);
+        const derived = try computeHookPending(&tm, allocator, hook.pattern, hook.cursor);
+        try testing.expectEqual(@as(u64, 0), derived.pending);
+    }
+}
+
+test "integration: backlog while the daemon is stopped grows for both cursor kinds" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.legib.stopped");
+
+    const hook_dir = try makeHookDir("legib-stop");
+    defer cleanupHookTree(hook_dir);
+    var ht = try HookTable.init(allocator, hook_dir);
+    defer ht.deinit();
+
+    _ = try registerHookAtTip(&tm, &ht, "t.legib.stopped", "/bin/sh -c 'exit 0'");
+    _ = try registerHookAtTip(&tm, &ht, "t.legib.", "/bin/sh -c 'exit 0'");
+
+    // No daemon runs — publish a backlog.
+    _ = try tm.publish("t.legib.stopped", null, "b1");
+    _ = try tm.publish("t.legib.stopped", null, "b2");
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+
+    // Identical backlog for both cursor kinds.
+    for (snap) |hook| {
+        try testing.expectEqual(@as(u64, 0), hook.fired_count);
+        const derived = try computeHookPending(&tm, allocator, hook.pattern, hook.cursor);
+        try testing.expectEqual(@as(u64, 2), derived.pending);
+    }
+
+    // Marker events don't inflate the backlog, and a matching event on a
+    // sibling topic is pending only for the prefix hook.
+    try tm.createTopic("t.legib.sibling");
+    _ = try tm.publish("t.legib.sibling", null, "s1");
+
+    const exact = try computeHookPending(&tm, allocator, snap[0].pattern, snap[0].cursor);
+    try testing.expectEqual(@as(u64, 2), exact.pending);
+    const prefix = try computeHookPending(&tm, allocator, snap[1].pattern, snap[1].cursor);
+    try testing.expectEqual(@as(u64, 3), prefix.pending);
+
+    // The cap bounds the scan: a cap below the true backlog is honoured
+    // (rendered as "1000+" by the CLI when it equals the cap).
+    const capped = try tm.countPatternByOffset(allocator, "t.legib.", 0, 2);
+    try testing.expectEqual(@as(u64, 2), capped);
+}

@@ -432,6 +432,46 @@ pub const TopicManager = struct {
         return events.toOwnedSlice(allocator);
     }
 
+    /// Count events matching `pattern` from a global log offset — the
+    /// count-only sibling of `fetchPatternByOffset` (same scan-from-cursor
+    /// loop: skip markers, `matchTopic`, tally instead of allocating event
+    /// bodies). Used by `list_hooks` to derive a hook's Pending backlog.
+    ///
+    /// The scan stops tallying at `cap` so a hook far behind a large log
+    /// cannot trigger an unbounded scan; callers render a result equal to
+    /// `cap` as "cap+". The result is a point-in-time snapshot racing live
+    /// publishes — fine for a status display.
+    pub fn countPatternByOffset(
+        self: *TopicManager,
+        allocator: Allocator,
+        pattern: []const u8,
+        start_offset: u64,
+        cap: u32,
+    ) !u64 {
+        // Same locking rationale as fetchPatternByOffset: readBatch is not
+        // thread-safe against concurrent appends.
+        self.lock();
+        defer self.mutex.unlock();
+
+        var count: u64 = 0;
+        var cursor = start_offset;
+        const next = self.log.nextOffset();
+        while (count < cap and cursor < next) {
+            const batch = try self.log.readBatch(allocator, cursor, 256);
+            defer allocator.free(batch);
+            if (batch.len == 0) break;
+            for (batch) |evt| {
+                defer store.freeEvent(allocator, evt);
+                if (count >= cap) continue; // cap reached — just free the rest
+                cursor = evt.offset + 1;
+                if (evt.value.len == 0) continue; // marker / tombstone
+                if (!matchTopic(pattern, evt.topic)) continue;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Fetch events across all topics matching a pattern.
     /// Skips internal marker events (creation markers and tombstones).
     pub fn fetchPattern(self: *TopicManager, allocator: Allocator, pattern: []const u8, start: u64, max_count: u32) ![]Event {
@@ -698,6 +738,56 @@ test "TopicManager fetchPatternByOffset serves the after_offset pattern path" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("a2", events[0].value);
     try std.testing.expectEqual(g3, events[0].offset);
+}
+
+test "TopicManager countPatternByOffset counts from cursor, excludes markers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // Creation markers and a tombstone interleaved with real events — none
+    // of the markers may be tallied.
+    try tm.createTopic("agent.a");
+    try tm.createTopic("agent.b");
+    try tm.createTopic("other.x");
+    _ = try tm.publish("agent.a", null, "a1");
+    const g_b1 = try tm.publish("agent.b", null, "b1");
+    _ = try tm.publish("other.x", null, "x1"); // non-matching topic
+    _ = try tm.publish("agent.a", null, "a2");
+    try tm.createTopic("agent.late"); // marker after the cursor positions below
+    _ = try tm.publish("agent.late", null, "l1");
+
+    // From offset 0: all four matching non-marker events.
+    try std.testing.expectEqual(@as(u64, 4), try tm.countPatternByOffset(std.testing.allocator, "agent.", 0, 1000));
+    // From mid-log: only events at offset >= g_b1 + 1 (a2, l1).
+    try std.testing.expectEqual(@as(u64, 2), try tm.countPatternByOffset(std.testing.allocator, "agent.", g_b1 + 1, 1000));
+    // From the tip: nothing pending.
+    try std.testing.expectEqual(@as(u64, 0), try tm.countPatternByOffset(std.testing.allocator, "agent.", tm.tipForPattern("agent."), 1000));
+    // Wildcard matches exactly one segment: a two-segment suffix is counted
+    // by the prefix pattern but not by the wildcard.
+    try tm.createTopic("agent.deep.q");
+    _ = try tm.publish("agent.deep.q", null, "d1");
+    try std.testing.expectEqual(@as(u64, 5), try tm.countPatternByOffset(std.testing.allocator, "agent.", 0, 1000));
+    try std.testing.expectEqual(@as(u64, 4), try tm.countPatternByOffset(std.testing.allocator, "agent.*", 0, 1000));
+}
+
+test "TopicManager countPatternByOffset honours the cap" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("agent.a");
+    var i: usize = 0;
+    while (i < 7) : (i += 1) _ = try tm.publish("agent.a", null, "v");
+
+    // Cap below the true backlog — the tally stops at the cap.
+    try std.testing.expectEqual(@as(u64, 3), try tm.countPatternByOffset(std.testing.allocator, "agent.", 0, 3));
+    // Cap above the true backlog — exact count.
+    try std.testing.expectEqual(@as(u64, 7), try tm.countPatternByOffset(std.testing.allocator, "agent.", 0, 1000));
 }
 
 test "TopicManager topicEventCount" {

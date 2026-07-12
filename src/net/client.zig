@@ -50,12 +50,19 @@ pub const HookInfoOwned = struct {
     failure_count: u64 = 0,
     last_exit_status: ?u8 = null,
     last_failed_offset: ?u64 = null,
+    // Derived listing fields (hook-list-legibility). `pending` is capped
+    // server-side (renders "1000+" at the cap); `cursor_kind` tags the
+    // polymorphic `cursor` ("topic_local" | "global"). Always heap-duped by
+    // `listHooks`; an old store that omits them yields 0 / "topic_local".
+    pending: u64 = 0,
+    cursor_kind: []const u8,
 
     pub fn deinit(self: HookInfoOwned, allocator: Allocator) void {
         if (self.name) |n| allocator.free(n);
         allocator.free(self.pattern);
         allocator.free(self.command);
         allocator.free(self.cwd);
+        allocator.free(self.cursor_kind);
         if (self.env) |env| {
             for (env) |e| allocator.free(e);
             allocator.free(env);
@@ -466,6 +473,8 @@ pub const Client = struct {
                 .failure_count = h.failure_count,
                 .last_exit_status = h.last_exit_status,
                 .last_failed_offset = h.last_failed_offset,
+                .pending = h.pending,
+                .cursor_kind = try self.allocator.dupe(u8, h.cursor_kind),
             };
             initialized = i + 1;
         }

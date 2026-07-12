@@ -388,6 +388,8 @@ pub const Server = struct {
         defer self.allocator.free(hook_infos);
 
         for (hooks, 0..) |hook, i| {
+            const derived = computeHookPending(self.topic_manager, self.allocator, hook.pattern, hook.cursor) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "pending computation failed");
             hook_infos[i] = .{
                 .id = hook.id,
                 .name = hook.name,
@@ -401,6 +403,8 @@ pub const Server = struct {
                 .failure_count = hook.failure_count,
                 .last_exit_status = hook.last_exit_status,
                 .last_failed_offset = hook.last_failed_offset,
+                .pending = derived.pending,
+                .cursor_kind = derived.cursor_kind,
             };
         }
 
@@ -816,6 +820,46 @@ pub fn createTopicAndRegisterHook(
 
     try tm.createTopicLocked(topic);
     return id;
+}
+
+/// Cap for the Pending backlog computation in `list_hooks`. A pattern hook
+/// far behind a large log would otherwise trigger an unbounded scan; a value
+/// equal to the cap renders as "1000+" in the CLI.
+pub const hook_pending_cap: u32 = 1000;
+
+pub const HookPendingInfo = struct {
+    pending: u64,
+    cursor_kind: []const u8,
+};
+
+/// Derive the uniform `Pending` value + `cursor_kind` tag for one hook,
+/// dispatching by pattern shape exactly like `HookDaemon.processHook`
+/// (see `v0.1/hook-registration-cursor.org`):
+///
+/// - exact topic → cursor is a topic-local skip count;
+///   `pending = non_marker_count -| cursor` (0 if the topic doesn't exist).
+/// - prefix/wildcard → cursor is a global log offset; pending is the count
+///   of matching non-marker events at `offset >= cursor`, capped at
+///   `hook_pending_cap`.
+///
+/// Each branch reads under the TopicManager lock, so the value is a
+/// consistent point-in-time snapshot (racing live publishes — fine for a
+/// status display). Public (module-level) so integration tests can exercise
+/// it without standing up TCP.
+pub fn computeHookPending(
+    tm: *TopicManager,
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    cursor: u64,
+) !HookPendingInfo {
+    if (topic_mod.isPatternShape(pattern)) {
+        return .{
+            .pending = try tm.countPatternByOffset(allocator, pattern, cursor, hook_pending_cap),
+            .cursor_kind = "global",
+        };
+    }
+    const total = tm.topicEventCount(pattern) orelse 0;
+    return .{ .pending = total -| cursor, .cursor_kind = "topic_local" };
 }
 
 fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {

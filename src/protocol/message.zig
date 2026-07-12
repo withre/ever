@@ -176,6 +176,13 @@ pub const HookInfo = struct {
     failure_count: u64 = 0,
     last_exit_status: ?u8 = null,
     last_failed_offset: ?u64 = null,
+    // Derived listing fields (hook-list-legibility). `pending` is the number
+    // of matching events not yet processed (capped server-side; see
+    // `net.hook_pending_cap`), `cursor_kind` tags the polymorphic `cursor`
+    // ("topic_local" for exact topics, "global" for prefix/wildcard) so the
+    // raw value is self-describing. Defaulted for old-store compatibility.
+    pending: u64 = 0,
+    cursor_kind: []const u8 = "topic_local",
 };
 
 pub const ListHooksResponse = struct {
