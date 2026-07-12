@@ -77,6 +77,166 @@ test "integration: status server probe flips true then false" {
     try testing.expect(!after_shutdown);
 }
 
+// ── Status Over TCP ───────────────────────────────────────────────────────
+//
+// From air/v0.1/status-over-tcp.org: start a server on a real data dir,
+// publish events, query status over the wire, and verify the server-sourced
+// counters agree with the offline scan of the same directory.
+
+fn makeStatusDir() ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/tmp/.ever-integ-status-{d}", .{std.os.linux.getpid()});
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    _ = std.os.linux.mkdir(path_z.ptr, 0o755);
+    return path;
+}
+
+fn cleanupStatusDir(path: []const u8) void {
+    // Unlink every file in the dir, then remove it.
+    blk: {
+        const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch break :blk;
+        defer dir.close(io);
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |n| allocator.free(n);
+            names.deinit(allocator);
+        }
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            names.append(allocator, allocator.dupe(u8, entry.name) catch break) catch break;
+        }
+        for (names.items) |name| {
+            const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, name }) catch continue;
+            defer allocator.free(full);
+            const full_z = allocator.allocSentinel(u8, full.len, 0) catch continue;
+            defer allocator.free(full_z);
+            @memcpy(full_z[0..full.len], full);
+            _ = std.os.linux.unlink(full_z.ptr);
+        }
+    }
+    const p_z = allocator.allocSentinel(u8, path.len, 0) catch return;
+    defer allocator.free(p_z);
+    @memcpy(p_z[0..path.len], path);
+    _ = std.os.linux.rmdir(p_z.ptr);
+    allocator.free(path);
+}
+
+test "integration: status over TCP reports live stats and matches offline scan" {
+    const data_dir = try makeStatusDir();
+    defer cleanupStatusDir(data_dir);
+
+    const dir = try std.Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true });
+    var tm = try TopicManager.init(allocator, io, dir, .{ .sync_on_append = false });
+    defer {
+        tm.deinit();
+        dir.close(io);
+    }
+
+    try tm.createTopic("status.alpha");
+    try tm.createTopic("status.beta");
+    _ = try tm.publish("status.alpha", null, "a1");
+    _ = try tm.publish("status.alpha", null, "a2");
+    _ = try tm.publish("status.alpha", null, "a3");
+    _ = try tm.publish("status.beta", null, "b1");
+
+    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+    const port: u16 = 31000 + pid_part;
+    var server = try ever.net.Server.init(allocator, io, &tm, .{
+        .address = "127.0.0.1",
+        .port = port,
+        .data_dir = data_dir,
+    });
+    defer server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+
+    var reachable = false;
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+            reachable = true;
+            break;
+        }
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    try testing.expect(reachable);
+
+    // Query status over the wire — no local filesystem access on this path.
+    var server_status: ever.client.StatusResult = undefined;
+    {
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
+        defer client.deinit();
+        server_status = try client.status();
+    }
+    defer server_status.deinit();
+
+    const st = &server_status.status;
+    try testing.expectEqualStrings(data_dir, st.data_dir);
+    try testing.expectEqual(ever.status.Source.server, st.source);
+    try testing.expectEqual(true, st.lock_held);
+    try testing.expectEqual(@as(u64, 4), st.total_events);
+    try testing.expect(st.segments >= 1);
+    try testing.expect(st.total_bytes > 0);
+    try testing.expect(st.uptime_ms != null);
+    try testing.expectEqual(@as(?u64, 0), st.timer_count); // no timer table attached
+    try testing.expectEqual(@as(usize, 2), st.topics.len);
+    var saw_alpha = false;
+    var saw_beta = false;
+    for (st.topics) |t| {
+        if (std.mem.eql(u8, t.name, "status.alpha")) {
+            try testing.expectEqual(@as(u64, 3), t.events);
+            saw_alpha = true;
+        }
+        if (std.mem.eql(u8, t.name, "status.beta")) {
+            try testing.expectEqual(@as(u64, 1), t.events);
+            saw_beta = true;
+        }
+    }
+    try testing.expect(saw_alpha);
+    try testing.expect(saw_beta);
+    try testing.expectEqual(@as(usize, 0), st.hooks.len); // no hook table attached
+
+    // Stop the server.
+    server.shutdown_requested.store(true, .release);
+    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
+    thread.join();
+    server.shutdown();
+
+    // With the server stopped, connecting fails — the CLI maps this to the
+    // endpoint-naming error and exit 1.
+    if (ever.client.Client.connect(allocator, io, "127.0.0.1", port)) |c| {
+        var cc = c;
+        cc.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    // Offline scan of the same quiesced data dir agrees with the
+    // server-sourced counters taken before shutdown.
+    var offline = try ever.status.getStatus(allocator, io, data_dir);
+    defer offline.deinit(allocator);
+
+    try testing.expectEqual(ever.status.Source.local_scan, offline.source);
+    try testing.expectEqual(st.total_events, offline.total_events);
+    try testing.expectEqual(st.segments, offline.segments);
+    try testing.expectEqual(st.total_bytes, offline.total_bytes);
+    try testing.expectEqual(st.topics.len, offline.topics.len);
+    for (st.topics) |server_topic| {
+        var found = false;
+        for (offline.topics) |offline_topic| {
+            if (std.mem.eql(u8, server_topic.name, offline_topic.name)) {
+                try testing.expectEqual(server_topic.events, offline_topic.events);
+                try testing.expectEqual(server_topic.deleted, offline_topic.deleted);
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+    try testing.expectEqual(st.hooks.len, offline.hooks.len);
+}
+
 // ── Basic Publish-Subscribe ─────────────────────────────────────────────────
 
 test "integration: basic publish-subscribe" {

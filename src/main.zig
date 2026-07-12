@@ -943,10 +943,55 @@ fn handleStart(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     try startServer(allocator, ctx.io, ctx, ctx.envp);
 }
 
-fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
+/// True when `name` is present in the process environment (any value).
+fn envHasVar(envp: [*:null]const ?[*:0]const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (envp[i]) |entry| : (i += 1) {
+        const s = std.mem.sliceTo(entry, 0);
+        if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name)) return true;
+    }
+    return false;
+}
 
+fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const data_dir = ctx.flag("data-dir");
     const json_output = ctx.flagBool("json");
+
+    // Default: query the running server over TCP — no local filesystem
+    // access. The offline directory scan only runs when a data dir was
+    // explicitly requested (--data-dir flag or EVER_DATA_DIR env).
+    const explicit_data_dir = ctx.hasFlag("data-dir") or envHasVar(ctx.envp, "EVER_DATA_DIR");
+    if (!explicit_data_dir) {
+        const addr_info = parseStoreAddress(ctx);
+        var c = ever.client.Client.connect(allocator, ctx.io, addr_info.address, addr_info.port) catch {
+            fatal(ctx, "error: cannot reach Ever server at {s}:{d}. Is the store running? For offline inspection use --data-dir <path>.\n", .{ addr_info.address, addr_info.port });
+        };
+        defer c.deinit();
+
+        var result = c.status() catch |err| switch (err) {
+            error.ServerError => exitFlushed(ctx, 1),
+            else => return err,
+        };
+        defer result.deinit();
+
+        // We just spoke the protocol — a strictly stronger signal than the
+        // offline path's bare TCP connect probe.
+        result.status.server = .{
+            .address = addr_info.address,
+            .port = addr_info.port,
+            .reachable = true,
+        };
+
+        if (json_output) {
+            try ever.status.printJson(&result.status, allocator, ctx.stdout);
+        } else {
+            try ever.status.printHuman(&result.status, allocator, ctx.stdout);
+        }
+        ctx.stdout.flush() catch {};
+        return;
+    }
+
+    // Offline/forensic inspection of a local data directory.
     const actual_dir = if (data_dir.len > 0) data_dir else "./data";
 
     // Validate directory looks like an Ever store
@@ -1027,7 +1072,7 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     var timer_table = try ever.timers.TimerTable.init(allocator, actual_data_dir);
     defer timer_table.deinit();
 
-    var server = try ever.net.Server.init(allocator, io, &topic_manager, .{ .address = if (address.len > 0) address else "127.0.0.1", .port = port });
+    var server = try ever.net.Server.init(allocator, io, &topic_manager, .{ .address = if (address.len > 0) address else "127.0.0.1", .port = port, .data_dir = actual_data_dir });
     defer server.deinit();
     server.setHookTable(&hook_table);
     server.setTimerTable(&timer_table);
@@ -1404,9 +1449,9 @@ const app = cli.App{
         },
         .{
             .name = "status",
-            .description = "Show store statistics",
+            .description = "Show store statistics (queries the running server; --data-dir for offline scan)",
             .flags = &.{
-                .{ .name = "data-dir", .default = "./data", .env = "EVER_DATA_DIR", .description = "Data directory" },
+                .{ .name = "data-dir", .default = "./data", .env = "EVER_DATA_DIR", .description = "Inspect a local data directory offline instead of querying the server" },
                 .{ .name = "json", .takes_value = false, .description = "Output as JSON" },
             },
             .run = handleStatus,
