@@ -919,3 +919,101 @@ test "integration: two-step topic-create then hook-add flow is unchanged" {
     try testing.expectEqual(@as(usize, 1), pending.len);
     try testing.expectEqualStrings("post-1", pending[0].value);
 }
+
+// ── Offset Coherence (air/v0.1/offset-coherence.org) ───────────────────────
+//
+// `after_offset` is a global-offset cursor: "resume strictly after this
+// event". Round-trip it over the wire and verify `topic_events` is carried
+// for exact-topic requests (powering the beyond-end warning) and absent
+// for pattern requests.
+
+test "integration: after_offset cursor over TCP round-trips displayed offsets" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("coher.t");
+    try tm.createTopic("coher.other");
+    _ = try tm.publish("coher.other", null, "noise"); // interleave global offsets
+    const g1 = try tm.publish("coher.t", null, "{\"n\":1}");
+    const g2 = try tm.publish("coher.t", null, "{\"n\":2}");
+    const g3 = try tm.publish("coher.t", null, "{\"n\":3}");
+
+    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+    const port: u16 = 32000 + pid_part;
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+    defer {
+        server.shutdown_requested.store(true, .release);
+        _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
+        thread.join();
+        server.shutdown();
+    }
+
+    var attempts: u32 = 0;
+    var reachable = false;
+    while (attempts < 50) : (attempts += 1) {
+        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+            reachable = true;
+            break;
+        }
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    try testing.expect(reachable);
+
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
+    defer client.deinit();
+
+    // A plain fetch tags events with global offsets; feed the 2nd one back.
+    {
+        var all = try client.fetch("coher.t", 0, 10);
+        defer all.deinit();
+        try testing.expectEqual(@as(usize, 3), all.events.len);
+        try testing.expectEqual(g1, all.events[0].offset);
+        try testing.expectEqual(@as(?u64, 3), all.topic_events);
+
+        var after2 = try client.fetchAfter("coher.t", null, all.events[1].offset, 10, 0);
+        defer after2.deinit();
+        try testing.expectEqual(@as(usize, 1), after2.events.len);
+        try testing.expectEqual(g3, after2.events[0].offset);
+        try testing.expectEqualStrings("{\"n\":3}", after2.events[0].value);
+    }
+
+    // Strictly after the tip → nothing, and topic_events still says 3.
+    {
+        var at_tip = try client.fetchAfter("coher.t", null, g3, 10, 0);
+        defer at_tip.deinit();
+        try testing.expectEqual(@as(usize, 0), at_tip.events.len);
+        try testing.expectEqual(@as(?u64, 3), at_tip.topic_events);
+    }
+
+    // Skip-count fetch beyond the end: empty, but topic_events lets the
+    // client distinguish this from a genuinely empty topic.
+    {
+        var beyond = try client.fetch("coher.t", 160, 10);
+        defer beyond.deinit();
+        try testing.expectEqual(@as(usize, 0), beyond.events.len);
+        try testing.expectEqual(@as(?u64, 3), beyond.topic_events);
+    }
+
+    // Pattern fetch with after_offset reuses the global-offset path and
+    // carries no topic_events (patterns aggregate several topics).
+    {
+        var pat = try client.fetchAfter(null, "coher.", g2, 10, 0);
+        defer pat.deinit();
+        try testing.expectEqual(@as(usize, 1), pat.events.len);
+        try testing.expectEqual(g3, pat.events[0].offset);
+        try testing.expectEqual(@as(?u64, null), pat.topic_events);
+    }
+
+    // Blocking fetch with after_offset: publish the next event, then wait.
+    {
+        const g4 = try tm.publish("coher.t", null, "{\"n\":4}");
+        var next = try client.fetchAfter("coher.t", null, g3, 10, 2000);
+        defer next.deinit();
+        try testing.expectEqual(@as(usize, 1), next.events.len);
+        try testing.expectEqual(g4, next.events[0].offset);
+    }
+}

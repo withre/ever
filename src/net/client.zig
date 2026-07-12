@@ -12,6 +12,9 @@ const status_mod = @import("../store/status.zig");
 
 pub const FetchResult = struct {
     events: []Event,
+    /// Total non-marker events in the topic — present for exact-topic
+    /// fetches, `null` for pattern fetches. See `FetchResponse.topic_events`.
+    topic_events: ?u64 = null,
     allocator: Allocator,
 
     pub fn deinit(self: *FetchResult) void {
@@ -225,6 +228,20 @@ pub const Client = struct {
         });
     }
 
+    /// Fetch events strictly *after* a global log offset — the resume
+    /// cursor for "continue after what I just saw". Works for exact topics
+    /// and patterns. `block_ms == 0` returns immediately; otherwise the
+    /// server holds until events arrive or the timeout elapses.
+    pub fn fetchAfter(self: *Client, topic_name: ?[]const u8, pattern: ?[]const u8, after_offset: u64, max_count: u32, block_ms: u32) !FetchResult {
+        return self.doFetch(.{
+            .topic = topic_name,
+            .pattern = pattern,
+            .after_offset = after_offset,
+            .max_count = max_count,
+            .block_ms = block_ms,
+        });
+    }
+
     fn doFetch(self: *Client, req: protocol.FetchRequest) !FetchResult {
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
@@ -277,6 +294,7 @@ pub const Client = struct {
 
         return .{
             .events = events,
+            .topic_events = parsed.value.topic_events,
             .allocator = self.allocator,
         };
     }

@@ -77,7 +77,14 @@ pub const PublishResponse = struct {
 pub const FetchRequest = struct {
     topic: ?[]const u8 = null,
     pattern: ?[]const u8 = null,
+    /// Topic-local skip count: skip the first `offset` non-marker events
+    /// (NOT a global log offset).
     offset: u64 = 0,
+    /// Global-offset cursor: resume strictly after this global log offset —
+    /// the value printed as `[topic:offset]` and carried in event bodies.
+    /// When set, the server ignores `offset` (clients enforce exclusivity;
+    /// this rule keeps the protocol total).
+    after_offset: ?u64 = null,
     max_count: u32 = 100,
     block_ms: u32 = 0,
 };
@@ -92,6 +99,11 @@ pub const EventData = struct {
 
 pub const FetchResponse = struct {
     events: []const EventData,
+    /// Total non-marker events in the requested topic. Populated for
+    /// exact-topic requests only (`null` for pattern requests, which
+    /// aggregate several topics). Powers the client-side "start beyond
+    /// end of topic" warning.
+    topic_events: ?u64 = null,
 };
 
 pub const TopicRequest = struct {

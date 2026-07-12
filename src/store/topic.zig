@@ -309,6 +309,60 @@ pub const TopicManager = struct {
         return events.toOwnedSlice(allocator);
     }
 
+    /// Fetch events for a single topic strictly *after* a global log offset
+    /// — the resume cursor behind `--after-offset` / `?after_offset=`. The
+    /// topic index already stores each event's global offset in ascending
+    /// order (`idx.offsets`), so we binary-search for the first stored
+    /// offset `> after_offset` and read forward from there, skipping
+    /// marker events (creation markers and tombstones). No new state.
+    pub fn fetchAfterOffset(self: *TopicManager, allocator: Allocator, topic_name: []const u8, after_offset: u64, max_count: u32) ![]Event {
+        // Phase 1: copy the relevant tail of the offset index under lock
+        const offsets_copy = blk: {
+            self.lock();
+            defer self.mutex.unlock();
+            const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+            const items = idx.offsets.items;
+            // Binary search: first index with items[i] > after_offset
+            // (equivalently >= after_offset + 1; avoids overflow at maxInt).
+            var lo: usize = 0;
+            var hi: usize = items.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (items[mid] <= after_offset) lo = mid + 1 else hi = mid;
+            }
+            break :blk try allocator.dupe(u64, items[lo..]);
+        };
+        defer allocator.free(offsets_copy);
+
+        // Phase 2: read from log WITHOUT holding the lock
+        var events: std.ArrayList(Event) = .empty;
+        errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
+
+        for (offsets_copy) |off| {
+            if (events.items.len >= max_count) break;
+            const event = (try self.log.read(allocator, off)) orelse continue;
+            // Skip marker events (creation markers and tombstones)
+            if (event.value.len == 0) {
+                store.freeEvent(allocator, event);
+                continue;
+            }
+            errdefer store.freeEvent(allocator, event);
+            try events.append(allocator, event);
+        }
+        return events.toOwnedSlice(allocator);
+    }
+
+    /// Non-marker event count of an exact topic, or `null` if the topic
+    /// doesn't exist. Read under the manager lock. Populates the
+    /// `topic_events` field of fetch responses so clients can distinguish
+    /// "start beyond end of topic" from "topic is empty".
+    pub fn topicEventCount(self: *TopicManager, topic_name: []const u8) ?u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.topics.getPtr(topic_name)) |idx| return idx.non_marker_count;
+        return null;
+    }
+
     /// Fetch events matching `pattern`, starting at a global log offset.
     /// Used by the hook daemon for wildcard/prefix hooks, where the cursor
     /// is interpreted as the next global log offset to consider (rather than
@@ -557,6 +611,108 @@ test "TopicManager publish and fetch" {
     defer { for (e2) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(e2); }
     try std.testing.expectEqual(@as(usize, 1), e2.len);
     try std.testing.expectEqualStrings("v2", e2[0].value);
+}
+
+test "TopicManager fetchAfterOffset: mid-stream, at-tip, beyond-tip" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t1");
+    const g1 = try tm.publish("t1", null, "v1");
+    const g2 = try tm.publish("t1", null, "v2");
+    const g3 = try tm.publish("t1", null, "v3");
+    _ = g1;
+
+    // Mid-stream: strictly after the 2nd event → exactly the 3rd.
+    const mid = try tm.fetchAfterOffset(std.testing.allocator, "t1", g2, 10);
+    defer { for (mid) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(mid); }
+    try std.testing.expectEqual(@as(usize, 1), mid.len);
+    try std.testing.expectEqualStrings("v3", mid[0].value);
+    try std.testing.expectEqual(g3, mid[0].offset);
+
+    // At-tip: strictly after the last event → nothing.
+    const tip = try tm.fetchAfterOffset(std.testing.allocator, "t1", g3, 10);
+    defer std.testing.allocator.free(tip);
+    try std.testing.expectEqual(@as(usize, 0), tip.len);
+
+    // Beyond-tip: an offset past everything → nothing, no error.
+    const beyond = try tm.fetchAfterOffset(std.testing.allocator, "t1", g3 + 1000, 10);
+    defer std.testing.allocator.free(beyond);
+    try std.testing.expectEqual(@as(usize, 0), beyond.len);
+
+    // Before everything (the creation marker's offset region) → all events.
+    const all = try tm.fetchAfterOffset(std.testing.allocator, "t1", 0, 10);
+    defer { for (all) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(all); }
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+
+    // Missing topic → NotFound.
+    try std.testing.expectError(TopicError.NotFound, tm.fetchAfterOffset(std.testing.allocator, "nope", 0, 10));
+}
+
+test "TopicManager fetchAfterOffset: markers and tombstones interleaved" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t1"); // creation marker in t1's index
+    const g1 = try tm.publish("t1", null, "v1");
+    try tm.createTopic("t2"); // interleaved global offset on another topic
+    _ = try tm.publish("t2", null, "other");
+    const g2 = try tm.publish("t1", null, "v2");
+    try tm.deleteTopic("t1"); // tombstone marker appended to t1's index
+
+    // Resuming after g1 skips the tombstone and yields only v2.
+    const after1 = try tm.fetchAfterOffset(std.testing.allocator, "t1", g1, 10);
+    defer { for (after1) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(after1); }
+    try std.testing.expectEqual(@as(usize, 1), after1.len);
+    try std.testing.expectEqualStrings("v2", after1[0].value);
+    try std.testing.expectEqual(g2, after1[0].offset);
+
+    // Resuming after g2 crosses only markers → nothing.
+    const after2 = try tm.fetchAfterOffset(std.testing.allocator, "t1", g2, 10);
+    defer std.testing.allocator.free(after2);
+    try std.testing.expectEqual(@as(usize, 0), after2.len);
+}
+
+test "TopicManager fetchPatternByOffset serves the after_offset pattern path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("agent.a");
+    try tm.createTopic("agent.b");
+    _ = try tm.publish("agent.a", null, "a1");
+    const g2 = try tm.publish("agent.b", null, "b1");
+    const g3 = try tm.publish("agent.a", null, "a2");
+
+    // Server maps `after_offset` → start_offset = after_offset + 1.
+    const events = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", g2 + 1, 10);
+    defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("a2", events[0].value);
+    try std.testing.expectEqual(g3, events[0].offset);
+}
+
+test "TopicManager topicEventCount" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t1");
+    try std.testing.expectEqual(@as(?u64, 0), tm.topicEventCount("t1"));
+    _ = try tm.publish("t1", null, "v1");
+    _ = try tm.publish("t1", null, "v2");
+    try std.testing.expectEqual(@as(?u64, 2), tm.topicEventCount("t1"));
+    try std.testing.expectEqual(@as(?u64, null), tm.topicEventCount("missing"));
 }
 
 test "TopicManager fetchPattern" {

@@ -204,12 +204,20 @@ pub const Server = struct {
         const sleep_interval_ms: u32 = 100; // 100ms poll interval
 
         while (true) {
-            // Resolve events — either by pattern or single topic
+            // Resolve events — either by pattern or single topic. When
+            // `after_offset` is set it takes precedence over `offset`
+            // (global-offset cursor vs. topic-local skip count).
             const events = if (req.pattern) |pattern|
-                self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
+                (if (req.after_offset) |after|
+                    self.topic_manager.fetchPatternByOffset(self.allocator, pattern, after +| 1, req.max_count)
+                else
+                    self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count)) catch
                     return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed")
             else if (req.topic) |topic_name|
-                self.topic_manager.fetch(self.allocator, topic_name, req.offset, req.max_count) catch |err| return switch (err) {
+                (if (req.after_offset) |after|
+                    self.topic_manager.fetchAfterOffset(self.allocator, topic_name, after, req.max_count)
+                else
+                    self.topic_manager.fetch(self.allocator, topic_name, req.offset, req.max_count)) catch |err| return switch (err) {
                     error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
                     else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"),
                 }
@@ -236,7 +244,14 @@ pub const Server = struct {
                     };
                 }
 
-                const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data });
+                // Exact-topic requests carry the topic's non-marker event
+                // count so clients can tell "start beyond end" from "empty".
+                const topic_events: ?u64 = if (req.pattern == null)
+                    (if (req.topic) |topic_name| self.topic_manager.topicEventCount(topic_name) else null)
+                else
+                    null;
+
+                const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data, .topic_events = topic_events });
                 defer self.allocator.free(resp_body);
                 try protocol.writeFrame(fd, .fetch_ok, resp_body);
                 return;
