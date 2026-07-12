@@ -1,5 +1,5 @@
 #+title: Status Over TCP: Query the Running Store, Not the Local Data Directory
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:protocol:store:
 
 * Summary
@@ -117,3 +117,4 @@ All numbers come from live state the server already maintains — no data-dir re
 - 2026-07-13: Implemented (everfix impl-p2c). Wire protocol =status= 0x10 / =status_ok= 0x90 with =StatusRequest=/=StatusResponse= and round-trip test (6522db); =StoreStatus= gains =source= / =uptime_ms= / =timer_count= and the formatters render them — offline human output unchanged, JSON always carries ="source"= (bd3450); server assembles the response under the =TopicManager= lock (log stats under the =Log= mutex), =Server.Config.data_dir= + =start_time= recorded in =init=, =Client.status()= follows the =listHooks= shape and returns =lock_held = true= by construction (0690e0); =handleStatus= defaults to the server path from any cwd, offline scan only behind explicit =--data-dir=/=EVER_DATA_DIR=, unreachable server names =address:port= and exits 1, plus integration test comparing wire-sourced counters against the offline scan of the quiesced store (d6b163). =zig build test= green; all five acceptance criteria verified behaviorally against a scratch store.
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, Incident 3, verified at 142d5e6). Imported and adapted from the round-1 review's pre-draft (notes/reviews/round-1/proposed-air/ever--status-over-tcp.org); reconciled with the landed v0.1/status-server-check.org probe (this doc adds server-served statistics; that doc added endpoint reachability only).
+- 2026-07-13: State: ready → complete.
