@@ -681,8 +681,168 @@ fn resolveHookId(
     fatal(ctx, "error: hook '{s}' not found\n", .{id_or_name});
 }
 
+/// One `hook logs --json` execution record parsed from the structured
+/// metadata header the hook daemon writes to every per-execution log file
+/// (see `executeHookCommand` in src/store/hooks.zig).
+const ParsedHookLog = struct {
+    hook_id: u64,
+    hook_name: ?[]const u8,
+    pattern: []const u8,
+    command: []const u8,
+    topic: []const u8,
+    offset: u64,
+    /// Raw bytes of the header's single-line `Payload:` JSON object.
+    payload: []const u8,
+    output: []const u8,
+};
+
+/// Strip a `Label:` prefix plus its column-alignment padding from a header
+/// line. Returns null when the line does not start with the label.
+fn stripHeaderLabel(line: []const u8, label: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, label)) return null;
+    return std.mem.trimStart(u8, line[label.len..], " ");
+}
+
+/// Parse a hook execution log against the fixed header grammar written by
+/// `executeHookCommand`: sentinel first line, labelled fields in fixed
+/// order, `===` terminator plus blank line, remainder = command output.
+/// Returns null for content that does not conform (pre-change or
+/// hand-edited files) — callers degrade instead of failing.
+fn parseHookLogContent(content: []const u8) ?ParsedHookLog {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse return null, "=== Hook Execution ===")) return null;
+
+    // `Hook:      #<id>` (unnamed) or `Hook:      #<id> (<name>)`
+    const hook_val = stripHeaderLabel(lines.next() orelse return null, "Hook:") orelse return null;
+    if (hook_val.len < 2 or hook_val[0] != '#') return null;
+    var id_end: usize = 1;
+    while (id_end < hook_val.len and std.ascii.isDigit(hook_val[id_end])) : (id_end += 1) {}
+    const hook_id = std.fmt.parseInt(u64, hook_val[1..id_end], 10) catch return null;
+    var hook_name: ?[]const u8 = null;
+    const name_part = std.mem.trim(u8, hook_val[id_end..], " ");
+    if (name_part.len > 0) {
+        if (name_part.len < 2 or name_part[0] != '(' or name_part[name_part.len - 1] != ')') return null;
+        hook_name = name_part[1 .. name_part.len - 1];
+    }
+
+    const pattern = stripHeaderLabel(lines.next() orelse return null, "Pattern:") orelse return null;
+    const command = stripHeaderLabel(lines.next() orelse return null, "Command:") orelse return null;
+    const topic = stripHeaderLabel(lines.next() orelse return null, "Topic:") orelse return null;
+    const offset_str = stripHeaderLabel(lines.next() orelse return null, "Offset:") orelse return null;
+    const offset = std.fmt.parseInt(u64, offset_str, 10) catch return null;
+    _ = stripHeaderLabel(lines.next() orelse return null, "Timestamp:") orelse return null;
+    const payload = stripHeaderLabel(lines.next() orelse return null, "Payload:") orelse return null;
+
+    if (!std.mem.eql(u8, lines.next() orelse return null, "===")) return null;
+    if ((lines.next() orelse return null).len != 0) return null;
+
+    return .{
+        .hook_id = hook_id,
+        .hook_name = hook_name,
+        .pattern = pattern,
+        .command = command,
+        .topic = topic,
+        .offset = offset,
+        .payload = payload,
+        .output = lines.rest(),
+    };
+}
+
+/// Extract the epoch-ms execution timestamp from a hook log path's
+/// `<hook-id>-<timestamp-ms>.log` filename component — the instant the
+/// daemon opened the log.
+fn executedAtFromLogPath(log_path: []const u8) ?i64 {
+    const base = if (std.mem.lastIndexOfScalar(u8, log_path, '/')) |i| log_path[i + 1 ..] else log_path;
+    if (!std.mem.endsWith(u8, base, ".log")) return null;
+    const stem = base[0 .. base.len - ".log".len];
+    const dash = std.mem.indexOfScalar(u8, stem, '-') orelse return null;
+    return std.fmt.parseInt(i64, stem[dash + 1 ..], 10) catch null;
+}
+
+/// Emit the `hook logs --json` record array on `out`: one record per
+/// execution returned by the server (currently the most recent — see the
+/// spec's Future Work). Content that fails the header grammar, mismatches
+/// the wire-echoed hook ID, or carries a payload that is not a JSON object
+/// degrades to a record with null header-derived fields and the full
+/// content in `output` — never a parse failure.
+fn emitHookLogsJson(
+    allocator: std.mem.Allocator,
+    out: *std.Io.Writer,
+    wire_hook_id: u64,
+    log_path: []const u8,
+    content: []const u8,
+) !void {
+    var record: ?ParsedHookLog = parseHookLogContent(content);
+    if (record) |p| {
+        // The wire response echoes the requested hook ID — cross-check it.
+        if (p.hook_id != wire_hook_id) record = null;
+    }
+    if (record) |p| {
+        // The payload must be the single-line JSON object written by
+        // buildEventJsonFromStore; validate before embedding it verbatim
+        // so `--json` output is always valid JSON.
+        if (std.json.parseFromSlice(std.json.Value, allocator, p.payload, .{})) |pv| {
+            defer pv.deinit();
+            if (pv.value != .object) record = null;
+        } else |_| record = null;
+    }
+
+    var js: std.json.Stringify = .{ .writer = out };
+    try js.beginArray();
+    try js.beginObject();
+    if (record) |p| {
+        try js.objectField("hook_id");
+        try js.write(p.hook_id);
+        try js.objectField("hook_name");
+        try js.write(p.hook_name);
+        try js.objectField("pattern");
+        try js.write(p.pattern);
+        try js.objectField("command");
+        try js.write(p.command);
+        try js.objectField("topic");
+        try js.write(p.topic);
+        try js.objectField("offset");
+        try js.write(p.offset);
+        try js.objectField("executed_at");
+        try js.write(executedAtFromLogPath(log_path));
+        try js.objectField("payload");
+        // Embedded verbatim: the header line is valid single-line JSON, so
+        // raw embedding avoids double-escaping.
+        try js.print("{s}", .{p.payload});
+        try js.objectField("output");
+        try js.write(p.output);
+    } else {
+        // Degraded record: header-derived fields null, full content in
+        // output. executed_at is filename-derived, so it survives.
+        try js.objectField("hook_id");
+        try js.write(null);
+        try js.objectField("hook_name");
+        try js.write(null);
+        try js.objectField("pattern");
+        try js.write(null);
+        try js.objectField("command");
+        try js.write(null);
+        try js.objectField("topic");
+        try js.write(null);
+        try js.objectField("offset");
+        try js.write(null);
+        try js.objectField("executed_at");
+        try js.write(executedAtFromLogPath(log_path));
+        try js.objectField("payload");
+        try js.write(null);
+        try js.objectField("output");
+        try js.write(content);
+    }
+    try js.objectField("log_path");
+    try js.write(log_path);
+    try js.endObject();
+    try js.endArray();
+    try out.print("\n", .{});
+}
+
 fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const id_or_name = ctx.arg("id");
+    const json_output = ctx.flagBool("json");
 
     if (id_or_name.len == 0) {
         fatal(ctx, "error: hook ID or name is required\n", .{});
@@ -698,6 +858,24 @@ fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         else => return err,
     };
     defer result.deinit();
+
+    // Empty-success wire shape (empty log_path + empty content): known
+    // hook, no recorded executions. An empty history is not an error.
+    const no_executions = result.log_path.len == 0 and result.content.len == 0;
+
+    if (json_output) {
+        if (no_executions) {
+            try ctx.stdout.print("[]\n", .{});
+        } else {
+            try emitHookLogsJson(allocator, ctx.stdout, result.hook_id, result.log_path, result.content);
+        }
+        return;
+    }
+
+    if (no_executions) {
+        diag(ctx, "(no executions)\n", .{});
+        return;
+    }
 
     try ctx.stdout.print("Log file: {s}\n---\n", .{result.log_path});
     if (result.content.len > 0) {
@@ -1564,6 +1742,9 @@ const app = cli.App{
                     .name = "logs",
                     .description = "Show recent hook execution output",
                     .args = &.{.{ .name = "id", .required = true, .description = "Hook ID" }},
+                    .flags = &.{
+                        .{ .name = "json", .takes_value = false, .description = "Output execution records as a JSON array" },
+                    },
                     .run = handleHookLogs,
                 },
             },
@@ -1825,4 +2006,158 @@ test "stdout/stderr split: debug printing confined to the stderr allow-list" {
     try std.testing.expectEqual(@as(usize, 0), countDebugPrints(@embedFile("store/status.zig")));
     // client.zig has no Context; its 2 sites are server-error diagnostics.
     try std.testing.expectEqual(@as(usize, 2), countDebugPrints(@embedFile("net/client.zig")));
+}
+
+// ── hook logs --json (air/v0.1/hook-logs-json.org) ─────────────────────────
+
+const sample_hook_log_named =
+    "=== Hook Execution ===\n" ++
+    "Hook:      #47 (wutest-h1)\n" ++
+    "Pattern:   wutest.wever.subtest\n" ++
+    "Command:   sh -c cat >> /tmp/a.log\n" ++
+    "Topic:     wutest.wever.subtest\n" ++
+    "Offset:    162\n" ++
+    "Timestamp: 2026-06-30 09:14:03\n" ++
+    "Payload:   {\"topic\":\"wutest.wever.subtest\",\"offset\":162,\"timestamp\":1751274843101,\"key\":null,\"value\":\"{\\\"n\\\":4}\"}\n" ++
+    "===\n" ++
+    "\n" ++
+    "handler output line\nwith \"quotes\"\n";
+
+test "hook logs header parse: named hook" {
+    const p = parseHookLogContent(sample_hook_log_named).?;
+    try std.testing.expectEqual(@as(u64, 47), p.hook_id);
+    try std.testing.expectEqualStrings("wutest-h1", p.hook_name.?);
+    try std.testing.expectEqualStrings("wutest.wever.subtest", p.pattern);
+    try std.testing.expectEqualStrings("sh -c cat >> /tmp/a.log", p.command);
+    try std.testing.expectEqualStrings("wutest.wever.subtest", p.topic);
+    try std.testing.expectEqual(@as(u64, 162), p.offset);
+    try std.testing.expect(std.mem.startsWith(u8, p.payload, "{\"topic\""));
+    try std.testing.expectEqualStrings("handler output line\nwith \"quotes\"\n", p.output);
+}
+
+test "hook logs header parse: unnamed hook" {
+    const content =
+        "=== Hook Execution ===\n" ++
+        "Hook:      #3\n" ++
+        "Pattern:   a.b\n" ++
+        "Command:   true\n" ++
+        "Topic:     a.b\n" ++
+        "Offset:    0\n" ++
+        "Timestamp: 2026-06-30 09:14:03\n" ++
+        "Payload:   {}\n" ++
+        "===\n" ++
+        "\n";
+    const p = parseHookLogContent(content).?;
+    try std.testing.expectEqual(@as(u64, 3), p.hook_id);
+    try std.testing.expect(p.hook_name == null);
+    try std.testing.expectEqual(@as(u64, 0), p.offset);
+    try std.testing.expectEqualStrings("", p.output);
+}
+
+test "hook logs header parse: non-conforming content yields null" {
+    try std.testing.expect(parseHookLogContent("") == null);
+    try std.testing.expect(parseHookLogContent("plain old log output\n") == null);
+    try std.testing.expect(parseHookLogContent("=== Hook Execution ===\ntruncated") == null);
+}
+
+test "executedAtFromLogPath extracts epoch-ms from the filename" {
+    try std.testing.expectEqual(@as(?i64, 1751274843123), executedAtFromLogPath("/srv/ever/data/hooks/47-1751274843123.log"));
+    try std.testing.expectEqual(@as(?i64, 5), executedAtFromLogPath("2-5.log"));
+    try std.testing.expect(executedAtFromLogPath("not-a-log") == null);
+    try std.testing.expect(executedAtFromLogPath("/x/47.log") == null);
+}
+
+fn emitHookLogsJsonToString(
+    alloc: std.mem.Allocator,
+    wire_hook_id: u64,
+    log_path: []const u8,
+    content: []const u8,
+) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+    try emitHookLogsJson(alloc, &aw.writer, wire_hook_id, log_path, content);
+    return alloc.dupe(u8, aw.written());
+}
+
+test "hook logs --json emit: full record round-trips through std.json" {
+    const alloc = std.testing.allocator;
+    const out = try emitHookLogsJsonToString(alloc, 47, "/data/hooks/47-1751274843123.log", sample_hook_log_named);
+    defer alloc.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    const rec = arr.items[0].object;
+    try std.testing.expectEqual(@as(i64, 47), rec.get("hook_id").?.integer);
+    try std.testing.expectEqualStrings("wutest-h1", rec.get("hook_name").?.string);
+    try std.testing.expectEqualStrings("wutest.wever.subtest", rec.get("pattern").?.string);
+    try std.testing.expectEqualStrings("sh -c cat >> /tmp/a.log", rec.get("command").?.string);
+    try std.testing.expectEqualStrings("wutest.wever.subtest", rec.get("topic").?.string);
+    try std.testing.expectEqual(@as(i64, 162), rec.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 1751274843123), rec.get("executed_at").?.integer);
+    // Payload embedded verbatim as an object; .payload.value is a string.
+    const payload = rec.get("payload").?.object;
+    try std.testing.expectEqualStrings("wutest.wever.subtest", payload.get("topic").?.string);
+    try std.testing.expectEqual(@as(i64, 162), payload.get("offset").?.integer);
+    try std.testing.expectEqualStrings("{\"n\":4}", payload.get("value").?.string);
+    try std.testing.expectEqualStrings("handler output line\nwith \"quotes\"\n", rec.get("output").?.string);
+    try std.testing.expectEqualStrings("/data/hooks/47-1751274843123.log", rec.get("log_path").?.string);
+}
+
+test "hook logs --json emit: degraded record for pre-change content" {
+    const alloc = std.testing.allocator;
+    const content = "old-style log content\nno header here\n";
+    const out = try emitHookLogsJsonToString(alloc, 9, "/data/hooks/9-123.log", content);
+    defer alloc.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    const rec = parsed.value.array.items[0].object;
+    try std.testing.expect(rec.get("hook_id").? == .null);
+    try std.testing.expect(rec.get("hook_name").? == .null);
+    try std.testing.expect(rec.get("pattern").? == .null);
+    try std.testing.expect(rec.get("command").? == .null);
+    try std.testing.expect(rec.get("topic").? == .null);
+    try std.testing.expect(rec.get("offset").? == .null);
+    try std.testing.expect(rec.get("payload").? == .null);
+    try std.testing.expectEqual(@as(i64, 123), rec.get("executed_at").?.integer);
+    try std.testing.expectEqualStrings(content, rec.get("output").?.string);
+    try std.testing.expectEqualStrings("/data/hooks/9-123.log", rec.get("log_path").?.string);
+}
+
+test "hook logs --json emit: wire hook ID mismatch degrades" {
+    const alloc = std.testing.allocator;
+    const out = try emitHookLogsJsonToString(alloc, 5, "/data/hooks/5-123.log", sample_hook_log_named);
+    defer alloc.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    const rec = parsed.value.array.items[0].object;
+    try std.testing.expect(rec.get("hook_id").? == .null);
+    try std.testing.expectEqualStrings(sample_hook_log_named, rec.get("output").?.string);
+}
+
+test "hook logs --json emit: invalid payload line degrades" {
+    const alloc = std.testing.allocator;
+    const content =
+        "=== Hook Execution ===\n" ++
+        "Hook:      #3\n" ++
+        "Pattern:   a.b\n" ++
+        "Command:   true\n" ++
+        "Topic:     a.b\n" ++
+        "Offset:    0\n" ++
+        "Timestamp: 2026-06-30 09:14:03\n" ++
+        "Payload:   not json at all\n" ++
+        "===\n" ++
+        "\n";
+    const out = try emitHookLogsJsonToString(alloc, 3, "/data/hooks/3-123.log", content);
+    defer alloc.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    const rec = parsed.value.array.items[0].object;
+    try std.testing.expect(rec.get("hook_id").? == .null);
+    try std.testing.expect(rec.get("payload").? == .null);
+    try std.testing.expectEqualStrings(content, rec.get("output").?.string);
 }
