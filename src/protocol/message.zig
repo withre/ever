@@ -32,6 +32,7 @@ pub const MessageType = enum(u8) {
     timer_info = 0x0D,
     hook_ps = 0x0E,
     hook_logs = 0x0F,
+    status = 0x10,
 
     // Responses
     publish_ok = 0x81,
@@ -49,6 +50,7 @@ pub const MessageType = enum(u8) {
     timer_info_ok = 0x8D,
     hook_ps_ok = 0x8E,
     hook_logs_ok = 0x8F,
+    status_ok = 0x90,
 
     // Error
     error_response = 0xFF,
@@ -230,6 +232,36 @@ pub const HookLogsResponse = struct {
     content: []const u8,
 };
 
+// --- Status request/response types ---
+
+pub const StatusRequest = struct {
+    _unused: u8 = 0, // no parameters; mirrors HookPsRequest
+};
+
+pub const StatusTopicInfo = struct {
+    name: []const u8,
+    events: u64,
+    deleted: bool = false,
+};
+
+pub const StatusHookInfo = struct {
+    id: u64,
+    pattern: []const u8,
+    command: []const u8,
+    cursor: u64,
+};
+
+pub const StatusResponse = struct {
+    data_dir: []const u8,
+    segments: u64,
+    total_bytes: u64,
+    total_events: u64,
+    topics: []const StatusTopicInfo,
+    hooks: []const StatusHookInfo,
+    timer_count: u64,
+    uptime_ms: u64,
+};
+
 // --- Encoding/Decoding ---
 
 /// Encode a frame header and body to a buffer. Returns the encoded slice.
@@ -395,6 +427,53 @@ test "body encode and decode FetchResponse" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.events.len);
     try std.testing.expectEqualStrings("v0", parsed.value.events[0].value);
     try std.testing.expectEqualStrings("k1", parsed.value.events[1].key.?);
+}
+
+test "body encode and decode StatusResponse round-trip" {
+    const topics = [_]StatusTopicInfo{
+        .{ .name = "agent.tasks", .events = 42 },
+        .{ .name = "agent.old", .events = 3, .deleted = true },
+    };
+    const hooks = [_]StatusHookInfo{
+        .{ .id = 7, .pattern = "agent.", .command = "./notify.sh", .cursor = 12 },
+    };
+    const resp = StatusResponse{
+        .data_dir = "/var/lib/ever",
+        .segments = 2,
+        .total_bytes = 4096,
+        .total_events = 45,
+        .topics = &topics,
+        .hooks = &hooks,
+        .timer_count = 3,
+        .uptime_ms = 123456,
+    };
+
+    const body = try encodeBody(std.testing.allocator, resp);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try decodeBody(StatusResponse, std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("/var/lib/ever", parsed.value.data_dir);
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.segments);
+    try std.testing.expectEqual(@as(u64, 4096), parsed.value.total_bytes);
+    try std.testing.expectEqual(@as(u64, 45), parsed.value.total_events);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.topics.len);
+    try std.testing.expectEqualStrings("agent.tasks", parsed.value.topics[0].name);
+    try std.testing.expectEqual(@as(u64, 42), parsed.value.topics[0].events);
+    try std.testing.expectEqual(false, parsed.value.topics[0].deleted);
+    try std.testing.expectEqual(true, parsed.value.topics[1].deleted);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.hooks.len);
+    try std.testing.expectEqualStrings("agent.", parsed.value.hooks[0].pattern);
+    try std.testing.expectEqualStrings("./notify.sh", parsed.value.hooks[0].command);
+    try std.testing.expectEqual(@as(u64, 12), parsed.value.hooks[0].cursor);
+    try std.testing.expectEqual(@as(u64, 3), parsed.value.timer_count);
+    try std.testing.expectEqual(@as(u64, 123456), parsed.value.uptime_ms);
+}
+
+test "status message type codepoints" {
+    try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(MessageType.status));
+    try std.testing.expectEqual(@as(u8, 0x90), @intFromEnum(MessageType.status_ok));
 }
 
 test "frame encode buffer too small" {
