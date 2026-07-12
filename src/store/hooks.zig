@@ -34,6 +34,21 @@ pub const Hook = struct {
     created_at: i64,
     once: bool = false,
     env: ?[]const []const u8 = null,
+    /// Delivery attempts that consumed an event (cursor advanced).
+    /// Incremented at spawn time — on spawn success *and* spawn failure —
+    /// matching the cursor-advance semantics.
+    fired_count: u64 = 0,
+    /// Subset of `fired_count` that failed: spawn failure, nonzero exit,
+    /// or death by signal.
+    failure_count: u64 = 0,
+    /// Status of the most recently reaped child: exit code if it exited
+    /// (0 = success), `128 + signum` (shell convention) if signal-killed.
+    /// Null until the first child is reaped; unchanged by spawn failures
+    /// (which produce no child).
+    last_exit_status: ?u8 = null,
+    /// Global log offset of the event whose delivery most recently failed
+    /// (any failure class). Null if no failure yet.
+    last_failed_offset: ?u64 = null,
 };
 
 /// JSON-serializable hook for persistence.
@@ -47,6 +62,12 @@ const HookJson = struct {
     created_at: i64,
     once: bool = false,
     env: ?[]const []const u8 = null,
+    // Execution counters (hook-failure-visibility). Defaults keep old-format
+    // hooks.json files loading cleanly.
+    fired_count: u64 = 0,
+    failure_count: u64 = 0,
+    last_exit_status: ?u8 = null,
+    last_failed_offset: ?u64 = null,
 };
 
 const HookFileJson = struct {
@@ -248,6 +269,53 @@ pub const HookTable = struct {
         }
     }
 
+    /// Advance a hook's cursor and record the delivery attempt in one
+    /// persisted write. `spawn_failed` marks a spawn-time failure (fork/pipe/
+    /// log-file setup) — the event is still consumed, but it counts as a
+    /// failure attributed to `event_offset` (global log offset).
+    /// Folds counter updates into the existing per-delivery save so the hot
+    /// path gains no extra hooks.json write.
+    pub fn recordDelivery(self: *HookTable, id: u64, new_cursor: u64, spawn_failed: bool, event_offset: u64) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.hooks.items) |*hook| {
+            if (hook.id == id) {
+                hook.cursor = new_cursor;
+                hook.fired_count += 1;
+                if (spawn_failed) {
+                    hook.failure_count += 1;
+                    hook.last_failed_offset = event_offset;
+                }
+                self.saveLocked() catch {};
+                return;
+            }
+        }
+    }
+
+    /// Record a reaped child's exit for a hook. `exit_status` is the decoded
+    /// status: exit code if the child exited, `128 + signum` if signal-killed.
+    /// `offset` is the global log offset of the triggering event. Nonzero
+    /// status counts as a failure and always saves; a clean exit only saves
+    /// when `last_exit_status` actually changes (persist-on-change).
+    pub fn recordExit(self: *HookTable, id: u64, exit_status: u8, offset: u64) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.hooks.items) |*hook| {
+            if (hook.id == id) {
+                if (exit_status != 0) {
+                    hook.last_exit_status = exit_status;
+                    hook.failure_count += 1;
+                    hook.last_failed_offset = offset;
+                    self.saveLocked() catch {};
+                } else if (hook.last_exit_status == null or hook.last_exit_status.? != 0) {
+                    hook.last_exit_status = 0;
+                    self.saveLocked() catch {};
+                }
+                return;
+            }
+        }
+    }
+
     /// Get a deep-copied snapshot of hooks for the daemon.
     /// Caller owns the returned slice and all string data within it.
     /// Free with `freeHookSnapshot`.
@@ -315,7 +383,12 @@ pub const HookTable = struct {
             defer parsed.deinit();
             self.next_id = parsed.value.next_id;
             for (parsed.value.hooks) |h| {
-                try self.loadHook(h.id, h.pattern, h.command, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name);
+                try self.loadHook(h.id, h.pattern, h.command, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name, .{
+                    .fired_count = h.fired_count,
+                    .failure_count = h.failure_count,
+                    .last_exit_status = h.last_exit_status,
+                    .last_failed_offset = h.last_failed_offset,
+                });
             }
             return;
         } else |_| {}
@@ -336,11 +409,19 @@ pub const HookTable = struct {
                 if (j > 0) try cmd_str.append(self.allocator, ' ');
                 try cmd_str.appendSlice(self.allocator, arg);
             }
-            try self.loadHook(h.id, h.pattern, cmd_str.items, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name);
+            try self.loadHook(h.id, h.pattern, cmd_str.items, h.cwd, h.cursor, h.created_at, h.once, h.env, h.name, .{});
         }
     }
 
-    fn loadHook(self: *HookTable, id: u64, pattern: []const u8, command: []const u8, cwd: []const u8, cursor: u64, created_at: i64, once: bool, env: ?[]const []const u8, name: ?[]const u8) !void {
+    /// Execution counters restored from persistence (hook-failure-visibility).
+    const LoadedCounters = struct {
+        fired_count: u64 = 0,
+        failure_count: u64 = 0,
+        last_exit_status: ?u8 = null,
+        last_failed_offset: ?u64 = null,
+    };
+
+    fn loadHook(self: *HookTable, id: u64, pattern: []const u8, command: []const u8, cwd: []const u8, cursor: u64, created_at: i64, once: bool, env: ?[]const []const u8, name: ?[]const u8, counters: LoadedCounters) !void {
         const name_copy: ?[]const u8 = if (name) |n| try self.allocator.dupe(u8, n) else null;
         errdefer if (name_copy) |nc| self.allocator.free(nc);
 
@@ -378,6 +459,10 @@ pub const HookTable = struct {
             .created_at = created_at,
             .once = once,
             .env = env_copy,
+            .fired_count = counters.fired_count,
+            .failure_count = counters.failure_count,
+            .last_exit_status = counters.last_exit_status,
+            .last_failed_offset = counters.last_failed_offset,
         });
     }
 
@@ -398,6 +483,10 @@ pub const HookTable = struct {
                 .created_at = hook.created_at,
                 .once = hook.once,
                 .env = hook.env,
+                .fired_count = hook.fired_count,
+                .failure_count = hook.failure_count,
+                .last_exit_status = hook.last_exit_status,
+                .last_failed_offset = hook.last_failed_offset,
             };
         }
 
@@ -492,6 +581,10 @@ fn deepCopyHook(allocator: Allocator, hook: Hook) !Hook {
         .created_at = hook.created_at,
         .once = hook.once,
         .env = env_copy,
+        .fired_count = hook.fired_count,
+        .failure_count = hook.failure_count,
+        .last_exit_status = hook.last_exit_status,
+        .last_failed_offset = hook.last_failed_offset,
     };
 }
 
@@ -520,6 +613,9 @@ pub const ProcessEntry = struct {
     hook_id: u64,
     pid: i32,
     pgid: i32,
+    /// Global log offset of the triggering event, so the reaper can
+    /// attribute the child's exit to an event.
+    offset: u64,
     start_time: i64,
     log_path: [256]u8,
     log_path_len: u8,
@@ -759,9 +855,20 @@ pub const HookDaemon = struct {
 
             const pid: i32 = @intCast(pid_i);
             if (self.process_table.removeByPid(pid)) |entry| {
-                const exit_code = (status >> 8) & 0xFF;
-                if (exit_code != 0) {
-                    logTimestampedFmt("Hook #{d} (pid {d}) exited with status {d}", .{ entry.hook_id, pid, exit_code });
+                const W = std.os.linux.W;
+                if (W.IFEXITED(status)) {
+                    const exit_code = W.EXITSTATUS(status);
+                    if (exit_code != 0) {
+                        logTimestampedFmt("Hook #{d} (pid {d}) exited with status {d}", .{ entry.hook_id, pid, exit_code });
+                    }
+                    self.hook_table.recordExit(entry.hook_id, exit_code, entry.offset);
+                } else if (W.IFSIGNALED(status)) {
+                    // Shell convention: signal death reads as 128 + signum.
+                    // This includes daemon-timeout SIGKILLs, which previously
+                    // decoded as exit 0 under the raw (status >> 8) & 0xFF.
+                    const signum: u8 = @intCast(@intFromEnum(W.TERMSIG(status)));
+                    logTimestampedFmt("Hook #{d} (pid {d}) killed by signal {d}", .{ entry.hook_id, pid, signum });
+                    self.hook_table.recordExit(entry.hook_id, 128 + signum, entry.offset);
                 }
             }
         }
@@ -864,6 +971,7 @@ pub const HookDaemon = struct {
         if (events.len == 0) return;
 
         for (events, 0..) |event, i| {
+            var spawn_failed = false;
             self.executeHookCommand(hook, event) catch |err| switch (err) {
                 error.ConcurrentLimitReached => {
                     // Don't advance cursor — retry these events on next poll cycle.
@@ -872,13 +980,14 @@ pub const HookDaemon = struct {
                 },
                 else => {
                     logTimestampedFmt("Hook #{d} command failed: {}", .{ hook.id, err });
+                    spawn_failed = true;
                 },
             };
             const new_cursor: u64 = if (is_pattern)
                 event.offset + 1
             else
                 hook.cursor + i + 1;
-            self.hook_table.updateCursor(hook.id, new_cursor);
+            self.hook_table.recordDelivery(hook.id, new_cursor, spawn_failed, event.offset);
 
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
@@ -1110,6 +1219,7 @@ pub const HookDaemon = struct {
             .hook_id = hook.id,
             .pid = child_pid,
             .pgid = child_pid, // setpgid(0,0) makes pgid == pid
+            .offset = event.offset,
             .start_time = now_ms,
             .log_path = lp_buf,
             .log_path_len = lp_len,
@@ -1213,6 +1323,10 @@ fn appendJsonEscaped(json: *std.ArrayList(u8), allocator: Allocator, s: []const 
 }
 
 fn logTimestampedFmt(comptime fmt: []const u8, args: anytype) void {
+    // Keep test runs quiet: the build runner surfaces any stderr output from
+    // a test binary as a step diagnostic, and these daemon log lines are
+    // expected noise when tests exercise failing hooks.
+    if (@import("builtin").is_test) return;
     var ts = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
     _ = std.os.linux.clock_gettime(.REALTIME, &ts);
     const secs: u64 = @intCast(ts.sec);
@@ -1378,4 +1492,261 @@ test "HookTable reload preserves stored cursor" {
     @memcpy(hooks_json_z[tmp_path.len .. tmp_path.len + 11], "/hooks.json");
     _ = std.os.linux.unlink(hooks_json_z.ptr);
     _ = std.os.linux.rmdir(tmp_z.ptr);
+}
+
+// ── Hook failure visibility tests (air/v0.1/hook-failure-visibility.org) ────
+
+const test_envp: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
+
+/// Create a scratch data dir for a HookTable under /tmp (HookTable takes a
+/// path string, not a Dir handle).
+fn makeFailTestDir(allocator: Allocator, suffix: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/tmp/.ever-hookfail-{d}-{s}", .{ std.os.linux.getpid(), suffix });
+    errdefer allocator.free(path);
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    _ = std.os.linux.mkdir(path_z.ptr, 0o755);
+    return path;
+}
+
+/// Recursively remove a scratch data dir (hooks.json + hooks/ log files).
+fn cleanupFailTestDir(allocator: Allocator, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(std.testing.io, path) catch {};
+    allocator.free(path);
+}
+
+/// Reap until no children remain (or ~10s timeout).
+fn reapUntilDone(daemon: *HookDaemon) void {
+    var waited: usize = 0;
+    while (daemon.process_table.activeCount() > 0 and waited < 10_000) {
+        daemon.reapChildren();
+        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 10_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+        waited += 10;
+    }
+    daemon.reapChildren();
+}
+
+test "failure visibility: failing command records failure counters" {
+    // Spec test (a): hook with a nonexistent handler; /bin/sh spawns fine and
+    // exits 127. Two sequential deliveries → fired_count=2, failure_count=2,
+    // last_exit_status=127, last_failed_offset = second event's global offset.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, std.testing.io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.fail");
+
+    const dir = try makeFailTestDir(allocator, "fail");
+    defer cleanupFailTestDir(allocator, dir);
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    _ = try ht.addWithCursor("t.fail", "/nonexistent/handler", "/tmp", false, null, null, 0);
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, test_envp);
+    daemon.ensureLogDir();
+
+    // Deliver sequentially so the *second* event is deterministically the
+    // most recently reaped failure.
+    _ = try tm.publish("t.fail", null, "one");
+    daemon.pollAndExecute();
+    reapUntilDone(&daemon);
+
+    const off2 = try tm.publish("t.fail", null, "two");
+    daemon.pollAndExecute();
+    reapUntilDone(&daemon);
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqual(@as(u64, 2), snap[0].fired_count);
+    try std.testing.expectEqual(@as(u64, 2), snap[0].failure_count);
+    try std.testing.expectEqual(@as(?u8, 127), snap[0].last_exit_status);
+    try std.testing.expectEqual(@as(?u64, off2), snap[0].last_failed_offset);
+}
+
+test "failure visibility: healthy hook records clean exit" {
+    // Spec test (b): a hook whose command exits 0 → failure_count=0,
+    // last_exit_status=0, last_failed_offset stays null.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, std.testing.io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.ok");
+    _ = try tm.publish("t.ok", null, "one");
+
+    const dir = try makeFailTestDir(allocator, "ok");
+    defer cleanupFailTestDir(allocator, dir);
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    // Absolute path — the test envp has no PATH.
+    _ = try ht.addWithCursor("t.ok", "/bin/sh -c 'exit 0'", "/tmp", false, null, null, 0);
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, test_envp);
+    daemon.ensureLogDir();
+    daemon.pollAndExecute();
+    reapUntilDone(&daemon);
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try std.testing.expectEqual(@as(u64, 1), snap[0].fired_count);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].failure_count);
+    try std.testing.expectEqual(@as(?u8, 0), snap[0].last_exit_status);
+    try std.testing.expectEqual(@as(?u64, null), snap[0].last_failed_offset);
+}
+
+test "failure visibility: signal-killed child records 128 plus signum" {
+    // Spec test (c): a child killed by SIGKILL must read as 128+9=137, not
+    // exit 0 (the old raw (status >> 8) & 0xFF decode bug).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, std.testing.io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.sig");
+    const off = try tm.publish("t.sig", null, "one");
+
+    const dir = try makeFailTestDir(allocator, "sig");
+    defer cleanupFailTestDir(allocator, dir);
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    // Busy-loop until killed; absolute /bin/sh, no PATH needed.
+    _ = try ht.addWithCursor("t.sig", "/bin/sh -c 'while :; do :; done'", "/tmp", false, null, null, 0);
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, test_envp);
+    daemon.ensureLogDir();
+    daemon.pollAndExecute();
+
+    // Kill the spawned child. Signal both the process group and the pid
+    // directly: right after fork the child may not have called setpgid(0,0)
+    // yet, so a group-only kill can race and miss it (leaving an orphaned
+    // busy loop and a hung test).
+    var buf: [MAX_CONCURRENT_HOOKS]ProcessEntry = undefined;
+    const n = daemon.process_table.snapshot(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    _ = std.os.linux.kill(-buf[0].pgid, .KILL);
+    _ = std.os.linux.kill(buf[0].pid, .KILL);
+    reapUntilDone(&daemon);
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try std.testing.expectEqual(@as(u64, 1), snap[0].fired_count);
+    try std.testing.expectEqual(@as(u64, 1), snap[0].failure_count);
+    try std.testing.expectEqual(@as(?u8, 137), snap[0].last_exit_status);
+    try std.testing.expectEqual(@as(?u64, off), snap[0].last_failed_offset);
+}
+
+test "failure visibility: counters survive table reload" {
+    // Spec test (d): counters persist in hooks.json across a restart.
+    const allocator = std.testing.allocator;
+    const dir = try makeFailTestDir(allocator, "reload");
+    defer cleanupFailTestDir(allocator, dir);
+
+    var id: u64 = 0;
+    {
+        var ht = try HookTable.init(allocator, dir);
+        defer ht.deinit();
+        id = try ht.addWithCursor("t.persist", "/nonexistent/handler", "/tmp", false, null, null, 0);
+        ht.recordDelivery(id, 1, true, 40); // spawn failure at offset 40
+        ht.recordDelivery(id, 2, false, 0); // clean spawn
+        ht.recordExit(id, 127, 41); // reaped nonzero exit at offset 41
+    }
+    {
+        var ht = try HookTable.init(allocator, dir);
+        defer ht.deinit();
+        const snap = try ht.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        try std.testing.expectEqual(@as(usize, 1), snap.len);
+        try std.testing.expectEqual(id, snap[0].id);
+        try std.testing.expectEqual(@as(u64, 2), snap[0].fired_count);
+        try std.testing.expectEqual(@as(u64, 2), snap[0].failure_count);
+        try std.testing.expectEqual(@as(?u8, 127), snap[0].last_exit_status);
+        try std.testing.expectEqual(@as(?u64, 41), snap[0].last_failed_offset);
+    }
+}
+
+test "failure visibility: old-format hooks.json loads with zeroed counters" {
+    // Spec test (e): a hooks.json written before this change (no counter
+    // fields) must load cleanly with defaults.
+    const allocator = std.testing.allocator;
+    const dir = try makeFailTestDir(allocator, "oldfmt");
+    defer cleanupFailTestDir(allocator, dir);
+
+    const old_json =
+        \\{"hooks":[{"id":7,"name":"legacy","pattern":"t.old","command":"echo hi","cwd":"/tmp","cursor":3,"created_at":0,"once":false,"env":null}],"next_id":8}
+    ;
+    const path = try std.fmt.allocPrint(allocator, "{s}/hooks.json", .{dir});
+    defer allocator.free(path);
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    defer allocator.free(path_z);
+    @memcpy(path_z[0..path.len], path);
+    const fd_rc = std.os.linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try std.testing.expect(@as(isize, @bitCast(fd_rc)) >= 0);
+    const fd: i32 = @intCast(fd_rc);
+    writeAllFd(fd, old_json);
+    _ = std.os.linux.close(fd);
+
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqual(@as(u64, 7), snap[0].id);
+    try std.testing.expectEqual(@as(u64, 3), snap[0].cursor);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].fired_count);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].failure_count);
+    try std.testing.expectEqual(@as(?u8, null), snap[0].last_exit_status);
+    try std.testing.expectEqual(@as(?u64, null), snap[0].last_failed_offset);
+}
+
+test "failure visibility: ConcurrentLimitReached increments nothing" {
+    // Spec test (f): when the process table is full, the event is not
+    // consumed — cursor and all counters stay untouched.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, std.testing.io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("t.limit");
+    _ = try tm.publish("t.limit", null, "one");
+
+    const dir = try makeFailTestDir(allocator, "limit");
+    defer cleanupFailTestDir(allocator, dir);
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    _ = try ht.addWithCursor("t.limit", "/bin/sh -c 'exit 0'", "/tmp", false, null, null, 0);
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, test_envp);
+    daemon.ensureLogDir();
+
+    // Fill the process table with dummy entries (no real children).
+    var i: usize = 0;
+    while (i < MAX_CONCURRENT_HOOKS) : (i += 1) {
+        try std.testing.expect(daemon.process_table.add(.{
+            .hook_id = 9999,
+            .pid = -1,
+            .pgid = -1,
+            .offset = 0,
+            .start_time = getMilliTimestamp(),
+            .log_path = [_]u8{0} ** 256,
+            .log_path_len = 0,
+            .pattern = [_]u8{0} ** 128,
+            .pattern_len = 0,
+            .command_display = [_]u8{0} ** 128,
+            .command_display_len = 0,
+        }));
+    }
+
+    daemon.pollAndExecute();
+
+    const snap = try ht.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].cursor);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].fired_count);
+    try std.testing.expectEqual(@as(u64, 0), snap[0].failure_count);
+    try std.testing.expectEqual(@as(?u8, null), snap[0].last_exit_status);
+    try std.testing.expectEqual(@as(?u64, null), snap[0].last_failed_offset);
 }
