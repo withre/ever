@@ -87,12 +87,17 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const max_count = try ctx.flagInt(u32, "max");
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
+    const json_full = ctx.flagBool("json");
 
     // The framework's `.conflicts` rejects both flags on argv; this guards
     // any path that bypasses it (mirrors the server-side precedence rule).
     if (after_offset != null and ctx.hasFlag("from")) {
         fatal(ctx, "error: --from and --after-offset are mutually exclusive\n", .{});
     }
+    if (json_full and json_values) {
+        fatal(ctx, "error: --json and --json-values are mutually exclusive\n", .{});
+    }
+    const mode: PrintMode = if (json_full) .json else if (json_values) .json_values else .default;
 
     const addr_info = parseStoreAddress(ctx);
 
@@ -143,7 +148,7 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 };
             defer result.deinit();
             for (result.events) |event| {
-                try printEvent(ctx.stdout, event, json_values);
+                try printEvent(allocator, ctx.stdout, event, mode, topic_name);
                 try ctx.stdout.flush();
                 emitted += 1;
                 if (emitted >= max_count) break;
@@ -176,7 +181,10 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             warnBeyondEnd(ctx, topic_name, after_offset, from_offset, result.topic_events);
             diag(ctx, "No events.\n", .{});
         } else {
-            for (result.events) |event| try printEvent(ctx.stdout, event, json_values);
+            for (result.events) |event| {
+                try printEvent(allocator, ctx.stdout, event, mode, topic_name);
+                try ctx.stdout.flush();
+            }
         }
     }
 }
@@ -262,7 +270,7 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             }
         }
         for (result.events) |event| {
-            try printEvent(ctx.stdout, event, json_values);
+            try printEvent(allocator, ctx.stdout, event, if (json_values) PrintMode.json_values else PrintMode.default, topic_name);
             try ctx.stdout.flush();
             collected += 1;
         }
@@ -1242,16 +1250,32 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     std.debug.print("Server shut down gracefully.\n", .{});
 }
 
-fn printEvent(out: *std.Io.Writer, event: ever.client.Event, json_values: bool) !void {
-    if (json_values) {
-        try out.print("{s}\n", .{event.value});
-    } else {
-        const t = if (event.topic) |tp| tp else "";
-        if (t.len > 0) {
-            if (event.key) |k| try out.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value }) else try out.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
-        } else {
-            if (event.key) |k| try out.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value }) else try out.print("[{d}] {s}\n", .{ event.offset, event.value });
-        }
+/// Output mode for `printEvent`. `default` is the human `[topic:offset]`
+/// line, `json_values` the bare payload per line, `json` the full NDJSON
+/// envelope (byte-compatible with the hook-stdin envelope built by
+/// `buildEventJson`). See air/v0.1/sub-json-output.org.
+const PrintMode = enum { default, json_values, json };
+
+fn printEvent(allocator: std.mem.Allocator, out: *std.Io.Writer, event: ever.client.Event, mode: PrintMode, fallback_topic: []const u8) !void {
+    switch (mode) {
+        .json => {
+            // Exact-topic fetches may omit the per-event topic; populate it
+            // from the subscribed topic name rather than emitting "".
+            var ev = event;
+            if (ev.topic == null or ev.topic.?.len == 0) ev.topic = fallback_topic;
+            const json = try buildEventJson(allocator, ev);
+            defer allocator.free(json);
+            try out.print("{s}\n", .{json});
+        },
+        .json_values => try out.print("{s}\n", .{event.value}),
+        .default => {
+            const t = if (event.topic) |tp| tp else "";
+            if (t.len > 0) {
+                if (event.key) |k| try out.print("[{s}:{d}] key={s} {s}\n", .{ t, event.offset, k, event.value }) else try out.print("[{s}:{d}] {s}\n", .{ t, event.offset, event.value });
+            } else {
+                if (event.key) |k| try out.print("[{d}] key={s} {s}\n", .{ event.offset, k, event.value }) else try out.print("[{d}] {s}\n", .{ event.offset, event.value });
+            }
+        },
     }
 }
 
@@ -1439,7 +1463,8 @@ const app = cli.App{
                 .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
                 .{ .name = "max", .default = "100", .description = "Max events" },
                 .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
-                .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
+                .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values", .conflicts = &.{"json"} },
+                .{ .name = "json", .takes_value = false, .description = "Output full event objects as NDJSON", .conflicts = &.{"json-values"} },
             },
             .run = handleSub,
         },
@@ -1690,6 +1715,89 @@ pub fn main(init: std.process.Init) !void {
 test "main module compiles" {
     _ = ever;
     _ = cli;
+}
+
+// --- sub --json (air/v0.1/sub-json-output.org) ------------------------------
+
+fn renderEvent(buf: []u8, event: ever.client.Event, mode: PrintMode, fallback_topic: []const u8) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try printEvent(std.testing.allocator, &w, event, mode, fallback_topic);
+    return w.buffered();
+}
+
+test "sub --json: envelope round-trips through a JSON parser" {
+    var buf: [512]u8 = undefined;
+    const keyed: ever.client.Event = .{
+        .offset = 161,
+        .timestamp = 1751500002789,
+        .key = "worker-3",
+        .value = "{\"n\":3}",
+        .topic = "wutest.wever.subtest",
+    };
+    const line = try renderEvent(&buf, keyed, .json, "fallback.unused");
+    try std.testing.expect(line.len > 0 and line[line.len - 1] == '\n');
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line[0 .. line.len - 1], .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // Per-event topic from the server wins over the fallback.
+    try std.testing.expectEqualStrings("wutest.wever.subtest", obj.get("topic").?.string);
+    try std.testing.expectEqual(@as(i64, 161), obj.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 1751500002789), obj.get("timestamp").?.integer);
+    try std.testing.expectEqualStrings("worker-3", obj.get("key").?.string);
+    // value is ALWAYS an escaped JSON string; a JSON payload parses from it.
+    const value = obj.get("value").?.string;
+    try std.testing.expectEqualStrings("{\"n\":3}", value);
+    var inner = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, value, .{});
+    defer inner.deinit();
+    try std.testing.expectEqual(@as(i64, 3), inner.value.object.get("n").?.integer);
+}
+
+test "sub --json: hostile payloads escape; unkeyed emits key null; exact-topic fallback" {
+    // Quotes, backslash, newline, tab, and a raw control character.
+    const hostile = "he said \"hi\"\\\nline2\ttab\x01ctl";
+    const ev: ever.client.Event = .{
+        .offset = 0,
+        .timestamp = 5,
+        .key = null,
+        .value = hostile,
+        .topic = null, // exact-topic fetch: server omits per-event topic
+    };
+    var buf: [512]u8 = undefined;
+    const line = try renderEvent(&buf, ev, .json, "exact.topic");
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line[0 .. line.len - 1], .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // Never "": populated from the subscribed topic name.
+    try std.testing.expectEqualStrings("exact.topic", obj.get("topic").?.string);
+    try std.testing.expect(obj.get("key").? == .null);
+    // Non-JSON payload round-trips the exact bytes through the string form.
+    try std.testing.expectEqualStrings(hostile, obj.get("value").?.string);
+}
+
+test "sub regression: default and --json-values output byte-identical to pre-change" {
+    var buf: [256]u8 = undefined;
+    const keyed: ever.client.Event = .{
+        .offset = 42,
+        .timestamp = 1751500000123,
+        .key = "worker-3",
+        .value = "{\"n\":3}",
+        .topic = "a.b",
+    };
+    const unkeyed_no_topic: ever.client.Event = .{
+        .offset = 7,
+        .timestamp = 0,
+        .key = null,
+        .value = "plain payload",
+        .topic = null,
+    };
+    // Default human format — unchanged (fallback topic must NOT leak in).
+    try std.testing.expectEqualStrings("[a.b:42] key=worker-3 {\"n\":3}\n", try renderEvent(&buf, keyed, .default, "a.b"));
+    try std.testing.expectEqualStrings("[7] plain payload\n", try renderEvent(&buf, unkeyed_no_topic, .default, "x.y"));
+    // --json-values — bare payload per line, unchanged.
+    try std.testing.expectEqualStrings("{\"n\":3}\n", try renderEvent(&buf, keyed, .json_values, "a.b"));
+    try std.testing.expectEqualStrings("plain payload\n", try renderEvent(&buf, unkeyed_no_topic, .json_values, "x.y"));
 }
 
 // Regression guard from air/v0.1/stdout-stderr-split.org: after the
