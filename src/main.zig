@@ -552,6 +552,12 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
 }
 
+/// Row format shared by the `hook list` header and data rows. Every column
+/// has a fixed width except `Command` — the only unbounded-width field —
+/// which is rendered last and un-padded (ps-style), so the table stays
+/// positionally parseable no matter how long the command is. No truncation.
+const hook_list_row_fmt = "{s:<4} {s:<20} {s:<25} {s:<9} {s:<9} {s}\n";
+
 fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
@@ -565,13 +571,21 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     if (result.hooks.len == 0) {
         diag(ctx, "No hooks registered.\n", .{});
     } else {
-        try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12} {s}\n", .{ "ID", "NAME", "Pattern", "Command", "Last Offset", "Fired" });
+        try ctx.stdout.print(hook_list_row_fmt, .{ "ID", "NAME", "Pattern", "Pending", "Fired", "Command" });
         for (result.hooks) |hook| {
             var id_buf: [20]u8 = undefined;
             const id_str = std.fmt.bufPrint(&id_buf, "#{d}", .{hook.id}) catch "?";
-            var cursor_buf: [20]u8 = undefined;
-            const cursor_str = std.fmt.bufPrint(&cursor_buf, "{d}", .{hook.cursor}) catch "?";
             const name_str = if (hook.name) |n| n else "-";
+
+            // Pending column: matching events not yet processed. Uniform
+            // meaning for both cursor kinds (derived server-side); the
+            // server caps the pattern-scan at 1000 — render the cap as
+            // "1000+".
+            var pending_buf: [20]u8 = undefined;
+            const pending_str = if (hook.pending >= 1000)
+                "1000+"
+            else
+                std.fmt.bufPrint(&pending_buf, "{d}", .{hook.pending}) catch "?";
 
             // Fired column: "12" for a healthy hook, "12 (2 failed)" or
             // "12 (2 failed, last exit 127)" when deliveries have failed.
@@ -592,13 +606,13 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 break :blk std.fmt.bufPrint(&fired_buf, "{d}", .{hook.fired_count}) catch "?";
             };
 
-            try ctx.stdout.print("{s:<4} {s:<20} {s:<25} {s:<30} {s:<12} {s}\n", .{
+            try ctx.stdout.print(hook_list_row_fmt, .{
                 id_str,
                 name_str,
                 hook.pattern,
-                hook.command,
-                cursor_str,
+                pending_str,
                 fired_str,
+                hook.command,
             });
         }
     }
@@ -1979,6 +1993,36 @@ test "sub regression: default and --json-values output byte-identical to pre-cha
     // --json-values — bare payload per line, unchanged.
     try std.testing.expectEqualStrings("{\"n\":3}\n", try renderEvent(&buf, keyed, .json_values, "a.b"));
     try std.testing.expectEqualStrings("plain payload\n", try renderEvent(&buf, unkeyed_no_topic, .json_values, "x.y"));
+}
+
+// From air/v0.1/hook-list-legibility.org: `Command` is the only
+// unbounded-width field; rendered last and un-padded, a long command must
+// not shift any preceding column out of alignment with the header.
+test "hook list: 60-char command keeps header and row columns aligned" {
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, hook_list_row_fmt, .{
+        "ID", "NAME", "Pattern", "Pending", "Fired", "Command",
+    });
+
+    const long_cmd = "sh -c 'cat >> /tmp/wutest-wever-handler-output-captured.log'";
+    try std.testing.expectEqual(@as(usize, 60), long_cmd.len); // 60-char command
+    var row_buf: [256]u8 = undefined;
+    const row = try std.fmt.bufPrint(&row_buf, hook_list_row_fmt, .{
+        "#47", "wutest-wever-h1", "wutest.wever.subtest", "1000+", "0", long_cmd,
+    });
+
+    // Every fixed-width column starts at the same byte position in header
+    // and row; the un-padded Command column starts where the header says.
+    const col = struct {
+        fn start(line: []const u8, needle: []const u8) usize {
+            return std.mem.indexOf(u8, line, needle).?;
+        }
+    };
+    try std.testing.expectEqual(col.start(header, "NAME"), col.start(row, "wutest-wever-h1"));
+    try std.testing.expectEqual(col.start(header, "Pattern"), col.start(row, "wutest.wever.subtest"));
+    try std.testing.expectEqual(col.start(header, "Pending"), col.start(row, "1000+"));
+    try std.testing.expectEqual(col.start(header, "Fired"), col.start(row, "0 "));
+    try std.testing.expectEqual(col.start(header, "Command"), col.start(row, long_cmd));
 }
 
 // Regression guard from air/v0.1/stdout-stderr-split.org: after the
