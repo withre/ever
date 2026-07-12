@@ -8,7 +8,16 @@
 //!   DELETE /topics/{name}         Delete topic
 //!   GET    /topics                List topics
 //!   POST   /topics/{name}/events  Publish event
-//!   GET    /topics/{name}/events  Fetch events (?offset=0&limit=100)
+//!   GET    /topics/{name}/events  Fetch events
+//!
+//! Fetch query parameters:
+//!   ?offset=N        Skip the first N events of the topic (topic-local
+//!                    count, NOT a log offset). Default 0.
+//!   ?after_offset=N  Resume strictly after global log offset N — the
+//!                    `offset` field carried in response event bodies
+//!                    round-trips into this parameter. Mutually exclusive
+//!                    with ?offset= (supplying both is a 400).
+//!   ?limit=N         Max events to return. Default 100.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -279,9 +288,12 @@ pub const HttpServer = struct {
 
     fn handleFetch(self: *HttpServer, request: *std.http.Server.Request, topic_name: []const u8, query: []const u8) !void {
         var offset: u64 = 0;
+        var has_offset = false;
+        var after_offset: ?u64 = null;
         var limit: u32 = 100;
 
-        // Parse query parameters
+        // Parse query parameters. `offset` is a topic-local skip count;
+        // `after_offset` is a global-offset cursor (resume strictly after).
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (param.len == 0) continue;
@@ -290,13 +302,23 @@ pub const HttpServer = struct {
                 const val = param[eq + 1 ..];
                 if (std.mem.eql(u8, key, "offset")) {
                     offset = std.fmt.parseInt(u64, val, 10) catch 0;
+                    has_offset = true;
+                } else if (std.mem.eql(u8, key, "after_offset")) {
+                    after_offset = std.fmt.parseInt(u64, val, 10) catch 0;
                 } else if (std.mem.eql(u8, key, "limit")) {
                     limit = std.fmt.parseInt(u32, val, 10) catch 100;
                 }
             }
         }
 
-        const events = self.topic_manager.fetch(self.allocator, topic_name, offset, limit) catch |err| return switch (err) {
+        if (has_offset and after_offset != null) {
+            return self.respondError(request, .bad_request, "offset and after_offset are mutually exclusive");
+        }
+
+        const events = (if (after_offset) |after|
+            self.topic_manager.fetchAfterOffset(self.allocator, topic_name, after, limit)
+        else
+            self.topic_manager.fetch(self.allocator, topic_name, offset, limit)) catch |err| return switch (err) {
             error.NotFound => self.respondError(request, .not_found, "topic not found"),
             else => self.respondError(request, .internal_server_error, "fetch failed"),
         };
@@ -321,7 +343,13 @@ pub const HttpServer = struct {
             };
         }
 
-        const resp = protocol.FetchResponse{ .events = event_data };
+        // Always an exact-topic request on this endpoint — carry the
+        // topic's non-marker count so clients can tell "start beyond end"
+        // from "empty topic".
+        const resp = protocol.FetchResponse{
+            .events = event_data,
+            .topic_events = self.topic_manager.topicEventCount(topic_name),
+        };
         const json = protocol.encodeBody(self.allocator, resp) catch {
             return self.respondError(request, .internal_server_error, "encoding failed");
         };
