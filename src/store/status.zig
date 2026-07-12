@@ -30,6 +30,19 @@ pub const ServerProbe = struct {
     reachable: bool,
 };
 
+/// Which mode produced the numbers in a StoreStatus.
+pub const Source = enum {
+    local_scan,
+    server,
+
+    pub fn jsonName(self: Source) []const u8 {
+        return switch (self) {
+            .local_scan => "local-scan",
+            .server => "server",
+        };
+    }
+};
+
 pub const StoreStatus = struct {
     data_dir: []const u8,
     server: ?ServerProbe = null,
@@ -39,6 +52,13 @@ pub const StoreStatus = struct {
     topics: []TopicInfo,
     hooks: []HookInfo,
     lock_held: bool,
+    /// Where the numbers came from: offline directory scan (default) or a
+    /// live server via the wire protocol.
+    source: Source = .local_scan,
+    /// Live-only: milliseconds since the server started. Null in local-scan mode.
+    uptime_ms: ?u64 = null,
+    /// Live-only: number of registered timers. Null in local-scan mode.
+    timer_count: ?u64 = null,
 
     pub fn deinit(self: *StoreStatus, alloc: Allocator) void {
         for (self.topics) |t| alloc.free(t.name);
@@ -365,6 +385,23 @@ fn checkLockHeld(io_: Io, dir: Dir) bool {
     return true;
 }
 
+/// Format a millisecond duration as a compact human string (e.g. "1d 2h 3m 4s").
+fn formatDuration(buf: []u8, ms: u64) []const u8 {
+    const total_secs = ms / 1000;
+    const days = total_secs / 86400;
+    const hours = (total_secs % 86400) / 3600;
+    const minutes = (total_secs % 3600) / 60;
+    const seconds = total_secs % 60;
+    if (days > 0) {
+        return std.fmt.bufPrint(buf, "{d}d {d}h {d}m {d}s", .{ days, hours, minutes, seconds }) catch "?";
+    } else if (hours > 0) {
+        return std.fmt.bufPrint(buf, "{d}h {d}m {d}s", .{ hours, minutes, seconds }) catch "?";
+    } else if (minutes > 0) {
+        return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds }) catch "?";
+    }
+    return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "?";
+}
+
 /// Format human-readable size string (e.g., "12.4 MB").
 fn formatSize(buf: []u8, bytes: u64) []const u8 {
     if (bytes < 1024) {
@@ -420,12 +457,21 @@ pub fn formatHuman(alloc: Allocator, status: *const StoreStatus) ![]u8 {
     var num_buf: [32]u8 = undefined;
 
     try out.appendSlice(alloc, "\n");
-    appendFmt(&out, alloc, "Ever Store: {s}\n", .{status.data_dir});
+    if (status.source == .server) {
+        appendFmt(&out, alloc, "Ever Store: {s} (via server)\n", .{status.data_dir});
+    } else {
+        appendFmt(&out, alloc, "Ever Store: {s}\n", .{status.data_dir});
+    }
     try out.appendSlice(alloc, "══════════════════════════════════════\n\n");
 
     if (status.server) |server| {
         const state: []const u8 = if (server.reachable) "running" else "not reachable";
-        appendFmt(&out, alloc, "  Server: {s} at {s}:{d}\n\n", .{ state, server.address, server.port });
+        appendFmt(&out, alloc, "  Server: {s} at {s}:{d}\n", .{ state, server.address, server.port });
+        if (status.uptime_ms) |up| {
+            var dur_buf: [64]u8 = undefined;
+            appendFmt(&out, alloc, "  Uptime: {s}\n", .{formatDuration(&dur_buf, up)});
+        }
+        try out.appendSlice(alloc, "\n");
     }
 
     try out.appendSlice(alloc, "  Log\n");
@@ -484,6 +530,10 @@ pub fn formatHuman(alloc: Allocator, status: *const StoreStatus) ![]u8 {
         }
     }
 
+    if (status.timer_count) |tc| {
+        appendFmt(&out, alloc, "\n  Timers: {d}\n", .{tc});
+    }
+
     if (status.lock_held) {
         try out.appendSlice(alloc, "\n  Lock: held (server running)\n\n");
     } else {
@@ -506,6 +556,8 @@ pub fn formatJson(status: *const StoreStatus, alloc: Allocator) ![]u8 {
 
     try json.appendSlice(alloc, "{\n  \"data_dir\": \"");
     try json.appendSlice(alloc, status.data_dir);
+    try json.appendSlice(alloc, "\",\n  \"source\": \"");
+    try json.appendSlice(alloc, status.source.jsonName());
     try json.appendSlice(alloc, "\"");
     if (status.server) |server| {
         try json.appendSlice(alloc, ",\n  \"server\": {\n");
@@ -543,6 +595,12 @@ pub fn formatJson(status: *const StoreStatus, alloc: Allocator) ![]u8 {
     }
 
     try json.appendSlice(alloc, "  ],\n");
+    if (status.uptime_ms) |up| {
+        appendFmt(&json, alloc, "  \"uptime_ms\": {d},\n", .{up});
+    }
+    if (status.timer_count) |tc| {
+        appendFmt(&json, alloc, "  \"timer_count\": {d},\n", .{tc});
+    }
     try json.appendSlice(alloc, if (status.lock_held) "  \"lock_held\": true\n" else "  \"lock_held\": false\n");
     try json.appendSlice(alloc, "}\n");
     return json.toOwnedSlice(alloc);
@@ -629,6 +687,100 @@ test "formatJson includes server object and lock field" {
     try std.testing.expect(std.mem.indexOf(u8, json, "    \"port\": 7890,") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "    \"reachable\": false\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "  \"lock_held\": false\n") != null);
+}
+
+test "formatDuration" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", formatDuration(&buf, 0));
+    try std.testing.expectEqualStrings("59s", formatDuration(&buf, 59_999));
+    try std.testing.expectEqualStrings("1m 0s", formatDuration(&buf, 60_000));
+    try std.testing.expectEqualStrings("1h 1m 5s", formatDuration(&buf, 3_665_000));
+    try std.testing.expectEqualStrings("1d 0h 0m 1s", formatDuration(&buf, 86_401_000));
+}
+
+test "formatHuman server-sourced includes uptime, timers, and source annotation" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "/srv/ever/data",
+        .server = .{ .address = "127.0.0.1", .port = 7890, .reachable = true },
+        .segments = 1,
+        .total_bytes = 128,
+        .total_events = 5,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = true,
+        .source = .server,
+        .uptime_ms = 61_000,
+        .timer_count = 2,
+    };
+    const text = try formatHuman(alloc, &status);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ever Store: /srv/ever/data (via server)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Server: running at 127.0.0.1:7890\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Uptime: 1m 1s\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Timers: 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Lock: held (server running)\n") != null);
+}
+
+test "formatHuman local-scan omits server-only lines" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "./data",
+        .server = .{ .address = "127.0.0.1", .port = 7890, .reachable = false },
+        .segments = 0,
+        .total_bytes = 0,
+        .total_events = 0,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = false,
+    };
+    const text = try formatHuman(alloc, &status);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ever Store: ./data\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(via server)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Uptime:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Timers:") == null);
+}
+
+test "formatJson includes source and live-only fields" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "/srv/ever/data",
+        .server = .{ .address = "127.0.0.1", .port = 7890, .reachable = true },
+        .segments = 1,
+        .total_bytes = 128,
+        .total_events = 5,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = true,
+        .source = .server,
+        .uptime_ms = 61_000,
+        .timer_count = 2,
+    };
+    const json = try formatJson(&status, alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"source\": \"server\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime_ms\": 61000,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"timer_count\": 2,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"lock_held\": true") != null);
+}
+
+test "formatJson local-scan marks source and omits live-only fields" {
+    const alloc = std.testing.allocator;
+    var status = StoreStatus{
+        .data_dir = "./data",
+        .segments = 0,
+        .total_bytes = 0,
+        .total_events = 0,
+        .topics = &.{},
+        .hooks = &.{},
+        .lock_held = false,
+    };
+    const json = try formatJson(&status, alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"source\": \"local-scan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "uptime_ms") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "timer_count") == null);
 }
 
 test "getStatus on data dir with events" {
