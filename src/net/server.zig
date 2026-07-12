@@ -18,6 +18,9 @@ pub const Config = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 7890,
     max_connections: u32 = 1024,
+    /// Data directory the store is serving from. Reported verbatim in the
+    /// status response so clients can see which directory the *server* uses.
+    data_dir: []const u8 = "./data",
 };
 
 /// Global server pointer for signal handler access.
@@ -34,6 +37,8 @@ pub const Server = struct {
     net_server: ?net.Server,
     shutdown_requested: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32),
+    /// Milliseconds since epoch at `init` — used to compute status uptime.
+    start_time: i64,
 
     /// Create a new server. Call `run()` to start accepting connections.
     pub fn init(allocator: Allocator, io: Io, topic_manager: *TopicManager, config: Config) !Server {
@@ -48,6 +53,7 @@ pub const Server = struct {
             .net_server = null,
             .shutdown_requested = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
+            .start_time = getMilliTimestamp(),
         };
     }
 
@@ -164,6 +170,7 @@ pub const Server = struct {
             .timer_info => try self.handleTimerInfo(frame.body, fd),
             .hook_ps => try self.handleHookPs(fd),
             .hook_logs => try self.handleHookLogs(frame.body, fd),
+            .status => try self.handleStatus(fd),
             else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
         }
     }
@@ -611,6 +618,87 @@ pub const Server = struct {
         try protocol.writeFrame(fd, .hook_logs_ok, resp_body);
     }
 
+    fn handleStatus(self: *Server, fd: std.posix.fd_t) !void {
+        const tm = self.topic_manager;
+
+        // Topic snapshot — assembled under the TopicManager lock so the
+        // per-topic counts and the deleted set are mutually consistent.
+        var topic_infos: []protocol.StatusTopicInfo = &.{};
+        var topics_initialized: usize = 0;
+        defer {
+            for (topic_infos[0..topics_initialized]) |t| self.allocator.free(t.name);
+            self.allocator.free(topic_infos);
+        }
+        var total_events: u64 = 0;
+        {
+            tm.lockForHookRegistration();
+            defer tm.unlockForHookRegistration();
+            const keys = tm.topics.keys();
+            const vals = tm.topics.values();
+            topic_infos = self.allocator.alloc(protocol.StatusTopicInfo, keys.len) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "status failed");
+            for (keys, vals) |k, v| {
+                const name = self.allocator.dupe(u8, k) catch
+                    return sendError(self.allocator, fd, protocol.ErrorCode.internal, "status failed");
+                topic_infos[topics_initialized] = .{
+                    .name = name,
+                    .events = v.non_marker_count,
+                    .deleted = tm.deleted_topics.contains(k),
+                };
+                topics_initialized += 1;
+                total_events += v.non_marker_count;
+            }
+        }
+
+        // Log stats — under the Log's own mutex (appends mutate segments).
+        var segments: u64 = 0;
+        var total_bytes: u64 = 0;
+        {
+            while (!tm.log.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer tm.log.mutex.unlock();
+            segments = tm.log.segments.items.len;
+            for (tm.log.segments.items) |seg| total_bytes += seg.size;
+        }
+
+        // Hooks — same source list_hooks uses. Empty when hooks are disabled.
+        const hooks_snap: []hooks_mod.Hook = if (self.hook_table) |ht|
+            ht.snapshot(self.allocator) catch
+                return sendError(self.allocator, fd, protocol.ErrorCode.internal, "status failed")
+        else
+            &.{};
+        defer if (hooks_snap.len > 0) hooks_mod.freeHookSnapshot(self.allocator, hooks_snap);
+
+        const hook_infos = self.allocator.alloc(protocol.StatusHookInfo, hooks_snap.len) catch
+            return sendError(self.allocator, fd, protocol.ErrorCode.internal, "status failed");
+        defer self.allocator.free(hook_infos);
+        for (hooks_snap, 0..) |hook, i| {
+            hook_infos[i] = .{
+                .id = hook.id,
+                .pattern = hook.pattern,
+                .command = hook.command,
+                .cursor = hook.cursor,
+            };
+        }
+
+        const timer_count: u64 = if (self.timer_table) |tt| tt.count() else 0;
+
+        const now = getMilliTimestamp();
+        const uptime_ms: u64 = if (now > self.start_time) @intCast(now - self.start_time) else 0;
+
+        const resp_body = try protocol.encodeBody(self.allocator, protocol.StatusResponse{
+            .data_dir = self.config.data_dir,
+            .segments = segments,
+            .total_bytes = total_bytes,
+            .total_events = total_events,
+            .topics = topic_infos[0..topics_initialized],
+            .hooks = hook_infos,
+            .timer_count = timer_count,
+            .uptime_ms = uptime_ms,
+        });
+        defer self.allocator.free(resp_body);
+        try protocol.writeFrame(fd, .status_ok, resp_body);
+    }
+
     fn handleTimerInfo(self: *Server, body: []const u8, fd: std.posix.fd_t) !void {
         const tt = self.timer_table orelse
             return sendError(self.allocator, fd, protocol.ErrorCode.internal, "timers not enabled");
@@ -713,6 +801,13 @@ fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
             _ = std.os.linux.close(@intCast(fd));
         }
     }
+}
+
+fn getMilliTimestamp() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 fn sendError(allocator: Allocator, fd: std.posix.fd_t, code: u16, message: []const u8) !void {

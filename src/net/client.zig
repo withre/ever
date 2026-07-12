@@ -8,6 +8,7 @@ const Io = std.Io;
 const net = Io.net;
 const protocol = @import("../protocol/message.zig");
 const store = @import("../store/store.zig");
+const status_mod = @import("../store/status.zig");
 
 pub const FetchResult = struct {
     events: []Event,
@@ -97,6 +98,18 @@ pub const HookLogsResult = struct {
     pub fn deinit(self: *HookLogsResult) void {
         self.allocator.free(self.log_path);
         self.allocator.free(self.content);
+    }
+};
+
+/// Owned result of a server status query. Wraps a `StoreStatus` whose
+/// fields (including `data_dir`) are deep-copied from the wire response.
+pub const StatusResult = struct {
+    status: status_mod.StoreStatus,
+    allocator: Allocator,
+
+    pub fn deinit(self: *StatusResult) void {
+        self.allocator.free(self.status.data_dir);
+        self.status.deinit(self.allocator);
     }
 };
 
@@ -610,6 +623,79 @@ pub const Client = struct {
             .hook_id = parsed.value.hook_id,
             .log_path = try self.allocator.dupe(u8, parsed.value.log_path),
             .content = try self.allocator.dupe(u8, parsed.value.content),
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Query live store statistics from the server. The returned status has
+    /// `source = .server` and `lock_held = true` (true by construction: a
+    /// server answered over the wire). Caller owns the result — call `deinit`.
+    pub fn status(self: *Client) !StatusResult {
+        try protocol.writeFrame(self.fd(), .status, "{}");
+
+        const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+            return error.ConnectionClosed;
+        defer self.allocator.free(frame.body);
+
+        if (frame.msg_type == .error_response) return self.handleErrorResponse(frame.body);
+        if (frame.msg_type != .status_ok) return error.UnexpectedResponse;
+
+        const parsed = try protocol.decodeBody(protocol.StatusResponse, self.allocator, frame.body);
+        defer parsed.deinit();
+
+        const data_dir = try self.allocator.dupe(u8, parsed.value.data_dir);
+        errdefer self.allocator.free(data_dir);
+
+        const topics = try self.allocator.alloc(status_mod.TopicInfo, parsed.value.topics.len);
+        var topics_initialized: usize = 0;
+        errdefer {
+            for (topics[0..topics_initialized]) |t| self.allocator.free(t.name);
+            self.allocator.free(topics);
+        }
+        for (parsed.value.topics) |t| {
+            topics[topics_initialized] = .{
+                .name = try self.allocator.dupe(u8, t.name),
+                .events = t.events,
+                .deleted = t.deleted,
+            };
+            topics_initialized += 1;
+        }
+
+        const hooks = try self.allocator.alloc(status_mod.HookInfo, parsed.value.hooks.len);
+        var hooks_initialized: usize = 0;
+        errdefer {
+            for (hooks[0..hooks_initialized]) |h| {
+                self.allocator.free(h.pattern);
+                self.allocator.free(h.command);
+            }
+            self.allocator.free(hooks);
+        }
+        for (parsed.value.hooks) |h| {
+            const pattern = try self.allocator.dupe(u8, h.pattern);
+            errdefer self.allocator.free(pattern);
+            const command = try self.allocator.dupe(u8, h.command);
+            hooks[hooks_initialized] = .{
+                .id = h.id,
+                .pattern = pattern,
+                .command = command,
+                .cursor = h.cursor,
+            };
+            hooks_initialized += 1;
+        }
+
+        return .{
+            .status = .{
+                .data_dir = data_dir,
+                .segments = parsed.value.segments,
+                .total_bytes = parsed.value.total_bytes,
+                .total_events = parsed.value.total_events,
+                .topics = topics,
+                .hooks = hooks,
+                .lock_held = true,
+                .source = .server,
+                .uptime_ms = parsed.value.uptime_ms,
+                .timer_count = parsed.value.timer_count,
+            },
             .allocator = self.allocator,
         };
     }
