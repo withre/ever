@@ -505,19 +505,66 @@ fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
 }
 
-fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
-    const id_str = ctx.arg("id");
+/// Result of resolving a CLI hook argument to a numeric hook ID.
+const ResolvedHook = struct {
+    id: u64,
+    /// True when the argument was resolved via name lookup rather than
+    /// parsed as an integer. Callers use this to pick the right message.
+    by_name: bool,
+};
 
-    if (id_str.len == 0) {
-        fatal(ctx, "error: hook ID is required\n", .{});
+/// Resolve a CLI hook argument to a numeric hook ID.
+/// Strategy (identical to the original `hook rm`): try integer first; on
+/// parse failure, list hooks and return the first whose name matches.
+/// Unknown name: prints "error: hook '<name>' not found" and exits 1.
+/// The name lookup consumes its own store connection (`listHooks()` eats
+/// the connection), so callers must open a fresh connection for any
+/// follow-up request.
+fn resolveHookId(
+    allocator: std.mem.Allocator,
+    ctx: *cli.Context,
+    address: []const u8,
+    port: u16,
+    id_or_name: []const u8,
+) !ResolvedHook {
+    // Integer parse wins: a hook literally named "42" is unreachable by name.
+    if (std.fmt.parseInt(u64, id_or_name, 10)) |id| {
+        return .{ .id = id, .by_name = false };
+    } else |_| {}
+
+    // Treat as name — list hooks to find the ID (first match wins).
+    var c = connectToStore(allocator, ctx, address, port);
+    defer c.deinit();
+    var result = c.listHooks() catch |err| switch (err) {
+        error.ServerError => exitFlushed(ctx, 1),
+        else => return err,
+    };
+    defer result.deinit();
+
+    for (result.hooks) |hook| {
+        if (hook.name) |name| {
+            if (std.mem.eql(u8, name, id_or_name)) {
+                return .{ .id = hook.id, .by_name = true };
+            }
+        }
     }
-    const id = std.fmt.parseInt(u64, id_str, 10) catch
-        fatal(ctx, "error: invalid hook ID '{s}'.\n", .{id_str});
+
+    fatal(ctx, "error: hook '{s}' not found\n", .{id_or_name});
+}
+
+fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
+    const id_or_name = ctx.arg("id");
+
+    if (id_or_name.len == 0) {
+        fatal(ctx, "error: hook ID or name is required\n", .{});
+    }
 
     const addr_info = parseStoreAddress(ctx);
+    const resolved = try resolveHookId(allocator, ctx, addr_info.address, addr_info.port, id_or_name);
+
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
-    var result = c.hookLogs(id) catch |err| switch (err) {
+    var result = c.hookLogs(resolved.id) catch |err| switch (err) {
         error.ServerError => exitFlushed(ctx, 1),
         else => return err,
     };
@@ -543,46 +590,19 @@ fn handleHookRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
 
     const addr_info = parseStoreAddress(ctx);
+    const resolved = try resolveHookId(allocator, ctx, addr_info.address, addr_info.port, id_or_name);
+
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
+    c.removeHook(resolved.id) catch |err| switch (err) {
+        error.ServerError => exitFlushed(ctx, 1),
+        else => return err,
+    };
 
-    // Try parsing as numeric ID first
-    if (std.fmt.parseInt(u64, id_or_name, 10)) |id| {
-        c.removeHook(id) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
-            else => return err,
-        };
-        diag(ctx, "Hook #{d} removed.\n", .{id});
-    } else |_| {
-        // Treat as name — list hooks to find the ID
-        var result = c.listHooks() catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
-            else => return err,
-        };
-        defer result.deinit();
-
-        var found_id: ?u64 = null;
-        for (result.hooks) |hook| {
-            if (hook.name) |name| {
-                if (std.mem.eql(u8, name, id_or_name)) {
-                    found_id = hook.id;
-                    break;
-                }
-            }
-        }
-
-        if (found_id) |id| {
-            // Reconnect since we consumed the connection for listHooks
-            var c2 = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
-            defer c2.deinit();
-            c2.removeHook(id) catch |err| switch (err) {
-                error.ServerError => exitFlushed(ctx, 1),
-                else => return err,
-            };
-            diag(ctx, "Hook '{s}' (#{d}) removed.\n", .{ id_or_name, id });
-        } else {
-            fatal(ctx, "error: hook '{s}' not found\n", .{id_or_name});
-        }
+    if (resolved.by_name) {
+        diag(ctx, "Hook '{s}' (#{d}) removed.\n", .{ id_or_name, resolved.id });
+    } else {
+        diag(ctx, "Hook #{d} removed.\n", .{resolved.id});
     }
 }
 
