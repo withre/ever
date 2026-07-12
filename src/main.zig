@@ -83,9 +83,16 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
 
     const from_offset = try ctx.flagInt(u64, "from");
+    const after_offset = try ctx.flagIntOrNull(u64, "after-offset");
     const max_count = try ctx.flagInt(u32, "max");
     const follow = ctx.flagBool("follow");
     const json_values = ctx.flagBool("json-values");
+
+    // The framework's `.conflicts` rejects both flags on argv; this guards
+    // any path that bypasses it (mirrors the server-side precedence rule).
+    if (after_offset != null and ctx.hasFlag("from")) {
+        fatal(ctx, "error: --from and --after-offset are mutually exclusive\n", .{});
+    }
 
     const addr_info = parseStoreAddress(ctx);
 
@@ -96,14 +103,29 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
     if (follow) {
+        // Two cursor modes: `--after-offset` tracks the last delivered
+        // event's *global* offset (resume strictly after it); `--from` /
+        // default keeps the topic-local skip-count arithmetic.
         var offset = from_offset;
+        var after_cursor = after_offset;
         var did_initial = false;
         var emitted: u64 = 0;
         while (true) {
             const remaining: u32 = if (max_count > emitted) @intCast(max_count - emitted) else 0;
             if (remaining == 0 and did_initial) break;
             const fetch_count: u32 = if (remaining > 0) remaining else max_count;
-            var result = if (!did_initial)
+            var result = if (after_cursor) |after|
+                client.fetchAfter(
+                    if (!is_pattern) topic_name else null,
+                    if (is_pattern) topic_name else null,
+                    after,
+                    if (!did_initial) fetch_count else @min(100, fetch_count),
+                    if (!did_initial) 0 else 5000,
+                ) catch |err| switch (err) {
+                    error.ServerError => exitFlushed(ctx, 1),
+                    else => return err,
+                }
+            else if (!did_initial)
                 (if (is_pattern) client.fetchPattern(topic_name, offset, fetch_count) else client.fetch(topic_name, offset, fetch_count)) catch |err| switch (err) {
                     error.ServerError => exitFlushed(ctx, 1),
                     else => return err,
@@ -126,21 +148,50 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 emitted += 1;
                 if (emitted >= max_count) break;
             }
-            if (result.events.len > 0) offset += result.events.len;
+            if (result.events.len > 0) {
+                if (after_cursor != null) {
+                    after_cursor = result.events[result.events.len - 1].offset;
+                } else {
+                    offset += result.events.len;
+                }
+            }
             did_initial = true;
             if (emitted >= max_count) break;
         }
     } else {
-        var result = (if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
+        var result = (if (after_offset) |after|
+            client.fetchAfter(
+                if (!is_pattern) topic_name else null,
+                if (is_pattern) topic_name else null,
+                after,
+                max_count,
+                0,
+            )
+        else if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
             error.ServerError => exitFlushed(ctx, 1),
             else => return err,
         };
         defer result.deinit();
         if (result.events.len == 0) {
+            warnBeyondEnd(ctx, topic_name, after_offset, from_offset, result.topic_events);
             diag(ctx, "No events.\n", .{});
         } else {
             for (result.events) |event| try printEvent(ctx.stdout, event, json_values);
         }
+    }
+}
+
+/// Emit the "start beyond end of topic" warning (stderr, diagnostic only —
+/// exit codes unchanged) when an empty result came from a `--from N` skip
+/// count that exceeds the topic's event count. `N == M` is a legitimate
+/// at-the-tail read — no warning. `topic_events` is null for pattern
+/// requests, so those never warn; `--after-offset` reads never warn either
+/// (any global offset at/past the tip is a valid "nothing new yet" cursor).
+fn warnBeyondEnd(ctx: *const cli.Context, topic_name: []const u8, after_offset: ?u64, from_offset: u64, topic_events: ?u64) void {
+    if (after_offset != null or from_offset == 0) return;
+    const m = topic_events orelse return;
+    if (from_offset > m) {
+        diag(ctx, "warning: start {d} is beyond the end of topic '{s}' ({d} events)\n", .{ from_offset, topic_name, m });
     }
 }
 
@@ -153,7 +204,12 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const count = try ctx.flagInt(u32, "count");
     const timeout_secs = try ctx.flagInt(u32, "timeout");
     const from_offset = try ctx.flagInt(u64, "from");
+    const after_offset = try ctx.flagIntOrNull(u64, "after-offset");
     const json_values = ctx.flagBool("json-values");
+
+    if (after_offset != null and ctx.hasFlag("from")) {
+        fatal(ctx, "error: --from and --after-offset are mutually exclusive\n", .{});
+    }
 
     const addr_info = parseStoreAddress(ctx);
 
@@ -165,9 +221,15 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
 
     var collected: u32 = 0;
     var offset = from_offset;
+    var after_cursor = after_offset;
     var elapsed_ms: u64 = 0;
     const timeout_ms: u64 = @as(u64, timeout_secs) * 1000;
     const block_interval_ms: u32 = 2000;
+
+    // A `--from N` beyond the topic's end would silently sit at the block
+    // timeout — probe non-blocking first so the beyond-end warning lands
+    // before we start blocking. Any events the probe returns count.
+    var probe_pending = after_offset == null and from_offset > 0 and !is_pattern;
 
     while (collected < count) {
         if (timeout_secs > 0 and elapsed_ms >= timeout_ms) exitFlushed(ctx, 1);
@@ -175,21 +237,43 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             @intCast(@min(block_interval_ms, timeout_ms - elapsed_ms))
         else
             block_interval_ms;
-        var result = client.fetchBlocking(
-            if (!is_pattern) topic_name else null,
-            if (is_pattern) topic_name else null,
-            offset,
-            @min(100, count - collected),
-            remaining_ms,
-        ) catch fatal(ctx, "error: fetch failed.\n", .{});
+        const block_ms: u32 = if (probe_pending) 0 else remaining_ms;
+        var result = (if (after_cursor) |after|
+            client.fetchAfter(
+                if (!is_pattern) topic_name else null,
+                if (is_pattern) topic_name else null,
+                after,
+                @min(100, count - collected),
+                block_ms,
+            )
+        else
+            client.fetchBlocking(
+                if (!is_pattern) topic_name else null,
+                if (is_pattern) topic_name else null,
+                offset,
+                @min(100, count - collected),
+                block_ms,
+            )) catch fatal(ctx, "error: fetch failed.\n", .{});
         defer result.deinit();
+        if (probe_pending) {
+            probe_pending = false;
+            if (result.events.len == 0) {
+                warnBeyondEnd(ctx, topic_name, after_offset, from_offset, result.topic_events);
+            }
+        }
         for (result.events) |event| {
             try printEvent(ctx.stdout, event, json_values);
             try ctx.stdout.flush();
             collected += 1;
         }
-        if (result.events.len > 0) offset += result.events.len;
-        elapsed_ms += remaining_ms;
+        if (result.events.len > 0) {
+            if (after_cursor != null) {
+                after_cursor = result.events[result.events.len - 1].offset;
+            } else {
+                offset += result.events.len;
+            }
+        }
+        elapsed_ms += block_ms;
     }
 }
 
@@ -1331,7 +1415,8 @@ const app = cli.App{
                 .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
             },
             .flags = &.{
-                .{ .name = "from", .default = "0", .description = "Start offset" },
+                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
+                .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
                 .{ .name = "max", .default = "100", .description = "Max events" },
                 .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
                 .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
@@ -1347,7 +1432,8 @@ const app = cli.App{
             .flags = &.{
                 .{ .name = "count", .default = "1", .description = "Events to wait for" },
                 .{ .name = "timeout", .default = "0", .description = "Timeout in seconds" },
-                .{ .name = "from", .default = "0", .description = "Start offset" },
+                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
+                .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
                 .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
             },
             .run = handleWait,
@@ -1539,6 +1625,18 @@ pub fn main(init: std.process.Init) !void {
         stdout.interface.flush() catch {};
         stderr.interface.flush() catch {};
         switch (err) {
+            // Usage errors: the CLI framework already wrote a human-readable
+            // message to stderr before returning — just exit non-zero
+            // instead of dumping a stack trace.
+            error.UnknownFlag,
+            error.MissingFlagValue,
+            error.MissingRequiredFlag,
+            error.ConflictingFlags,
+            error.UnknownCommand,
+            error.UnknownSubcommand,
+            error.UnexpectedArgument,
+            error.InvalidIntValue,
+            => std.process.exit(1),
             // A closed stdout (e.g. `ever sub t --follow | head -1`) is
             // normal termination per Unix convention: exit 0, no message.
             error.WriteFailed => {
