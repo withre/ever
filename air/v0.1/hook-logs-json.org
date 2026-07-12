@@ -1,5 +1,5 @@
 #+title: JSON Output for Hook Logs
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:subscriber:orchestrator:
 
 * Summary
@@ -112,3 +112,4 @@ With a running store, a hook =<id>= that has executed at least once, and =v0.1/s
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6).
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-12: Implemented. Server split of "no such hook" (=not_found= error) vs "known hook, no executions" (=hook_logs_ok= with empty =log_path= + =content=), via a new =HookTable.contains= check before the log-dir scan, with a TCP integration test (914e30b). CLI =--json= flag on =hook logs=: client-side header parse against the fixed grammar, record array on stdout with =payload= embedded verbatim, degraded record (null header fields, full content in =output=) for non-conforming content / wire-ID mismatch / non-object payload; empty history prints =[]= (=--json=) or =(no executions)= on stderr, exit 0; unit tests for parser, emitter round-trip, and all degraded paths (dc4277f). Acceptance criteria verified behaviorally against a scratch store (named + auto-named hook fired with quotes/newlines in payload and output, =jq= round-trip, never-fired → =[]= exit 0, bogus ID/name → stderr + exit 1 + empty stdout, human mode unchanged, name resolution composes with =--json=).
+- 2026-07-13: State: ready → complete.
