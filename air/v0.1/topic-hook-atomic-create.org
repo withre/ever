@@ -1,5 +1,5 @@
 #+title: Atomic Topic + Hook Creation
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:store:orchestrator:
 
 * Summary
@@ -91,3 +91,4 @@ If the store crashes between hook registration and marker append, the surviving 
 - 2026-07-03: Drafted from the ever field report (docs/ever.org, verified at 142d5e6). Deviation from the report: the =topic list --deleted= / tombstone-display split that P6 bundles is moved to Non-Goals (belongs with v0.1/cli-json-list-output.org).
 - 2026-07-03: Moved to ready after supervisor review (everfix Phase B).
 - 2026-07-13: Implemented (everfix impl-p6). Split =createTopic= into a locking wrapper plus =createTopicLocked= — the TopicManager mutex is a non-reentrant spinlock — and added =hasTopicLocked= / =isPatternShape= plus a test-only marker-append fault-injection flag (9dc5f38). Added =RegisterHookRequest.create_topic= (defaulted; no new message type), the =createTopicAndRegisterHook= critical section in the server (validate → register hook at tip 0 → append marker, hook removed on marker failure), =conflict=/=bad_request= error mapping, =Client.registerHookCreateTopic=, and integration tests for the spec's five cases (37c8df9). Added the =--create-topic= CLI flag with client-side validation mirrored server-side and the =(topic created)= ack; verified acceptance criteria end-to-end against a scratch store, including exactly-once delivery of the first publish, AlreadyExists on live and tombstoned names with no hook registered, pattern-shape rejection, and the unchanged two-step flow (b769a0c).
+- 2026-07-13: State: ready → complete.
