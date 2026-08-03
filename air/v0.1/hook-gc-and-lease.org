@@ -513,7 +513,7 @@ In dry-run mode =--purge <id>…= prints one line per named hook — id, name, p
 
 /[Superseded: 2026-08-03 — revisions 1 and 2 stated this as "no single command takes a hook from =armed= to removed" and justified it with "=ever hook rm <id>= keeps its current behaviour: it is explicit, single-target, and already exists". Both halves are wrong. =hook rm= accepts *id or name*, and in the name form it is neither explicit nor single-target — it is first-match over an array whose order is an artefact of past deletions (see [[#names][Name addressing]]) — and it takes an =armed= hook to removed in one step with no confirmation. So the invariant was already false in shipped code, and it was the argument that made =--purge= acceptable.]/
 
-=ever hook rm= predates this document and remains the documented single-target escape hatch. It is *not* covered by the invariant, and this document narrows it in exactly one way: the name form must refuse ambiguity like every other name-addressed verb.
+=ever hook rm= predates this document and remains the documented single-target escape hatch. It is *not* covered by the invariant, and this document narrows it in exactly one way: the name form must refuse ambiguity like every other name-addressed verb. Rewriting =hook rm='s client-side resolve-then-act to go through the server is *not* required here — it is a pre-existing narrow window on a verb this document does not add — but it is named in [[#names][Name addressing]] so that nobody reads it as the pattern to follow.
 
 *** Why =--purge= exists at all
 
@@ -528,7 +528,8 @@ This document adds =enable=, =disable= and =renew= as =<id|name>= verbs, and rev
 Verified by reading the source and reproduced on an isolated store (own =--data-dir=, port 7951, torn down):
 
 - =HookTable.addWithCursor= performs *no uniqueness check* on =name=. Registering two hooks called =guard= succeeds silently, no warning.
-- =HookTable.removeByName= and =HookTable.findIdByName= both =return= on the *first* array match. =handleHookRm= in the CLI does the same with a =break=. Three independent layers, none able to see a second match.
+- =HookTable.removeByName= and =HookTable.findIdByName= both =return= on the *first* array match — and *neither has a single call site anywhere in the tree, including tests*. They are dead code that looks like the right primitive. =handleHookRm= in the CLI does its own first-match scan with a =break=.
+- *The wire protocol has no name-addressed operation at all.* =UnregisterHookRequest= carries =id: u64= and nothing else. So the CLI's name form is implemented entirely client-side: =listHooks()= on one connection, scan the result, *reconnect* ("since we consumed the connection for listHooks"), then =removeHook(id)=. That is resolve-then-act with the table mutable in between — the daemon auto-removes =once= hooks on its own schedule, and ids are reusable after the =next_id= reset that [[#load-hardening][criterion 5]] measures. Narrow, but it is a window, and it is the pattern a new verb would copy.
 - =removeByName= uses =swapRemove=, which moves the *last* element into the freed slot. Measured: after =hook rm guard= removed =#4=, =hook list= came back =#6, #5= — the array reordered. *Which of two same-named hooks a verb hits is not the oldest, not the lowest id, and not predictable from anything an operator can see.* The live store shows the same churn: its array order is =[3, 4, 10, 6, 7, 8, 9, 11, 12, 220, 193, 170, 221, 186, 226, 227]=.
 - Measured end to end: =ever hook rm guard= printed =Hook 'guard' (#4) removed.=, left the other =guard= live, and *the same command run again removed a different hook*.
 - *The repo already decided this question the other way for timers.* =TimerTable.add= does =if (std.mem.eql(u8, t.name, name)) return error.AlreadyExists;=. Timer names are a unique key. Hook names look like one, are used like one, and are not one.
@@ -536,11 +537,16 @@ Verified by reading the source and reproduced on an isolated store (own =--data-
 
 *** What this document requires
 
-Three changes, the first two of which are prerequisites:
+Four changes, the first three of which are prerequisites:
 
-1. *=hook add= rejects a duplicate =--name= with =error.AlreadyExists=*, exactly as =TimerTable.add= already does, with the same error and the same shape. Two lines, with the precedent in the same repo.
-2. *Every name resolver returns =error.Ambiguous= when more than one hook matches.* The CLI prints every candidate id and exits non-zero without acting. This is needed *in addition to* (1), because (1) cannot retroactively de-duplicate a store that has been accumulating hooks since April.
-3. *Destructive verbs take ids only.* =gc --purge= accepts =<id>…= and nothing else — which is also the answer to =--purge='s shape, so the two close together.
+1. *=hook add= rejects a duplicate =--name= with =error.AlreadyExists=*, exactly as =TimerTable.add= already does, with the same error and the same shape. Two lines, with the precedent in the same repo. Over the wire this is =ErrorCode.conflict= (409), which already exists.
+2. *Every name resolver returns =error.Ambiguous= when more than one hook matches* — also =ErrorCode.conflict=, with every candidate id in the message. The CLI prints them and exits non-zero without acting. This is needed *in addition to* (1), because (1) cannot retroactively de-duplicate a store that has been accumulating hooks since April.
+3. *Resolution happens server-side, in the same critical section as the mutation.* The request body for each new verb carries ={ id: ?u64, name: ?[]const u8 }= with exactly one set, and the server resolves the name under the =HookTable= mutex it is about to mutate under. The client never lists-then-acts.
+
+   This is not decoration on (2). Ambiguity detection performed client-side still leaves the resolve-then-act window: the answer is correct when it is computed and stale when it is used. Doing both under one lock closes the ambiguity and the window together, and it costs nothing, because every one of these verbs already needs a server round trip to do its actual work.
+
+   It also decides what happens to =removeByName= and =findIdByName=, which today are first-match, uncalled and untested. *Either wire them up with ambiguity detection added and test them, or delete them* — leaving an untested first-match helper sitting next to four new callers is precisely how this defect would propagate into the verbs that are supposed to fix it.
+4. *Destructive verbs take ids only.* =gc --purge= accepts =<id>…= and nothing else — which is also the answer to =--purge='s shape, so the two close together.
 
 Why each of the new verbs makes this worse than =hook rm= alone did:
 
@@ -610,6 +616,8 @@ Verified 2026-08-03 at =142d5e66=, *after* the zig-cli-kit migration (=src/main.
 This document adds =gc=, =enable=, =disable=, =renew=, and =--ttl= on =add=; it also makes =hook add --name= *reject a duplicate* and every name resolver refuse ambiguity ([[#names][Name addressing]]), which is a change to existing behaviour and the only one in this document. =hook list= gains a =STATE= column, a =LAST OK= column (=last_success_at=) and a =TIMEOUTS= tally; for =quarantined= the state column shows the time until the next attempt, for =disabled= it shows the reason. The =STATE= column is the primary observable distinguishing the two states, and =LAST OK= is what makes a quarantined hook's line actionable.
 
 Wire protocol: four new request/response pairs. The last opcodes in use are =hook_logs = 0x0F= and =hook_logs_ok = 0x8F= (=src/protocol/message.zig=), so the new pairs are *=0x10–0x13= / =0x90–0x93=*, in the order =hook_gc=, =hook_enable=, =hook_disable=, =hook_renew=. Naming them here rather than saying "following the existing numbering" is deliberate: two implementers working from that phrase would collide.
+
+The three targeted verbs take ={ id: ?u64, name: ?[]const u8 }= with exactly one set, so that *the server* resolves the name under the =HookTable= mutex it is about to mutate under — see [[#names][Name addressing]] for why the client must not resolve. Ambiguity and duplicate-name are both =ErrorCode.conflict= (409), which already exists in the enum. =hook_gc= takes ={ yes: bool, include_quarantined: bool, purge: []const u64 }=; =purge= is a list of ids because a destructive verb does not accept an ambiguous key.
 
 Existing =list_hooks_ok= gains the new fields. The old-client half of compatibility is free — =decodeBody= sets =ignore_unknown_fields=, so a client built before this change ignores them. The new-client half is *not* free: =protocol.HookInfo= (=message.zig:144=) must gain the same eight fields with the same defaults, or a new client talking to an older store fails to decode a response that legitimately omits them. See [[#record-fields][Record format]].
 
@@ -798,6 +806,8 @@ b=$(awk '/^syscr/{print $2}' /proc/$PID/io); echo $(( (b-a)/3 ))
 - *28c — The unpredictability is real, so the criterion is not academic.* On that same store, =hook rm <first id>= then =hook list=: the array order changes, because =removeByName= uses =swapRemove=. A criterion that assumes "first match" means "lowest id" or "oldest" is wrong.
 - *28d — Destructive verbs take ids only.* =ever hook gc --purge guard --yes= is rejected as a malformed argument — =--purge= accepts ids and nothing else — regardless of whether =guard= is ambiguous.
 - *28e — Unnamed hooks are addressable by id.* 9 of the 16 live hooks have =name: null=. Every new verb works on them by id, and the name form reports "not found" rather than matching a null name.
+- *28f — Resolution is server-side.* Run =ever hook enable somename= against a store and capture the wire traffic (or instrument the client). *Exactly one* request is sent, carrying the name; there is no =list_hooks= call and no second connection. An implementation that lists, scans and reconnects fails this criterion even if it detects ambiguity correctly, because the check and the act are then in different critical sections.
+- *28g — The dead helpers do not survive untested.* =HookTable.removeByName= and =findIdByName= have no call sites at =142d5e66=, not even in tests. After the change, either both are exercised by the tests for 28b, or both are gone. A first-match helper that still compiles is the shape this defect re-enters through.
 
 ** Reversibility
 
@@ -852,7 +862,7 @@ Test discipline required by the fleet: prove each regression test fails against 
 8. Counting: a simulated reap sequence for one hook of (fail, fail, fail) within one tick increments by 1; (fail, success, fail) within one tick leaves the counter at 0; the same three failures across three ticks increment by 3.
 9. =gc= candidate classification: a table of synthetic records — =(state, consecutive_failures, streak_started_at, cwd_missing_since, last_exit_status, last_success_at, cwd exists now, token qualifies, token exists now)= → =reclaimable(R1) / reclaimable(R2) / flagged / none=. This is where the wall-clock floors, the two-observer requirement and the never-dispatched branches are pinned. Include a row for a =quarantined= hook with a high =consecutive_failures= and =cwd_missing_since = null= — it must classify as *flagged*, not reclaimable, which is the B4 regression.
 10. Attributability: a table mapping =(exit status, signal, daemon-sent?, token qualifies?, token exists?)= → =(counts toward K?, last_error)=. Exit 1 never counts. Exit 127 counts only with a qualifying, absent token.
-11. Name resolution: duplicate =--name= rejected; a resolver over a table containing two matches returns =error.Ambiguous= and names both ids; a resolver over a table with one match returns it; over zero returns =error.NotFound=.
+11. Name resolution: duplicate =--name= rejected; a resolver over a table containing two matches returns =error.Ambiguous= and names both ids; a resolver over a table with one match returns it; over zero returns =error.NotFound=; a table where the only match has =name: null= returns =error.NotFound=. These are the first tests either resolver has ever had.
 
 ** Integration (=src/tests/integration.zig=)
 
@@ -892,6 +902,7 @@ Each of these must fail a *different* test set. A mutation that fails nothing is
 - accept =--purge= without ids, or without the one-hour floor → criteria 27 and 27a;
 - return the first match instead of =error.Ambiguous= from any name resolver → criterion 28b;
 - accept a duplicate =--name= → criterion 28a;
+- resolve the name client-side and reconnect to act, as =handleHookRm= does → criterion 28f;
 - drop =last_success_at= from the flagged line → criterion 26b;
 - drop a default from one new field → criterion 1;
 - treat a short read as a parse failure → criterion 6a.
@@ -965,3 +976,11 @@ Any test that waits for a hook to fire must bound its own wait and fail on timeo
   Field count is now twelve plus a file version, grouped in the record-format section by the question each group answers. That is a lot; the grouping is the argument, and every field traces to a finding.
 
   Still not verified: nothing implemented. The three new blockers were reproduced as *current* behaviour; the specified replacements were not, because they do not exist yet.
+
+- 2026-08-03: B5 completed against the frozen findings document. Revision 3 had specified uniqueness at =add=, ambiguity refusal at resolve, and ids-only for destructive verbs, but had missed the *resolve-then-act window* and had characterised the resolvers loosely. Re-read at =142d5e66=:
+  - =UnregisterHookRequest= carries =id= and nothing else, so *the wire protocol has no name-addressed operation at all*, and the CLI's name form is a client-side =listHooks= → scan → *reconnect* → =removeHook(id)=. Resolve-then-act, with the table mutable between the two connections.
+  - =HookTable.removeByName= and =findIdByName= have *zero call sites in the entire tree, including tests*. Revision 3 called them one of "three independent layers"; they are in fact dead code that looks like the right primitive, which is worse, because an implementer wiring four new verbs to them would be using untested first-match helpers.
+
+  Consequently name resolution is now specified to happen *server-side, in the same critical section as the mutation* — which closes the ambiguity and the window together and costs nothing, since every one of these verbs already needs a round trip. Ambiguity and duplicate-name reuse =ErrorCode.conflict= (409), already in the enum. The two dead helpers must be wired and tested or deleted in the same change. Criteria 28f and 28g added; =hook rm='s own client-side window is named as out of scope but not as a pattern to copy.
+
+  With that, every finding in the frozen review — 5 blockers, 11 major, 12 minor, 4 nit — is either fixed at the claim or answered with an argument. Nothing in the review is outstanding.
