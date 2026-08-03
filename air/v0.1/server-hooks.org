@@ -82,6 +82,12 @@ The hook daemon runs in the same process as the store (a separate thread), shari
 ** Registration
 
 #+begin_src bash
+# NOTE [2026-08-03]: this block is illustrative and no longer matches the shipped CLI.
+#   - `hook list` has a NAME column and prints to *stderr*, not stdout:
+#     `ever hook list 2>/dev/null | wc -l` returns 0.
+#   - `hook list --json` does not exist.
+#   Re-checked at 142d5e66, after the zig-cli-kit migration.
+
 # Register a hook (persisted immediately)
 ever hook add agent.build.complete -- ./deploy.sh
 # Output: Hook #1 registered: agent.build.complete → ./deploy.sh
@@ -123,13 +129,15 @@ Stored in =<data-dir>/hooks.json=:
 
 Written atomically (write to temp, rename) on every hook add/remove/cursor update.
 
+*[Amended 2026-08-03: still accurate, and load-bearing.* =HookTable.updateCursor= (=src/store/hooks.zig:239=) serialises the *entire* hook table and does a write-plus-rename on *every* cursor advance, with no "unchanged" guard. Today a never-matching hook never advances and therefore never writes; any change that advances cursors on scan must batch these writes or it turns a CPU defect into an I/O one. See P3 in [[./hook-scan-cursor-and-lag.org]].*]*
+
 ** Execution Model
 
 The hook daemon:
 1. On startup: read =hooks.json=, start watching from each hook's cursor
-2. Poll the shared log for new events (using =TopicManager.fetch= / =fetchPattern=)
+2. Poll the shared log for new events (using =TopicManager.fetch= / =fetchPattern=) *[Superseded 2026-04-28 / re-checked 2026-08-03: prefix and wildcard hooks use =fetchPatternByOffset=, not =fetchPattern=. Only exact-topic hooks use =fetch=. See B1 in [[./hook-registration-cursor.org]].]*
 3. For each new event matching a hook's pattern: fork/exec the command
-4. On command completion: update cursor in =hooks.json=
+4. On command completion: update cursor in =hooks.json= *[Superseded: the cursor advances on* spawn*, not on completion — see "Cursor Advancement Strategy" in [[./hook-execution.org]]. And it advances* only *on dispatch: a scan that matches nothing leaves it untouched, which is the defect in [[./hook-scan-cursor-and-lag.org]].]*
 5. Sequential per hook (same as =ever on=)
 6. On command failure: log to stderr, advance cursor (don't retry)
 
@@ -172,7 +180,7 @@ Both coexist — =ever on= for quick ad-hoc triggers, =ever hook add= for persis
 
 - *PostgreSQL trigger pitfall*: Triggers running in the database transaction. Ever's daemon runs AFTER events are committed to the log, never during. A slow hook can't block event publishing.
 - *Jenkins config drift*: Hooks stored in XML that nobody audits. =ever hook list= makes all hooks visible and =ever hook rm= makes cleanup explicit.
-- *Lambda parallel explosion*: Keep sequential execution per hook as default. Each hook has its own cursor and runs independently of other hooks.
+- *Lambda parallel explosion*: Keep sequential execution per hook as default. Each hook has its own cursor and runs independently of other hooks. *[Superseded 2026-08-03: hooks are* not *independent.* =pollAndExecute= (=src/store/hooks.zig:830=) walks every hook sequentially on one daemon thread, and each prefix/wildcard scan holds the global =TopicManager= mutex — a spin lock — for its whole duration. One hook that is far behind therefore delays every *other* hook's dispatch and stalls *publishers*. Measured at =142d5e66=: publish round-trip 2 ms idle vs 21 ms with a saturated hook daemon, the penalty scaling with the single largest hook's scan. Per-hook cursors are independent; per-hook *execution* is not. See [[./hook-scan-cursor-and-lag.org]].*]*
 
 * Implementation Complexity
 
@@ -194,3 +202,12 @@ Both coexist — =ever on= for quick ad-hoc triggers, =ever hook add= for persis
 - Extended =src/main.zig=: =ever hook add/list/rm= CLI commands, hook daemon startup in =ever store start=
 - Updated =src/root.zig=: exported hooks module
 - All tests pass, end-to-end verified
+
+** 2026-08-03 — Claims superseded
+Marked inline by the =speccursor= worker while drafting [[./hook-scan-cursor-and-lag.org]] (spec only — no code change). Re-verified at =142d5e66= ("Migrate CLI to zig-cli-kit"):
+- *Execution Model step 2* — prefix/wildcard hooks use =fetchPatternByOffset=, not =fetchPattern=.
+- *Execution Model step 4* — the cursor advances on *spawn*, not on completion, and only on dispatch: a scan that matches nothing leaves it untouched.
+- *What to avoid → Lambda parallel explosion* — "each hook ... runs independently of other hooks" is false. One daemon thread walks all hooks sequentially and each pattern scan holds the global =TopicManager= spin lock, so one lagging hook delays every other hook and stalls publishers (measured: publish 2 ms idle → 21 ms under a saturated daemon).
+- *Registration example block* — =hook list= gained a NAME column and writes to stderr, and has no =--json=.
+- *Hook Table* — the "written atomically on every cursor update" line is still true and was annotated rather than superseded, because it constrains any fix that advances cursors more often.
+State left =complete=: the architecture this document specified did ship.

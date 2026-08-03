@@ -178,8 +178,12 @@ Format: =<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log=
 
 The sequence number =<seq>= is a per-daemon-instance counter to avoid collisions when multiple events trigger the same hook within the same second.
 
+*[Superseded 2026-08-03: this naming scheme did not ship, and the anti-collision counter it exists for did not ship with it.* The shipped format is =<data-dir>/hooks/<hook-id>-<epoch-ms>.log= (=src/store/hooks.zig:952=), opened =O_CREAT | O_TRUNC= (=:962=). There is no sequence number, so two executions of the same hook that start within the same *millisecond* resolve to the same path and the second truncates the first. Measured at =142d5e66= on a private store: 50 events published in a burst to one hook produced *50 executions and 28 log files* — 22 executions (44%) lost their output. Because =handleHookLogs= (=src/net/server.zig:498=) picks the newest file matching =<id>-=, the surviving file shows the *later* offset, which reads as "only one event was dispatched". It was not: dispatch is not lossy. See F1 in [[./hook-scan-cursor-and-lag.org]]. The log content header also differs from the block below — the shipped header is a multi-line banner block, not the =#=-prefixed form specified here.*]*
+
 *** Rotation
 Keep the last N log files per hook (configurable, default 10). On each new spawn, if a hook already has N log files, delete the oldest. Rotation is best-effort — if deletion fails, continue anyway.
+
+*[Superseded 2026-08-03: rotation did not ship.* There is no unlink of hook log files anywhere in =src/store/hooks.zig= at =142d5e66= — the only =unlink= calls are on =hooks.json= temp files. Nothing prunes =data/hooks/=. On the live store on 2026-07-27 this directory held *105,272 files / 476 MB*, 99.6% of a 478 MB store whose event log was 1.7 MB. Retention is a separate round-4 item; this paragraph is a plan, not a description of the code.*]*
 
 *** Content Format
 Each log file begins with a metadata header:
@@ -251,6 +255,8 @@ Two new message types for =hook ps= and =hook logs=:
 
 The =hook logs= command returns metadata about available log files. To actually read log content, add a =--tail N= flag to =ever hook logs <id>= which reads the last N lines from the most recent log file.
 
+*[Superseded 2026-08-03: =--tail= did not ship.* =ever hook logs= takes one required =id= argument and no flags (=src/main.zig=, hook subcommand table), and the server returns the content of the single newest matching log file. Re-checked after the zig-cli-kit migration at =142d5e66=.*]*
+
 ** CLI Commands
 
 *** =ever hook ps=
@@ -318,7 +324,11 @@ One-shot hooks (=--once=) currently call =hook_table.remove(hook.id)= immediatel
 
 Edge case: if a one-shot hook's child is still running when new events arrive for the same pattern, those events should be skipped (the hook is conceptually "consumed"). Track this by checking the process table for an active child with the same =hook_id= before spawning.
 
+*[Superseded 2026-08-03: no per-=hook_id= check ships.* =executeHookCommand= tests only the global =activeCount() >= MAX_CONCURRENT_HOOKS= and returns =error.ConcurrentLimitReached=; the process table is never consulted per hook. A =--once= hook is instead removed inline in =processHook= immediately after the first spawn, so the "still running" window cannot arise for =--once=. This matters because the absence of a per-hook guard is what rules out "a poll cycle dispatches only one matching event" — see F1 in [[./hook-scan-cursor-and-lag.org]].*]*
+
 ** Cursor Advancement Strategy
+
+*[Amended 2026-08-03: this section covers advancement on* spawn *and on the concurrent-limit path, both of which shipped and are still correct. It does not cover the case where the fetch returns* no events at all *— there the cursor is not written either, which is the pathology specified in [[./hook-scan-cursor-and-lag.org]]. Read the two together.*]*
 
 Currently: cursor is advanced after =waitpid= returns (synchronous, cursor tracks "last completed" offset).
 
@@ -377,3 +387,4 @@ The process table (=ArrayList(ChildProcess)=) is only accessed from the daemon t
 * History
 - 2026-04-08: Draft created. Identified four problems with current synchronous fork+exec+waitpid model in HookDaemon.
 - 2026-04-15: Marked complete. Background hook execution with PID tracking, timeout enforcement, and graceful shutdown implemented.
+- 2026-08-03: Superseded in part by [[./hook-scan-cursor-and-lag.org]] (=speccursor= worker, spec only — no code change). Four claims marked inline, all re-verified at =142d5e66=: (1) *Log File Management → File Naming* — the =<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log= scheme and its anti-collision sequence number did not ship; the shipped =<hook-id>-<epoch-ms>.log= with =O_TRUNC= destroys the earlier log when two executions of one hook start in the same millisecond (measured: 50 executions → 28 files); (2) *Rotation* did not ship — nothing prunes =data/hooks/=; (3) =ever hook logs --tail N= did not ship; (4) the per-=hook_id= active-child check in *Interaction with One-Shot Hooks* did not ship. A note was also added to *Cursor Advancement Strategy* pointing at the no-events case it does not cover. State left =complete=: the background-execution model this document specified did ship and works; the marked items are plan text that was never implemented and would otherwise read as description.
