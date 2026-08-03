@@ -178,6 +178,8 @@ The cost: one more thread in the store process. But the store already spawns thr
 | Overhead        | TCP client polling           | Direct log access (in-process)  |
 | Use case        | Ad-hoc, development          | Production, long-lived hooks    |
 
+[Amended: 2026-08-03, =v0.1/hook-test-harness.org=] The "Execution env" row is incomplete in the way that matters most. Verified live at =txpyxrnm 142d5e66=: a hook child runs with the *store process's entire environment*, captured when the store started (=HookDaemon.envp=), and with the *hook's recorded cwd* — not the store's cwd, and nothing at all from the client that published the event. Publishing with =SPECTEST_CLIENT_MARKER=… ever pub …= left the marker absent in the child, and the child's =PATH= was the store's. Read the row as "store's env + hook's cwd". Anything that claims to reproduce a hook delivery must therefore run *inside the store process*; a client-side fork reproduces the wrong environment and reports a false pass.
+
 Both coexist — =ever on= for quick ad-hoc triggers, =ever hook add= for persistent ones.
 
 ** What to avoid
@@ -221,3 +223,6 @@ Marked inline by =ever4-specgc= while drafting =./hook-gc-and-lease.org=, verifi
 Revised twice more the same day after spec review. The second revision corrected the step-6 marker's premise: a non-zero exit is a routing signal at least as often as a health signal for prefix hooks, so =./hook-gc-and-lease.org= no longer counts it toward quarantine at all. The first revision fixed the following.
 
 The step-6 marker had summarised the replacement rule as "a hook whose =cwd= or literal absolute command path no longer exists is moved to =disabled= and is not dispatched at all", which drops *every* safety precondition the rule has — the failure threshold, the =ENOENT=-only restriction, the =last_exit_status == 127= conjunction, and (after the review) the operator's =--yes=. That is the unsound rule =./hook-gc-and-lease.org= spends a section rejecting, stated inline in a =complete= document that a reader looking up "how do hooks behave on failure" lands on first — worse than no marker, because it borrows the credibility of a correction. The marker is now a pointer that names what it omits.
+
+** 2026-08-03 — "Execution env" row amended
+Amended inline while specifying =v0.1/hook-test-harness.org=, verified live at base =txpyxrnm 142d5e66=. A hook child runs with the *store process's* environment (=HookDaemon.envp=, captured at store start) and the *hook's* cwd; nothing from the publishing client reaches it. The table's "Store's cwd + hook's cwd" understates this, and the understatement is load-bearing: it is why a hook delivery cannot be faithfully reproduced by forking from the CLI.

@@ -235,6 +235,8 @@ Two new message types for =hook ps= and =hook logs=:
 | 0x0F | hook_logs     | Request   | ={"hook_id": N, "limit": M}=          |
 | 0x8F | hook_logs_ok  | Response  | ={"entries": [LogEntry, ...]}=         |
 
+[Superseded: 2026-08-03, =v0.1/hook-test-harness.org=] The two =hook_logs= bodies above never shipped in this shape. Verified live at =txpyxrnm 142d5e66=: =protocol.HookLogsRequest= is ={"hook_id": N, "max_bytes": u32 = 65536}= and =HookLogsResponse= is ={"hook_id", "log_path", "content"}= — a single file's *content*, not a list of =LogEntry= metadata. Note that =max_bytes= is a wire capability the CLI does not expose.
+
 *** ChildInfo
 #+begin_src json
 {
@@ -262,6 +264,8 @@ Two new message types for =hook ps= and =hook logs=:
 The =hook logs= command returns metadata about available log files. To actually read log content, add a =--tail N= flag to =ever hook logs <id>= which reads the last N lines from the most recent log file.
 
 *[Superseded 2026-08-03: =--tail= did not ship.* =ever hook logs= takes one required =id= argument and no flags (=src/main.zig=, hook subcommand table), and the server returns the content of the single newest matching log file. Re-checked after the zig-cli-kit migration at =142d5e66=.*]*
+
+[Superseded: 2026-08-03, =v0.1/hook-test-harness.org=] Not what shipped, and the difference is load-bearing for anything that writes into =<data-dir>/hooks/=. Verified live: =ever hook logs <id>= prints the *content* of the single newest file whose name starts =<id>-= and ends =.log= (=src/net/server.zig=, =handleHookLogs=). There is no =--tail=, no =--limit= (=ever hook logs 1 --limit 3= → =error: unknown flag '--limit'=), and no metadata listing at all. The example output below (=EXECUTION / EXIT / DURATION / SIZE= table, =--tail 20=) does not exist.
 
 ** CLI Commands
 
@@ -324,6 +328,8 @@ Parse duration strings: =30s=, =5m=, =1h=. Stored as milliseconds in =hooks.json
 
 One-shot hooks (=--once=) currently call =hook_table.remove(hook.id)= immediately after execution in =processHook=. With background execution, the removal must be deferred to =handleChildExit= (when the child is reaped):
 
+[Superseded: 2026-08-03, =v0.1/hook-test-harness.org=] The deferral was not implemented. Read from source at =txpyxrnm 142d5e66=: =processHook= still calls =hook_table.remove(hook.id)= immediately after =executeHookCommand= returns — i.e. after *spawn*, not after reap — and =reapChildren= does no =once= handling. This is relied upon: cursor advance and one-shot removal both live in =processHook=, one level above =executeHookCommand=, which is what makes a delivery path that cannot mutate hook state possible at all.
+
 1. =processHook= spawns the child and marks the hook as "pending removal" (or simply records =once= in =ChildProcess=)
 2. =processHook= advances the cursor (or the cursor becomes irrelevant since the hook is being removed)
 3. When =reapChildren= collects the child, if =once=, call =hook_table.remove(hook_id)=
@@ -375,6 +381,8 @@ On daemon start, create =data/hooks/= directory if it doesn't exist. Use =mkdir=
 
 The process table (=ArrayList(ChildProcess)=) is only accessed from the daemon thread — no mutex needed. The =HookTable= is shared and already has its own mutex for =updateCursor= / =remove= / =snapshot= calls.
 
+[Superseded: 2026-08-03, =v0.1/hook-test-harness.org=] False as shipped, and dangerous to act on. =ProcessTable= is a fixed =[MAX_CONCURRENT_HOOKS]?ProcessEntry= array guarded by a spin mutex (=src/store/hooks.zig=), and it *is* read from a connection thread — =handleHookPs= calls =snapshot=. It is cross-thread and it is locked. The related hazard the original section does not mention: =reapChildren= calls =waitpid(-1, &status, WNOHANG)= and discards the status of any pid not in the table, so the daemon is the only component that may safely wait on a child of the store process.
+
 * Implementation Estimate
 
 | Component                        | Estimate  | Notes                                            |
@@ -398,3 +406,4 @@ The process table (=ArrayList(ChildProcess)=) is only accessed from the daemon t
 - 2026-08-03: Superseded in part by [[./hook-scan-cursor-and-lag.org]] (=speccursor= worker, spec only — no code change). Four claims marked inline, all re-verified at =142d5e66=: (1) *Log File Management → File Naming* — the =<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log= scheme and its anti-collision sequence number did not ship; the shipped =<hook-id>-<epoch-ms>.log= with =O_TRUNC= destroys the earlier log when two executions of one hook start in the same millisecond (measured: 50 executions → 28 files); (2) *Rotation* did not ship — nothing prunes =data/hooks/=; (3) =ever hook logs --tail N= did not ship; (4) the per-=hook_id= active-child check in *Interaction with One-Shot Hooks* did not ship. A note was also added to *Cursor Advancement Strategy* pointing at the no-events case it does not cover. State left =complete=: the background-execution model this document specified did ship and works; the marked items are plan text that was never implemented and would otherwise read as description.
 - 2026-08-03: Four inline =[Superseded: …]= markers added by =ever4-specgc= while drafting =./hook-gc-and-lease.org=, all verified against =142d5e66=. Three are *corrections*, not supersessions — the per-hook =--timeout= flag and =timeout_ms= field, the =--hook-max-concurrent= flag, the =handleChildExit= function, the log-file exit footer and log rotation were all specified here and marked complete, but none of them shipped. The fourth marks the cursor-advancement strategy as partially superseded. The load-bearing one for anything that counts hook failures: =reapChildren= extracts =(status >> 8) & 0xFF=, which is 0 for a signal death, so a child killed by a signal — including by this document's own timeout path — is recorded as a success. No source changed.
 - 2026-08-03: Markers revised after spec review. Each of the three corrections now says "CORRECTION, not a supersession" *inline*, because the distinction was previously only in this History entry and a reader greps the claim, not its History. The cursor-advancement marker had asserted a per-tick =cwd= check that =./hook-gc-and-lease.org= has since resolved as per-event-after-fetch, and now states that and points at the rule rather than paraphrasing it. Separately, and *not* fixed here because it is the user's call: this document remains =#+state: complete= while specifying three features that were never implemented. Someone should decide whether that is a state change or a scope note.
+- 2026-08-03: Four claims marked =[Superseded]= inline while specifying =v0.1/hook-test-harness.org=, re-verified at base =txpyxrnm 142d5e66=: (1) the =hook_logs= wire bodies — shipped as ={hook_id, max_bytes}= / ={hook_id, log_path, content}=, not ={hook_id, limit}= / ={entries: [LogEntry]}=; (2) =hook logs= returning metadata plus a =--tail N= flag — it returns one file's content and has no =--tail= or =--limit=; (3) deferring one-shot removal to =handleChildExit= — removal still happens in =processHook= immediately after spawn; (4) "the process table is only accessed from the daemon thread — no mutex needed" — it is a mutex-guarded fixed array read cross-thread by =handleHookPs=, and =reapChildren= calls =waitpid(-1, …, WNOHANG)=, which makes the daemon the only component that may safely wait on a child of the store process.
