@@ -4,18 +4,19 @@
 
 * Summary
 
-A hook's cursor advances only when an event is *delivered*. A hook whose pattern matches nothing therefore never advances, and the daemon rescans every event between that cursor and the log head on every 500 ms poll tick, forever. The rescan costs two =pread(2)= calls and one allocation per event and is performed while holding the =TopicManager= mutex.
+A hook's cursor advances only when an event is *delivered*. A prefix/wildcard hook whose pattern matches nothing therefore never advances, and the daemon rescans every event between that cursor and the log head on every 500 ms poll tick, forever. The rescan costs two =pread(2)= calls and one allocation per event.
 
-This document specifies four things:
+This document specifies, in the order it should be implemented:
 
-1. =fetchPatternByOffset= returns the offset it scanned to, and the daemon persists that watermark when it has dispatched every event the scan returned. This converts a never-matching (or rarely-matching) hook from O(log length) per tick to O(new events).
-2. Precise rules for when advancing on a no-match scan is safe, named against the code paths that must keep their current semantics.
-3. A scan-cost column in =ever hook list= and =ever status=, so the condition is visible in one command instead of requiring =/proc= forensics.
-4. A store-side saturation warning with a pinned threshold, a pinned channel, and hysteresis.
+1. =fetchPatternByOffset= returns the offset it scanned to, and the daemon persists that watermark when it has dispatched every event the scan returned. For *prefix/wildcard* hooks this converts a never-matching (or rarely-matching) hook from O(log length) per tick to O(new events). It does nothing for exact-topic hooks — see [[#f2][F2]], which is why the ordering below puts F2 between the fix and the observability half.
+2. Precise rules for when advancing on a no-match scan is safe, discharged per-event against the loop and named against the code paths that must keep their current semantics.
+3. Containment of the =hooks.json= write amplification the change would otherwise introduce.
+4. A scan-cost column in =ever hook list= and =ever status=, replacing the =Last Offset= column whose meaning this change destroys.
+5. A store-side saturation warning with a build-independent trigger, a pinned channel, and hysteresis.
 
-It also records three findings established from source and reproduced at this base that the triage draft does not contain — one of which answers an open question the supervisor could not settle, and one of which the proposed fix does *not* address.
+It also records four findings established from source and reproduced at this base that the triage draft does not contain. One answers an open question the supervisor could not settle ([[#f1][F1]]); one is a cost class this change does *not* fix ([[#f2][F2]]); one is a pre-existing data race in the path this change touches ([[#f4][F4]]).
 
-*Scope note.* This document does not propose garbage-collecting hooks (companion item), a topic-prefix index, condvar signalling on publish, or hook-execution-log retention. See [[#non-goals][Non-Goals]] for why the ordering is defensible in measured numbers rather than by assertion.
+*Scope note.* This document does not propose garbage-collecting hooks (companion item), a topic-prefix index, condvar signalling on publish, hook-execution-log retention, or fixing =F2= or =F4=. See [[#non-goals][Non-Goals]].
 
 * Motivation
 :PROPERTIES:
@@ -42,7 +43,7 @@ The pathological hook is not only the one whose pattern will *never* match. It i
 
 ** Re-verified at this base, on a private store
 
-All observations below are from a store started by this worker on =127.0.0.1:7991= with =--data-dir /var/tmp/speccursor-probe/data=. The live store was never touched.
+All observations below are from stores started by this worker on =127.0.0.1:7991= with =--data-dir /var/tmp/speccursor-probe/data=. The live store was never addressed and no hook on it was created, modified or removed.
 
 *** The cursor does not advance on a no-match scan
 
@@ -54,11 +55,13 @@ Registered =probe.dead.= (a prefix pattern with no matching topic) at tip; its c
 log head = 252
 #+end_example
 
-Hook #2 rescans 198 events every 500 ms and will rescan the whole log forever. Confirmed.
+Hook #2 rescans 198 events every 500 ms and will rescan the whole log forever. Confirmed. Independently reproduced by review on a separate store: cursor frozen at 203 while the head reached 403.
 
 *** Scan cost and the poll budget, measured
 
-Method: =N= synthetic hooks with never-matching prefix patterns at cursor 0, log of 5,152 events, so total scan lag = =N × 5152=. Read-syscall rate taken as the *minimum* of five 3-second windows from =/proc/PID/io= (=syscr=), per the loaded-host rule. Build: =zig build -Doptimize=ReleaseFast= of this base. Host: 32 cores, load average 3.70, 2026-08-03.
+Method: =N= synthetic hooks with never-matching prefix patterns at cursor 0, log of 5,152 events, so total scan lag = =N × 5152=. Read-syscall rate taken as the *minimum of five 3-second windows* from =/proc/PID/io= (=syscr=). Build: =zig build -Doptimize=ReleaseFast= of this base. Host: 32 cores, load average 3.70, 2026-08-03.
+
+*Method deviation, stated because it is a deviation.* =common.md= requires the min over ≥20 interleaved runs. This table is five windows per condition, not interleaved between conditions. It was not re-run at 20 because review reproduced it independently on a different store, a different build and a different day and the two agree to within 0.5% (=285,300= vs =285,403= syscr/s at N=25; =433,135= vs =431,482= at N=50; Debug plateau =66,000= vs =65,560= events/s). Independent reproduction is stronger evidence than more runs of the same harness. The one table in this document that was *not* independently reproducible as written is the publish-latency table, and it has been re-taken to the rule — see below.
 
 Derivation: 2 =pread= per event ⇒ cycles/s = syscr_per_sec / (2 × lag); period = 1/cycles; scan time = period − 500 ms sleep.
 
@@ -72,34 +75,45 @@ Derivation: 2 =pread= per event ⇒ cycles/s = syscr_per_sec / (2 × lag); perio
 |   200 |      1,030,400 |            721,496 |     2,856 ms |  2,356 ms |  437,298 |
 |   400 |      2,060,800 |            722,374 |     5,706 ms |  5,206 ms |  395,879 |
 
-The low-=N= rows are not reliable rate estimates — the derivation subtracts a fixed 500 ms that has jitter, and per-cycle fixed costs (the hook snapshot deep-copies every hook's strings each tick) dominate. The asymptote is the meaningful figure: *≈400,000 events/s scanned*.
+The low-=N= rows are not reliable rate estimates — the derivation subtracts a fixed 500 ms that has jitter, and per-cycle fixed costs (the hook snapshot deep-copies every hook's strings each tick) dominate. The asymptote is the meaningful figure: *≈400,000 events/s scanned*. Review measured to N=50 only (354,400 events/s, still rising); the N=100–400 asymptote is this document's measurement alone.
 
 At =N=400= the process showed =utime=112= / =stime=1660= ticks — *93.7% of CPU time in the kernel*, against the incident's measured 93%. One thread permanently in state =R=, three in =S=, against the incident's single =R= thread. The mechanism reproduces.
 
-The 500 ms budget is therefore exhausted at ≈200,000 events of total scan lag on this hardware; the measured crossing sits between 128,800 (403 ms) and 257,600 (689 ms).
+The 500 ms budget is therefore exhausted at ≈200,000 events of total scan lag on this hardware; the measured crossing sits between 128,800 (403 ms) and 257,600 (689 ms). Review's independent crossing: between 137,850 (466 ms) and 275,700 (778 ms).
 
 *** Build mode changes the absolute number by 6×
 
-The same table taken against a *Debug* build (what =zig build= produces by default) plateaus at ≈155,000 syscr/s and ≈66,000 events/s — six times slower. This is why the threshold in [[#p5][P5]] is primarily expressed as *measured cycle time*, not as an event count: an absolute count calibrated on one build and one host is wrong on another. It is also a trap for whoever implements the acceptance criteria — a Debug-build probe will see a saturated daemon at one sixth the lag.
+The same table taken against a *Debug* build (what =zig build= produces by default) plateaus at ≈155,000 syscr/s and ≈66,000 events/s — six times slower, and the 500 ms budget is exhausted around *33,000* events of lag rather than 200,000 (review's measurement: 55,020 lag → 910 ms scan; 137,550 lag → 2,098 ms). This is why [[#p5][P5]] expresses *both* of its triggers in measured time rather than in an event count: a constant calibrated on one build is wrong by 6× on the other. It is also a trap for whoever implements the acceptance criteria — a Debug-build probe will see a saturated daemon at one sixth the lag.
 
-*** Publish latency degrades to one hook's scan time, not the total
+*** Publish latency: the penalty appears only when the daemon is saturated, and its size is one hook's scan
 
-=fetchPatternByOffset= holds the =TopicManager= mutex for the whole scan of *one* hook (=src/store/topic.zig:316-317=), and =TopicManager.lock= is a *spin* lock (=while (!self.mutex.tryLock()) std.atomic.spinLoopHint();=, =src/store/topic.zig:92=), so a blocked publisher burns a core rather than sleeping. =publish= takes that mutex in phases 1 and 3 (=src/store/topic.zig:240=).
+=fetchPatternByOffset= holds the =TopicManager= mutex for the whole scan of *one* hook (=src/store/topic.zig:314-315=), and =TopicManager.lock= is a *spin* lock (=while (!self.mutex.tryLock()) std.atomic.spinLoopHint();=, =src/store/topic.zig:92=), so a blocked publisher burns a core rather than sleeping. =publish= takes that mutex in phases 1 and 3 (=src/store/topic.zig:240-256=) — but *not* across =log.append=; see [[#b1-retraction][the retraction in P1]] and [[#f4][F4]].
 
-Measured, ten sequential =ever pub= round-trips, wall clock:
+Method: =ever pub= round-trips timed with =date +%s%N=, ReleaseFast, log of 5,000 events, three alternating blocks of 20 per condition (60 samples each), hooks added and removed live between blocks so the conditions are genuinely interleaved.
 
-| condition                                        | latency (ms)                         |
-|--------------------------------------------------+--------------------------------------|
-| 0 hooks (baseline)                               | 6 2 3 2 3 2 3 2 2 2                  |
-| 400 dead hooks, total lag 2.06M, cycle 5.2 s     | 19 32 21 21 21 21 21 20 20 31        |
+| condition                              |  n | min | median |  p90 |  max |
+|----------------------------------------+----+-----+--------+------+------|
+| 0 hooks                                | 60 | 1.9 |    2.3 |  3.3 |  6.8 |
+| 1 dead hook, lag 5,000 (daemon sleeps) | 60 | 2.0 |    2.3 |  3.0 |  6.1 |
+| 25 dead hooks, total lag 125,000       | 60 | 2.0 |   15.2 | 23.7 | 27.7 |
 
-The penalty is ≈ the scan time of a *single* hook (5,152 events ≈ 13 ms here), not of the whole cycle, because the lock is released between hooks. Extrapolating linearly to the incident's per-hook lag of 111,031 events gives ≈280 ms of added publish latency per event on a saturated store. That is a 100× degradation of the store's primary operation and it is not mentioned in the incident or the draft. It is *not* a reason to widen this change — the cursor fix removes it along with the CPU burn — but it belongs in the motivation, because "the store looked healthy from every CLI view" understates what was actually degraded.
+All figures in ms.
+
+Three things this shows, and the third is why the earlier revision of this section was wrong:
+
+- *The delta of medians is 12.9 ms* against a predicted single-hook scan time of 5,000 ÷ 400,000 = 12.5 ms. The penalty is one hook's scan, not the cycle's.
+- *The delta of minima is 0.1 ms.* A publish that arrives while the lock is free pays nothing. This is a lock-wait, not a throughput cost, which is what makes it invisible in aggregate throughput measurements.
+- *One dead hook with the same per-hook lag costs nothing measurable* (median 2.3 ms, identical to idle), because the daemon still reaches its 500 ms sleep and the ~12.5 ms lock window is 2.4% of wall time. The penalty is a property of a *saturated* daemon, not of any single lagging hook.
+
+*[Superseded 2026-08-03 (review m2): an earlier revision reported a single unreplicated pass of ten round-trips, extrapolated it linearly by 21.5× to "≈280 ms of added publish latency per event", and called it "a 100× degradation of the store's primary operation".* The mechanism was right and review confirmed it independently (17 ms → ~152 ms with 25 dead hooks on Debug), but the number was a single-pass measurement extrapolated past its evidence, and the ratio was inflated by using a CLI round-trip — which includes process spawn and connect — as the denominator. The table above replaces it.*]*
+
+For orientation only, and *explicitly an unverified projection*: the scan table is linear in lag from 128,800 to 2,060,800, so a hook with the incident's per-hook lag of 111,031 events would hold the lock for ≈280 ms. No measurement in this document exceeds a single-hook lag of 5,152, and that projection has not been taken.
 
 ** What the draft asserts that this document does not inherit
 
-- /The live-store measurements./ "111,031 events, 28 prefix/wildcard hooks, 2,004,113 events rescanned per poll cycle, total scan lag 2,004,113" describe *one store on 2026-07-27*, and that store has since been pruned (42 hooks → 15, residual lag 0). They are supporting evidence with a date, not a property of the code. The property of the code is the mechanism in [[#mechanism][The mechanism]] above, which is re-established here and reproduces at any store size.
-- /"=ever hook list= (and its JSON form)"./ *[Superseded 2026-08-03: there is no JSON form.* =ever hook list --json= at this base returns =error: unknown flag '--json'=. =hook list= has no flags at all — see =src/main.zig:1379=. A =--json= surface for list commands is being drafted separately as =air/v0.1/cli-json-list-output.org= in the default workspace; this document must not duplicate it.*]*
-- /That =hook list= output is greppable./ It is not. =handleHookList= prints via =std.debug.print=, which writes to *stderr*; =ever hook list 2>/dev/null | wc -l= returns =0= at this base. The incident recorded this and it is still true after the zig-cli-kit migration. Any acceptance criterion phrased as "=ever hook list= shows a lag column" must be checked on stderr, or the CLI-wide stdout bug must be fixed first (not this document's job).
+- /The live-store measurements./ "111,031 events, 28 prefix/wildcard hooks, 2,004,113 events rescanned per poll cycle" describe *one store on 2026-07-27*, and that store has since been pruned (42 hooks → 15, residual lag 0). They are supporting evidence with a date, not a property of the code. The property of the code is the mechanism in [[#mechanism][The mechanism]] above, which reproduces at any store size.
+- /"=ever hook list= (and its JSON form)"./ *[Superseded 2026-08-03: there is no JSON form of =hook list=.* =ever hook list --json= at this base returns =error: unknown flag '--json'=; =hook list= has no flags at all (=src/main.zig:1379=). Note that =ever status --json= *does* exist (=src/main.zig:1420=) — the two surfaces differ, and [[#p4][P4]] says what each must carry.*]*
+- /That =hook list= output is greppable./ It is not. =handleHookList= prints via =std.debug.print=, which writes to *stderr*; =ever hook list 2>/dev/null | wc -l= returns =0= at this base. Any acceptance criterion phrased as "=ever hook list= shows a column" must be checked on stderr.
 
 * Goals
 :PROPERTIES:
@@ -107,10 +121,10 @@ The penalty is ≈ the scan time of a *single* hook (5,152 events ≈ 13 ms here
 :END:
 
 - A prefix/wildcard hook that scans to offset =N= without a match persists =N=, so its per-tick cost becomes O(events published since the last tick) rather than O(log length).
-- The cursor never advances past an event that matched the hook's pattern and was not dispatched. This is stated as an invariant and discharged against the code, not asserted.
+- The cursor never advances past an event that matched the hook's pattern and was not dispatched. Stated as an invariant and discharged *per event against the loop*, without depending on a locking claim.
 - =--from-beginning=, =--from N= and default (tip) arming keep exactly their current semantics.
-- The condition is visible without =/proc=: a scan-cost figure per hook in =ever hook list=, a total in =ever status=.
-- A saturated daemon announces itself once, on a named channel, at a pinned threshold, with hysteresis — not once per tick.
+- The condition is visible without =/proc=, and the diagnostic signal the fix destroys (a frozen =Last Offset=) is replaced rather than merely removed.
+- A saturated daemon announces itself once, on a named channel, in a unit that does not need recalibrating per build, and names the hook to prune.
 - A regression test that *fails* against pre-fix source within a bounded wall-clock budget, reporting the observed cursor rather than hanging.
 
 * Non-Goals
@@ -120,14 +134,36 @@ The penalty is ≈ the scan time of a *single* hook (5,152 events ≈ 13 ms here
 
 - *Delivery semantics.* Every matching event is still delivered exactly once from where the hook was armed. Only the no-match case changes.
 - *Garbage-collecting dead hooks.* Companion work. This document makes a dead hook cheap; GC removes it. Either alone leaves the other's failure mode live.
-- *A topic-prefix index.* Worth doing, and *not* needed to close this incident — with the fix, per-tick cost is =H × E= where =H= is hook count and =E= is events published per 500 ms. The incident's store had =H=42= and roughly 1 event/s, i.e. ≈21 events scanned per cycle against 2,004,113. At the measured 400,000 events/s the index only starts to matter around =H × E ≳ 100,000= per cycle — e.g. 100 hooks on a store publishing 2,000 events/s. The draft's ordering (this item first, index later) survives the arithmetic.
+- *A topic-prefix index.* Worth doing, and *not* needed to close this incident — post-fix, the *prefix/wildcard* per-tick cost is =H_p × E= where =H_p= is the count of prefix/wildcard hooks and =E= is events published per 500 ms. The incident's store had 28 prefix/wildcard hooks and roughly 1 event/s, i.e. ≈14 events scanned per cycle against 2,004,113. At the measured 400,000 events/s an index only starts to pay around =H_p × E ≳ 100,000= per cycle. This arithmetic is *only* about prefix/wildcard hooks; the incident store's other 14 hooks were exact-topic and are governed by [[#f2][F2]], not by this term. The draft's ordering (this item first, index later) survives.
 - *Condvar signalling on publish.* Same argument; it removes the fixed 500 ms latency floor, not the pathology.
-- *Hook-execution-log retention.* Separate item. [[#f1][F1]] below touches the same directory but is a correctness bug in the log *filename*, not a retention policy.
-- *Fixing the exact-topic rescan* ([[#f2][F2]]) or the CLI-writes-to-stderr bug. Both are recorded here with acceptance criteria so they are not lost, and both need a decision before anyone widens this change.
+- *Hook-execution-log retention* and the log-filename collision ([[#f1][F1]]).
+- *The exact-topic rescan* ([[#f2][F2]]) — its own document, ordered *between* this document's stages; see [[#staging][Implementation order]].
+- *The =readBatch=/=append= data race* ([[#f4][F4]]) — pre-existing, recorded here, fixed elsewhere.
+- *The CLI-writes-to-stderr bug*, and *the =--from= help-text bug*: =src/main.zig:1375= describes =--from= as "Start at an explicit *topic-local* offset (replay from there)", which is wrong for prefix/wildcard hooks, whose cursor is a global log offset (=tipForPatternLocked=, =src/store/topic.zig:127-137=). This document records the bug so the =[Amended]= marker in [[./hook-registration-cursor.org]] has somewhere to point, and does not claim the fix. It is one string literal and belongs with whoever next touches that flag.
+
+* Implementation order
+:PROPERTIES:
+:CUSTOM_ID: staging
+:END:
+
+This document is one document but three stages, and they must land in this order.
+
+| stage | content | why here |
+|-------+---------+----------|
+| 1 | [[#p1][P1]] + [[#p2][P2]] + [[#p3][P3]] | The incident closer. Smallest change, largest measured effect, and self-contained: two call sites and one out-parameter. |
+| 2 | [[#f2][F2]] — its own document, not this one | It changes =TopicManager.fetch=, which also serves =src/net/server.zig:205= (client fetch) and =src/net/http.zig:299= (HTTP), so its correctness argument is about marker-skip index arithmetic and its blast radius is every client, not the hook daemon. |
+| 3 | [[#p4][P4]] + [[#p5][P5]] | The observability half. |
+
+*Why stage 2 comes before stage 3, which is a change from this document's first revision.* An exact-topic hook contributes its *whole topic size* to the store's scan cost at *zero* lag and stays there forever. Twenty such hooks on 5,000-event topics — an ordinary orchestration store — total 100,000 events of scan cost with nothing to remediate. While that is true, [[#p5][P5]]'s threshold cannot be justified coherently: it would fire permanently on a healthy store, and an alarm that is always on is an alarm operators learn to ignore. Stage 2 makes SCAN and lag nearly the same quantity again for every hook shape, which is what makes stage 3's threshold defensible. It also means stage 3 lands against a store whose expected SCAN total is ≈0, which is the right baseline for a new observability surface.
+
+Stage 1 does *not* depend on stage 3, and should not wait for it. It does, however, destroy the only symptom the pathology currently has — see [[#m1-note][the note on =Last Offset=]] — so the gap between stages 1 and 3 is a period in which the prefix-hook pathology is both fixed and invisible. That is acceptable because it is fixed; it would not be acceptable in the other order.
 
 * Proposal
 
 ** P1 — =fetchPatternByOffset= returns its scan watermark
+:PROPERTIES:
+:CUSTOM_ID: p1
+:END:
 
 =src/store/topic.zig:304=. The function already maintains the exact value needed, in its local =cursor=. Return it.
 
@@ -142,47 +178,86 @@ pub fn fetchPatternByOffset(
 ) ![]Event
 #+end_src
 
+Two requirements on the out-parameter, both load-bearing:
+
+1. =scan_end.* = start_offset= is the *first statement of the function*, before any fallible operation. The function returns =![]Event=; on an error return the caller would otherwise read whatever it left in the variable, and the natural =var scan_end: u64 = undefined;= at the call site combined with [[#p2][P2]]'s =max(cursor, scan_end)= would advance the cursor arbitrarily far forward. With this rule, =scan_end= on an error return is =start_offset= and the =max= is a no-op.
+2. =scan_end= is *the loop's =cursor= variable and nothing else*. It must never be assigned from =log.nextOffset()=, from a batch boundary, or from the =next= captured at entry. This is the whole safety argument; see below.
+
 An out-parameter is preferred over returning a struct because there are only two call sites (=src/store/hooks.zig:856= and =src/tests/integration.zig:556=) and the =[]Event= return keeps its existing ownership contract, which the surrounding =defer= blocks depend on. If a reviewer prefers a =PatternScan{ events, scan_end }= struct, the substance is unchanged.
 
-*The invariant the implementation must preserve*, discharged against the loop as it stands:
+*** The invariant, and its discharge
 
 #+begin_quote
 On return, every offset in =[start_offset, scan_end)= that matches =pattern= is present in the returned slice.
 #+end_quote
 
-- Non-matching event → =cursor = evt.offset + 1=, event freed. Nothing matching is skipped.
-- Marker/tombstone (=value.len == 0=) → same. Markers are not user-visible publishes and are correctly excluded from delivery today.
-- Match, buffer not full → =cursor = evt.offset + 1= *and* the event is appended. Delivered.
-- Match, buffer full → the event and the remaining batch are freed and =cursor= is *not* advanced. =scan_end= therefore stops at the last delivered offset + 1, exactly as the current code's per-event advance does. No change in behaviour for a full batch.
-- =readBatch= returns empty (head reached, or a segment lookup fails) → loop breaks with =cursor= at the last consumed offset + 1. Correct in both cases.
-- =start_offset > head= (cursor beyond the head after an out-of-range =--from N=) → the loop body never runs and =scan_end == start_offset=. A no-op, not a rewind.
+The discharge is *per event* and depends on no lock:
 
-The head is read once at entry (=const next = self.log.nextOffset()=) *under the same mutex =publish= takes*, so no event can be appended between the head read and the end of the scan. =scan_end= can never be ahead of an event that a concurrent publisher has already committed.
+- =cursor= is initialised to =start_offset= and is only ever assigned =evt.offset + 1= for an event the loop has just decoded and classified. There is no other assignment and no skip.
+- The classifications are exhaustive. Marker/tombstone (=value.len == 0=) → advance; markers are not user-visible publishes and are correctly excluded from delivery today. Non-matching topic → advance. Match with room in the buffer → advance *and* append. Match with no room → do not advance past it, break.
+- Therefore every offset strictly below =cursor= was individually decoded and either delivered or proven not to match. Nothing matching can lie in the interval, whatever a concurrent publisher does.
+
+Two consequences worth stating because both look like bugs and are not:
+
+- *=scan_end= may exceed the head read at entry.* The outer loop's bound is =next=, captured at entry, but =readBatch='s own loop condition is the *live* =self.next_offset= (=src/store/store.zig:202=), so a single =readBatch= call can return events appended after entry. Those events were decoded and classified like any other, so the invariant covers them. An implementer must not "correct" this by clamping =scan_end= to =next=.
+- *=start_offset > head= is a no-op.* The loop body never runs, =scan_end == start_offset=, and the cursor does not move. Not a rewind.
+
+**** [Superseded 2026-08-03 (review B1)] the locking argument this replaces
+:PROPERTIES:
+:CUSTOM_ID: b1-retraction
+:END:
+
+An earlier revision discharged the invariant by asserting: /"The head is read once at entry under the same mutex =publish= takes, so no event can be appended between the head read and the end of the scan."/ *That is false.* =publish= (=src/store/topic.zig:240-256=) validates under the manager mutex, then *drops it* for phase 2 — the comment at =:248= says so: /"Phase 2: disk I/O without lock (log has its own mutex)"/ — and =Log.append= (=src/store/store.zig:135=) takes the *Log's* mutex, which =fetchPatternByOffset= never takes. Appends can and do happen mid-scan. =src/net/server.zig:97= spawns a thread per connection, so there is no single writer either.
+
+The claim was not invented here: it was inherited from the doc-comment at =src/store/topic.zig:311-313=, which asserts /"Hold the manager mutex while reading so log appends and readBatch don't race"/. That comment is wrong for the same reason and *must be corrected in the same change* — it is a =[code]=-shaped claim that asserted "verified" at some commit and that nothing revalidated, which is exactly the failure mode =common.md= warns about, and it propagated into a spec.
+
+Nothing in the fix depends on the retracted premise; the per-event argument above is stronger and lock-free. The consequences of the race itself are recorded as [[#f4][F4]] and are not fixed here. This document makes *no* claim about the ordering guarantee at hook *registration* time — that is [[./hook-registration-cursor.org]]'s, it is deliberately worded as "under the same lock used by the publish path (single-writer discipline)" rather than as atomicity, and this document does not walk that back.
 
 ** P2 — the daemon persists the watermark, and exactly when it is safe to
+:PROPERTIES:
+:CUSTOM_ID: p2
+:END:
 
-=src/store/hooks.zig:846= =processHook=. Replace the early =if (events.len == 0) return;= and add a post-loop advance. In prose, because the ordering is the specification:
+=src/store/hooks.zig:846= =processHook=. Replace the early =if (events.len == 0) return;= and add a post-loop advance.
 
-1. Pattern hooks only. Exact-topic hooks keep the =fetch= path and the topic-local skip-count cursor untouched — a "scan watermark" has no meaning there, and their cost is unaffected by the cursor (see [[#f2][F2]]).
+There are two loops in play and the specification has to name which one it means, because an implementer who picks the wrong one writes different code:
+
+- the *scan loop* is inside =fetchPatternByOffset= and produces =scan_end=;
+- the *dispatch loop* is =processHook='s =for (events, 0..)=, which spawns one child per returned event.
+
+The rules:
+
+1. Pattern hooks only. Exact-topic hooks keep the =fetch= path and the topic-local skip-count cursor untouched — a scan watermark has no meaning there, and their cost is unaffected by the cursor ([[#f2][F2]]).
 2. Dispatch each returned event as today, advancing to =event.offset + 1= per event.
-3. *If, and only if, the loop ran to completion*, persist =max(hook.cursor, scan_end)=.
-4. Do *not* persist =scan_end= on any early exit:
-   - =error.ConcurrentLimitReached= from =executeHookCommand= — today's code returns without advancing so the events are retried next tick. That must stay: the events were matched and not dispatched, and advancing past them would drop them.
+3. *If and only if the dispatch loop ran to completion* — every returned event was handed to =executeHookCommand= — persist =max(hook.cursor_after_dispatch, scan_end)=. Whether the *scan* loop filled its batch is irrelevant to this decision: a full batch is the ordinary case and =scan_end= is safe under it (see [[#p1][P1]]).
+4. Do *not* persist =scan_end= on any early exit from the dispatch loop:
+   - =error.ConcurrentLimitReached= from =executeHookCommand= — today's code returns without advancing so the events are retried next tick. That must stay: those events were matched and *not* dispatched, and advancing past them would drop them. Guarded by [[#t7][T7]].
    - =hook.once= fired — the hook is removed; there is no cursor to write.
-5. A non-=ConcurrentLimitReached= error from =executeHookCommand= keeps today's behaviour: log it, advance past the event, continue. The event was matched and *attempted*; hooks have never had retry semantics (=server-hooks.org=: "On command failure: log to stderr, advance cursor (don't retry)"). Persisting =scan_end= afterwards is consistent with that. This is a deliberate choice, not an oversight — if a reviewer wants failed dispatch to hold the cursor, that is a change to delivery semantics and belongs in its own document.
+5. A non-=ConcurrentLimitReached= error from =executeHookCommand= keeps today's behaviour: log it, advance past the event, continue. The event was matched and *attempted*; hooks have never had retry semantics (=server-hooks.org=: "On command failure: log to stderr, advance cursor (don't retry)"). Persisting =scan_end= afterwards is consistent with that. This is a deliberate choice — if a reviewer wants failed dispatch to hold the cursor, that is a change to delivery semantics and belongs in its own document.
+
+*** What the buffer-full case actually does
+
+The order of tests inside the scan loop matters and the first revision of this document got it wrong. Reading =src/store/topic.zig:331-356=, the marker test (=:332=) and the =!matchTopic= test (=:338=) both come *before* the =events.items.len >= max_count= test (=:343=). So once the buffer is full the loop keeps consuming the *current* batch, advancing =cursor= over markers and non-matching events, and stops only at the next *match*. The chunk is sized =max_count - len + 16=, so =scan_end= can exceed =last_delivered.offset + 1= by at most ~16 events.
+
+This is safe — nothing matching is skipped, by the invariant — and it is desirable. But it *is* a behaviour difference from "the cursor stops at the last delivered event", and it means [[#t1][T1]]'s full-batch fixture must interleave non-matching traffic after the last match or the assertion cannot distinguish the two readings.
+
+*[Superseded 2026-08-03 (review M2): an earlier revision said "the event and the remaining batch are freed and =cursor= is not advanced ... No change in behaviour for a full batch."* Wrong, per the loop as written. That claim too was inherited from a source comment — =src/store/topic.zig:344-350=, /"We deliberately do NOT advance =cursor= past these events"/ — which describes the =break= but not the two =continue= branches above it. That comment must be corrected in the same change.*]*
 
 *** Re-arm paths, each named
 
 | path | code | effect under this change |
 |------+------+--------------------------|
-| default (armed at tail) | =main.zig= =handleHookAdd= sends =start_cursor = null= → =server.zig:308= =tipForPatternLocked= under =lockForHookRegistration= → =log.nextOffset()= → =HookTable.addWithCursor= | First tick scans =[tip, head)=; if nothing matches, cursor moves to head. Nothing published after registration can be skipped, because =tip= and every subsequent =scan_end= are read under the publish mutex. Unchanged. |
+| default (armed at tail) | =main.zig= =handleHookAdd= sends =start_cursor = null= → =server.zig:308= =tipForPatternLocked= under =lockForHookRegistration= → =log.nextOffset()= → =HookTable.addWithCursor= | First tick scans =[tip, head)=; if nothing matches, cursor moves to the scan watermark. Nothing published after registration is skipped, because every offset the cursor passes was individually pattern-tested. Unchanged. |
 | =--from-beginning= | =main.zig= flag → =start_cursor = 0= → same server path | Historical matches are still delivered, 100 per tick, cursor advancing per delivery. =scan_end= only overtakes the cursor once the scan has passed every match. Replay is unchanged. |
-| =--from N= | =main.zig= flag → =start_cursor = N= | Same as above from =N=. If =N > head=, =scan_end == N=, a no-op. |
-| reload from =hooks.json= | =HookTable.load= → =loadHook= | Reads the persisted cursor unchanged. The only difference is that the persisted value is now a scan watermark rather than a delivery watermark — both are "the next offset to consider", which is what =fetchPatternByOffset= already means by =start_offset=. No schema change, no migration. |
+| =--from N= | =main.zig= flag → =start_cursor = N= | Same from =N=. If =N > head=, =scan_end == N=, a no-op. Note that for prefix/wildcard hooks =N= is a *global log offset*, not a topic-local one; the CLI help string at =src/main.zig:1375= says otherwise and is wrong. Recorded in [[#non-goals][Non-Goals]]; not fixed here. |
+| reload from =hooks.json= | =HookTable.load= → =loadHook= | Reads the persisted cursor unchanged. The persisted value is now a scan watermark rather than a delivery watermark — both are "the next offset to consider", which is what =fetchPatternByOffset= already means by =start_offset=. No schema change, no migration. |
 
-*Consequence that must be stated because it crosses items.* Today, a hook whose pattern never matched keeps cursor 0, so *changing the pattern-matching rules would retroactively deliver history*. After this change it will not: the cursor has already passed those events. The pattern-matching item (round-4 item 9, scheduled after this one) must therefore not assume replay-on-semantics-change. This strengthens the "9 after 1" ordering rather than weakening it, but it is a real behavioural coupling and whoever writes item 9 needs to know.
+*Consequence that crosses items.* Today, a hook whose pattern never matched keeps cursor 0, so *changing the pattern-matching rules would retroactively deliver history*. After this change it will not: the cursor has already passed those events. The pattern-matching item (round-4 item 9, scheduled after this one) must therefore not assume replay-on-semantics-change. This strengthens the "9 after 1" ordering rather than weakening it, but whoever writes item 9 needs to know.
 
 ** P3 — do not turn a CPU bug into an I/O bug
+:PROPERTIES:
+:CUSTOM_ID: p3
+:END:
 
 =HookTable.updateCursor= (=src/store/hooks.zig:239=) calls =saveLocked()= on every call, which serialises the whole hook table to JSON and does a write-plus-rename of =hooks.json= (=src/store/hooks.zig:385=). Today a dead hook never writes. After P1/P2, a naive implementation writes =hooks.json= once per hook per tick — with 42 hooks that is 84 full-table rewrites per second on an otherwise idle store. That would be a regression, and it is the kind that gets discovered as a second incident.
 
@@ -191,30 +266,50 @@ Required:
 1. =updateCursor= must be a no-op — *no save* — when =new_cursor <= hook.cursor=. This also gives a monotonicity guard for free.
 2. =pollAndExecute= must perform *at most one* =hooks.json= write per tick. Either a =HookTable.updateCursors(pairs: []const struct{ id: u64, cursor: u64 })= that takes the lock once and saves once, or a dirty flag set by =updateCursor= and flushed at the end of =pollAndExecute=. Implementer's choice; the acceptance criterion is the write count, not the shape.
 
-** P4 — surface the cost
+** P4 — surface the cost (stage 3)
+:PROPERTIES:
+:CUSTOM_ID: p4
+:END:
 
-*** Per-hook
+*** The unit, first
 
-=ever hook list= gains a =SCAN= column: *the number of events this hook will read on its next poll cycle*. It is a cost, not a delivery backlog, and the column heading and =SKILL.md= entry must say so.
+SCAN is *one* quantity in *one* unit: **events this hook will read on its next poll cycle**. It is a cost — a rate of reads — not a position and not a delivery backlog. What varies by pattern shape is the *formula*, not the unit, which is why summing SCAN across hooks into a store total is legitimate.
 
-| pattern shape | SCAN value | why |
-|---------------+------------+-----|
-| prefix / wildcard | =log.nextOffset() − cursor= | exactly what =fetchPatternByOffset= walks |
-| exact topic | the topic's indexed event count | =fetch= re-reads the topic's offset list from index 0 every call regardless of cursor — see [[#f2][F2]] |
+| pattern shape | SCAN formula | note |
+|---------------+--------------+------|
+| prefix / wildcard | =log.nextOffset() − cursor= | the log head, *marker-inclusive* — =nextOffset()=, not =status.total_events=, which counts only non-marker records (=src/store/status.zig:191=). Reproduced by review: one =topic create= plus one =pub= gives =Events: 1= while the head is 2. =ever status= must compute the head itself. |
+| exact topic | the topic's *offset-list length*, marker-inclusive (=offsets.items.len=) | =fetch= iterates =offsets_copy.len= (=src/store/topic.zig:279=) and calls =log.read= on every entry including markers, so the true read cost is =2 × offsets.len=. This is *not* the =non_marker_count= that =ever status= and =ever topic list= display; on a 5,000-event topic the displayed count is 5,000 and the fetch reads 5,001 offsets. |
 
-The draft's single =lag = head − cursor= is *wrong for exact-topic hooks*: their cursor is a topic-local skip count, so subtracting it from a global log offset produces a meaningless number that will usually look enormous. Reporting one column with two definitions is the least surprising option available given that =Hook.cursor= is already polymorphic in the pattern shape (=hook-registration-cursor.org=, decision B1).
+The draft's =lag = head − cursor= must not ship in any form: for exact-topic hooks the cursor is a topic-local skip count and subtracting it from a global log offset produces a meaningless number.
 
-A totals line: =N hooks, total scan 12,345 events/cycle=.
+A second =BEHIND= column is rejected: a prefix hook's delivery backlog is not computable without performing the scan, so the column would be empty exactly where it would be most useful.
 
-*** Store-wide
+*** =ever hook list=
 
-=ever status= gains =Hook scan: 12,345 events/cycle= in the Hooks section (it already reads =hooks.json= and the log directly and prints =cursor: N= per hook, =src/main.zig= =handleStatus=). This is the command an operator runs first and it is the one that "looked healthy" during the incident.
+Rename the existing =Last Offset= column to =CURSOR= and add =SCAN=.
+:PROPERTIES:
+:CUSTOM_ID: m1-note
+:END:
+
+The rename is not cosmetic. =ever hook list= today prints a column headed *=Last Offset== whose value is =hook.cursor= (=src/main.zig:460=), and today that header is true: it is the last delivered offset + 1. A hook that has never matched shows a stale, obviously-wrong number, *and that is the only way the incident is visible from any CLI at this base*. After P2 the same column tracks the head for every hook, the header becomes false, and the diagnostic disappears. Shipping P2 without the rename repurposes the one field an operator already reads; shipping P2 without =SCAN= removes a signal and replaces it with nothing.
+
+So: =CURSOR= (the value, honestly named) and =SCAN= (the signal that replaces the one P2 destroys), plus a totals line. Because [[#p5][P5]] alarms on the pattern-hook subtotal only ([[#m4-note][see below]]), the totals line reports both when they differ:
+
+#+begin_example
+2 hooks — total scan 130,001 events/cycle (prefix/wildcard 125,000)
+#+end_example
+
+=SKILL.md= must carry the legend: =CURSOR= is the next offset to consider and its unit depends on the pattern shape (global log offset for prefix/wildcard, topic-local skip count for exact); =SCAN= is events read per poll cycle.
+
+*** =ever status=
+
+=ever status= already prints =cursor: N= per hook (=src/store/status.zig:467-483=) — correctly named already — and needs the same legend plus a store-wide total. =ever status --json= exists (=src/main.zig:1420=, renderer =src/store/status.zig:534=, hooks at =:536-542=) and *must carry the same total and the same per-hook field*; a human-readable total with a JSON output that silently lacks it is a divergence between two surfaces of one command, which is worse than not having it.
 
 *** Not proposed here
 
-No =--json=. See the supersession note in [[#motivation][Motivation]] — that surface is being drafted elsewhere. Whoever lands =cli-json-list-output.org= should carry the same =scan= field with the same definition; that is a note for them, not a requirement of this document.
+No =--json= for =hook list=; that surface is being drafted separately as =air/v0.1/cli-json-list-output.org= in the default workspace. Whoever lands it should carry =scan= with the definition above. This note is about =hook list= only — =status --json= is in scope and is covered above.
 
-** P5 — the saturation warning: threshold and channel, pinned
+** P5 — the saturation warning (stage 3)
 :PROPERTIES:
 :CUSTOM_ID: p5
 :END:
@@ -227,30 +322,49 @@ No =--json=. See the supersession note in [[#motivation][Motivation]] — that s
 2. =ever pub= does not auto-create topics, so a store-side publisher would have to create a reserved topic, changing =ever topic list= for every user of the store.
 3. The store log is already the record of daemon health, and the incident was diagnosed partly from it.
 
-*** Trigger 1 (primary): measured poll-cycle time
+*** The line itself
 
-Time =pollAndExecute= with a monotonic clock. Warn when the measured cycle exceeds *250 ms* (50% of the 500 ms budget) for *3 consecutive cycles*; clear when it falls below *125 ms* (25%). One line on entering the degraded state, one on leaving, and at most one repeat every 5 minutes while degraded.
+#+begin_example
+hook daemon degraded: poll cycle 780 ms (budget 500 ms), pattern scan 275,700 events/cycle,
+  largest contributor hook #17 'zz.dead.' 137,850
+#+end_example
 
-Justification. This measures the actual failure — "the daemon cannot finish a poll cycle inside its budget", the =R=-state condition of the incident — rather than a proxy for it, and it needs no per-host calibration. On this host 250 ms of scan corresponds to ≈100,000 events of lag (interpolating the table above); on the Debug build it corresponds to ≈16,000. An event-count threshold would have to be one of those two numbers and would be wrong on the other machine. Three consecutive cycles suppresses a one-off caused by a large publish burst. The hysteresis band exists because the incident's own remediation crossed the boundary in stages (2,004,113 → 141,572 → 0) and a single threshold would have flapped at the middle stage.
+Naming the largest contributor answers the *remediation* question at the moment of the alarm, which is what the operator actually needs. This is why there is deliberately **no** per-hook threshold: the difference between "one hook at 150,000" and "fifty at 3,000" is a diagnosis difference, not a detection difference — both stores are equally saturated and both need a human. A second threshold would buy a second constant, a second hysteresis band and a second flap boundary to answer a question the existing line can answer for free.
 
-The 5-minute repeat is deliberate and deliberately slow: hook #20 in the incident wrote 89,221 identical log lines and produced a 15 MB store log. A per-tick warning would be the same mistake at 2 Hz.
+*** Trigger 1 (retrospective): measured poll-cycle time
 
-*** Trigger 2 (secondary): total scan lag, 100,000 events
+Time =pollAndExecute= with a monotonic clock. Warn when the measured cycle exceeds *50% of the 500 ms budget* (250 ms) for *3 consecutive cycles*; clear when it falls below *25%* (125 ms). One line on entering the degraded state, one on leaving, and at most one repeat every 5 minutes while degraded.
 
-Also warn when the store-wide total of the P4 SCAN figure exceeds *100,000 events*, on the same channel with the same hysteresis (clear below 50,000).
+Three consecutive cycles suppresses a one-off caused by a publish burst. The hysteresis band exists because the incident's own remediation crossed the boundary in stages (2,004,113 → 141,572 → 0) and a single threshold would have flapped at the middle stage. The 5-minute repeat is deliberately slow: hook #20 in the incident wrote 89,221 identical log lines and produced a 15 MB store log; a per-tick warning would be the same mistake at 2 Hz.
 
-Justification against the incident's numbers, in order:
+*** Trigger 2 (prospective): projected next-cycle scan time
 
-- It is *half* the point at which the 500 ms budget is provably exhausted on this hardware (≈200,000, measured 2026-08-03), so it fires while the daemon is still keeping up.
-- The incident's pre-prune total was 2,004,113 — 20× the threshold. It would have fired long before anyone looked at =/proc=.
-- The incident's post-first-prune residual was 141,572, at which the daemon was still burning 36.6% of a core. That is 1.4× the threshold, so the warning correctly persists through the partial remediation and clears only at the third stage (residual 0).
-- The four healthy hooks in that store were at the head with lag 0, and a single caught-up hook on the probe store shows 0. A store trips this only with ≈100,000 events of genuine unprocessed backlog, which is worth a line either way.
+The daemon is already timing the cycle for trigger 1, and after P1 it already knows how many events it scanned (the sum of =scan_end − start_cursor= across pattern hooks). Those two give a *measured* scan rate. Warn when
 
-Trigger 2 exists because trigger 1 only fires once the daemon is already missing its budget, whereas lag is observable while there is still headroom. Trigger 1 is the alarm; trigger 2 is the early warning. Neither replaces the P4 columns, which are the diagnosis.
+: pattern_scan_total ÷ measured_scan_rate  >  50% of the budget
+
+with the same clear band (25%) and the same hysteresis and repeat policy. Suppress trigger 2 until at least one cycle has been timed with a nonzero scan; on the first cycle after start there is no rate yet.
+
+*[Superseded 2026-08-03 (review M5): an earlier revision pinned trigger 2 at a constant 100,000 events, justified as "half the point at which the 500 ms budget is provably exhausted on this hardware (≈200,000)".* That is a ReleaseFast number. On the Debug build =zig build= produces by default the budget is exhausted around 33,000 events, so at 100,000 the daemon is already 3× over budget and trigger 1 has been firing for some time — trigger 2 would have been a redundant late warning, not an early one, on the build most people run. The document argued at length that an absolute event count is the wrong unit and then used one. The formulation above removes the constant entirely; the only constants left are the two budget fractions shared with trigger 1.*]*
+
+For orientation, the effective event counts this rule produces: ≈100,000 on this host in ReleaseFast, ≈16,000 in Debug. Those are outputs of the rule, not inputs to it.
+
+*** Why the total is over pattern hooks only
+:PROPERTIES:
+:CUSTOM_ID: m4-note
+:END:
+
+Trigger 2 sums SCAN over *prefix/wildcard* hooks only, and this is a real exclusion, not a rounding.
+
+An exact-topic hook's SCAN is its topic's whole size *regardless of its cursor* ([[#f2][F2]]): it is a constant level, not a trend, and nothing an operator does short of deleting the hook changes it. Twenty exact-topic hooks on 5,000-event topics — an ordinary orchestration store with nothing wrong with it — total 100,000 and would hold the alarm on permanently. Measured on the review's probe store: one exact-topic hook at the tip of a 5,000-event topic, zero events published, store otherwise idle, 16,815–20,004 read syscalls/s against a 0 syscr/s baseline with no hooks; this document's own F2 figure (18,804 for a 5,152-event topic) sits inside that range.
+
+*[Superseded 2026-08-03 (review M4): an earlier revision justified the trigger-2 constant with "a store trips this only with ≈100,000 events of genuine unprocessed backlog" and "the four healthy hooks in that store were at the head with lag 0".* Both sentences were false under this document's own definition of SCAN as a *cost*, and the document had measured the counter-example (F2) before writing them. The exclusion above and the cost-language justification replace them.*]*
+
+After stage 2 ([[#f2][F2]]) lands, an exact-topic hook's SCAN falls to O(events actually delivered) and the exclusion can be dropped — a one-line change then, and the totals line collapses to a single number.
 
 * Findings
 
-Established from source at this base and reproduced on the private store. Each has its own acceptance criterion so it is not lost, and each is flagged where a decision is needed.
+Established from source at this base and reproduced on a private store. Each has its own acceptance criterion so it is not lost.
 
 ** F1 — hook execution logs collide on a one-millisecond filename, and the earlier one is destroyed
 :PROPERTIES:
@@ -261,24 +375,24 @@ Established from source at this base and reproduced on the private store. Each h
 
 *It is (b). Dispatch is not lossy.*
 
-From source: =processHook= (=src/store/hooks.zig:866=) loops over *every* event in the batch and calls =executeHookCommand= for each. There is no per-hook concurrency guard — =executeHookCommand= checks only the global =MAX_CONCURRENT_HOOKS= and returns =error.ConcurrentLimitReached=, which *stops the cursor* so the events are retried. Nothing drops a matched event.
+From source: =processHook= (=src/store/hooks.zig:866=) loops over *every* event in the batch and calls =executeHookCommand= for each. There is no per-hook concurrency guard — =executeHookCommand= checks only the global =MAX_CONCURRENT_HOOKS= (16, =src/store/hooks.zig:512=) and returns =error.ConcurrentLimitReached=, which *stops the cursor* so the events are retried. Nothing drops a matched event, so (a) is ruled out by construction as well as by measurement.
 
-The log path is =<data-dir>/hooks/<hook-id>-<epoch-ms>.log=, opened =O_CREAT | O_TRUNC= (=src/store/hooks.zig:952-966=). Two executions of the same hook starting in the same millisecond produce the same path; the second =open= truncates the first's file, and both children then write through independent file descriptions at independent offsets. The surviving content is the later execution's header. =handleHookLogs= (=src/net/server.zig:498=) scans the directory for the newest file matching =<id>-=, so =ever hook logs <id>= shows exactly one entry, for the later offset — which is what was observed.
+The log path is =<data-dir>/hooks/<hook-id>-<epoch-ms>.log=, opened =O_CREAT | O_TRUNC= (=src/store/hooks.zig:952-966=). Two executions of the same hook starting in the same millisecond produce the same path; the second =open= truncates the first's file, and both children then write through independent file descriptions at independent offsets. The surviving content is the later execution's header. =handleHookLogs= (=src/net/server.zig:498=) picks the newest file matching =<id>-=, so =ever hook logs <id>= shows exactly one entry, for the later offset — which is what was observed.
 
-Reproduced: 50 events published to a matching topic in a burst, one hook.
+Reproduced twice, independently:
 
-#+begin_example
-executions that actually ran (distinct EVER_OFFSET values):  50
-hook execution log files on disk:                            28
-#+end_example
+| probe | events published | executions that ran | distinct offsets | log files on disk | loss |
+|-------+------------------+---------------------+------------------+-------------------+------|
+| this document | 50 in a burst | 50 | 50 | 28 | 44% |
+| review | 50 in a burst | 50 | 50 | 31 | 38% |
 
-*22 of 50 executions (44%) lost their log to a filename collision.* All 50 commands ran.
+The exact count is timing-dependent; the mechanism is not.
 
-Relation to the cursor change: *neither better nor worse.* The collision is a function of how close together two executions of one hook start, which is unchanged by this fix. The one indirect effect is that a hook which is far behind and then catches up dispatches its backlog in batches of 100, which is precisely the burst shape that collides — so a store that has been running with the defect and is then fixed will lose logs during the one catch-up cycle. That is a transient, not a regression.
+Relation to the cursor change: *neither better nor worse.* The collision is a function of how close together two executions of one hook start, which this fix does not change. The one indirect effect is that a hook far behind which then catches up dispatches its backlog in batches of 100 — precisely the burst shape that collides — so a store running with the defect and then fixed will lose logs during the one catch-up cycle. A transient, not a regression.
 
-*Scope.* Not fixed here. *This needs a decision.* The obvious fix — a per-daemon sequence counter in the filename, which is what =hook-execution.org= originally specified and which did not ship — is a handful of lines in =executeHookCommand=, but it is squarely the hook-execution-log item's territory (round-4 item 10, two reviewers, because it touches files inside the store) and I have not widened scope to take it.
+*Acceptance criterion, wherever it lands:* /N executions of one hook triggered inside one poll cycle produce N distinct log files, and =ever hook logs <id>= can distinguish them./ The burst must be produced with a *nested* shell — =sh -c 'echo $EVER_OFFSET >> file'=, not =echo $EVER_OFFSET >> file= — because =executeHookCommand= builds =… EVER_OFFSET='406' exec <command>= (=src/store/hooks.zig:929-944=) and the outer shell expands =$EVER_OFFSET= before the assignment takes effect. A naive probe records empty lines and looks like zero executions, which is indistinguishable from the symptom under test.
 
-Acceptance criterion, wherever it lands: /N executions of one hook triggered inside one poll cycle produce N distinct log files, and =ever hook logs <id>= can distinguish them./
+*Scope.* Not fixed here, per supervisor direction: the fix belongs to the hook-execution-log item (round-4 item 10). *Review disagrees with that placement and the argument is recorded because it is a good one:* moving execution logs into per-hook directories — which is what item 10 is scoped for — does *not* fix this, because two executions of the *same* hook in the same millisecond collide on =<epoch-ms>.log= inside =hooks/<id>/= exactly as they do in =hooks/=; item 10 would have to change the *filename* as well, which is a different change from the one it is scoped for. Item 10 also carries a two-reviewer posture because it *deletes* files inside the store, and adding a monotonic per-daemon counter to a filename deletes nothing and creates strictly more files, so attaching F1 to item 10 imports a review cost it does not earn. Whoever owns item 10 should read this paragraph before assuming F1 comes along for free.
 
 ** F2 — exact-topic hooks re-read their entire topic every tick, and the cursor fix does not help them
 :PROPERTIES:
@@ -296,7 +410,7 @@ while (i < offsets_copy.len and events.items.len < max_count) : (i += 1) {
 }
 #+end_src
 
-So an exact-topic hook fully caught up on a topic of =T= events performs =2T= =pread= calls per tick and delivers nothing. Its cursor is already at the tip; advancing it further is not possible and would not help.
+So an exact-topic hook fully caught up on a topic of =T= offsets performs =2T= =pread= calls per tick and delivers nothing. Its cursor is already at the tip; advancing it further is not possible and would not help.
 
 Reproduced: one exact-topic hook on a 5,152-event topic, cursor 5,150 (two events from the tip), *zero* new events published:
 
@@ -306,64 +420,94 @@ syscr/sec = 18804
 syscr/sec = 18804
 #+end_example
 
-≈ 2 × 5,152 × 1.8 cycles/s. The store is idle and burning 18,800 syscalls per second.
+≈ 2 × 5,152 × 1.8 cycles/s. The store is idle and burning 18,800 syscalls per second. Review reproduced 16,815–20,004 syscr/s on a 5,000-event topic against a *0 syscr/s* baseline with no hooks registered.
 
-This has wider blast radius than hooks: the same =fetch= serves the client fetch path (=src/net/server.zig:205=) and the HTTP path (=src/net/http.zig:299=), so =ever sub <topic> --from N= re-reads the topic from the beginning on every call.
+Wider blast radius than hooks: the same =fetch= serves the client fetch path (=src/net/server.zig:205=) and the HTTP path (=src/net/http.zig:299=), so =ever sub <topic> --from N= re-reads the topic from the beginning on every call.
 
-*Scope.* Not fixed here. The fix is small and local — start the loop at the index corresponding to =start= instead of counting up to it — but it is a different code path with a different correctness argument (the marker-skip accounting interacts with the index arithmetic), it changes a path used by every client fetch, and this document is a cursor-semantics change. *This needs a decision:* fold into this document, or file separately. My recommendation is *separately and soon*, because it is a live cost on every store with a busy exact-topic hook and it is invisible in the P4 SCAN column unless P4 defines the exact-topic value as the topic's event count, which is why P4 does.
+*Scope.* Its own document, ordered as stage 2 ([[#staging][Implementation order]]) — after the incident closer and *before* the observability half, because [[#p5][P5]]'s threshold cannot be justified coherently while an idle exact-topic hook contributes its whole topic size. Not folded into this document: it changes a path used by every client, and its correctness argument is about the marker-skip index arithmetic, not about cursors.
 
-Acceptance criterion, wherever it lands: /an exact-topic hook at the tip of a topic with 5,000 events performs O(1), not O(5,000), event reads per idle poll cycle./
+*Acceptance criterion, wherever it lands:* /an exact-topic hook at the tip of a topic with 5,000 events performs O(1), not O(5,000), event reads per idle poll cycle, and the client and HTTP fetch paths deliver identical results before and after./
 
-** F3 — the incident's "restart does not help" is true, and the reason is now testable
+** F3 — "a restart does not help" is true, and now testable
 
-=hooks.json= persists cursors, so a restart reloads the same stale values and the busy loop resumes. Verified: the probe harness restarted the store seven times with synthetic hooks at cursor 0 and the scan rate was identical each time. This is stated only because the incident recorded an initial recommendation ("restart to reclaim the core") that was wrong, and T2's reload step in the [[#test-plan][Test Plan]] covers the restart path so the claim stops being folklore.
+=hooks.json= persists cursors, so a restart reloads the same stale values and the busy loop resumes. Verified: the probe harness restarted the store seven times with synthetic hooks at cursor 0 and the scan rate was identical each time. Stated because the incident recorded an initial recommendation ("restart to reclaim the core") that was wrong; [[#t2][T2]]'s reload step covers it so the claim stops being folklore.
+
+** F4 — =readBatch= / =append= race in the path this document changes
+:PROPERTIES:
+:CUSTOM_ID: f4
+:END:
+
+*Pre-existing. Recorded here because this is the document that examined the path. Not fixed here.*
+
+=Log.read= and =Log.readBatch= both carry the comment /"NOT thread-safe on its own — caller must serialize with appends (e.g., via TopicManager's mutex)"/ (=src/store/store.zig:180-181=, =:191-192=). *That serialization does not exist.* =publish= drops the manager mutex across =log.append= (=src/store/topic.zig:248=), =Log.append= takes the Log's own mutex (=src/store/store.zig:135=), and neither =fetchPatternByOffset= nor =fetch= takes it. =src/net/server.zig:97= spawns a thread per connection, so concurrent publishers are the normal case, not an edge.
+
+What races: =append= appends to =seg.positions= (an =ArrayList= append that can realloc the array a concurrent =readBatch= is indexing), can push a new segment onto =self.segments= (invalidating the =*Segment= pointer a concurrent =findSegmentForOffset= is holding), and writes =self.next_offset= non-atomically while =readBatch='s loop condition reads it.
+
+*Established by reading the source, not by a thread-sanitizer run.* Neither this document nor its review executed one. That is the honest status and any fix should start by producing one.
+
+Relationship to this change, stated precisely because it would be easy to overclaim:
+
+- The [[#p1][P1]] invariant is *unaffected*. It is a statement about the offsets the loop actually observed, and it holds per-event regardless of concurrent appends. The race is a memory-safety hazard (torn read, use-after-realloc, stale segment pointer), not a delivery-safety one. This change neither causes it nor cures it.
+- The fix *reduces exposure* for prefix/wildcard hooks: the window in which the scan is inside =readBatch= shrinks from O(log length) per tick to O(new events). It does not shrink for exact-topic hooks until [[#f2][F2]] lands.
+- The phrase "single-writer publish discipline", used in [[./hook-registration-cursor.org]] and in =src/store/topic.zig:95-100=, describes an *intended* discipline. With a thread per connection it is not enforced. Whether those documents need amending is F4's owner's call, not this document's — flagged in [[#open-questions][Open Questions]].
+
+*Acceptance criterion, wherever it lands:* /a test that publishes concurrently from ≥4 threads while a pattern hook scans a multi-segment log runs clean under a thread sanitizer and under =-Doptimize=ReleaseFast=, and the two in-source comments claiming the serialization exists are either made true or corrected./
 
 * Design Details
 
-** Files expected to change
+** Files expected to change (stage 1 unless noted)
 
-- =src/store/topic.zig= — =fetchPatternByOffset= gains the =scan_end= out-parameter (P1).
-- =src/store/hooks.zig= — =processHook= persists the watermark on full-batch completion (P2); =updateCursor= no-ops on a non-advancing write and the per-tick save is batched (P3); =pollAndExecute= is timed and carries the warning state machine (P5).
-- =src/protocol/message.zig= — =HookInfo= gains =scan: u64= (P4). Additive with a default, so an older client decoding a newer response is unaffected.
-- =src/net/server.zig= — =handleListHooks= computes =scan= per hook. Requires the log head and, for exact hooks, the topic's event count — both available from the =TopicManager= the server already holds. Must be read under the manager lock.
-- =src/main.zig= — =handleHookList= SCAN column and totals line; =handleStatus= total line.
-- =SKILL.md= — document the SCAN column's meaning (cost, not backlog) and its two definitions, and the warning's threshold and channel.
-- =src/tests/integration.zig= — tests below.
+- =src/store/topic.zig= — =fetchPatternByOffset= gains the =scan_end= out-parameter (P1); the doc-comment at =:311-313= and the buffer-full comment at =:344-350= are corrected, both being claims this document had to retract after inheriting them.
+- =src/store/hooks.zig= — =processHook= persists the watermark on dispatch-loop completion (P2); =updateCursor= no-ops on a non-advancing write and the per-tick save is batched (P3); *stage 3*: =pollAndExecute= is timed and carries the warning state machine (P5).
+- =src/tests/integration.zig= — the tests below.
+- *Stage 3*: =src/protocol/message.zig= — =HookInfo= (=:144=, the *wire* struct) gains =scan: u64=. Additive with a default, so an older client decoding a newer response is unaffected.
+- *Stage 3*: =src/net/server.zig= — =handleListHooks= computes =scan= per hook. Needs the log head and, for exact hooks, the topic's offset-list length; both are available from the =TopicManager= the server already holds and must be read under the manager lock.
+- *Stage 3*: =src/main.zig= — =handleHookList= renames =Last Offset= → =CURSOR= and adds =SCAN= plus the totals line.
+- *Stage 3*: =src/store/status.zig= — *this is where =ever status= is actually rendered*, and it was missing from the first revision's inventory. It defines a *second, offline* =HookInfo= (=:20-25=, distinct from the wire struct above) built by =readHooks= from =hooks.json= (=:238=); per-hook rendering is at =:467-483= and the JSON renderer at =:534-552=. The store-wide total needs the offline struct; the =hook list= SCAN column needs the wire one. The total must be computed from the log head (=nextOffset=), *not* from =status.total_events=, which excludes markers (=:191=).
+- =SKILL.md= — the =CURSOR= / =SCAN= legend, and the warning's channel and trigger.
 
 ** Thread safety
 
-Cursors are written only by the single daemon thread (=pollAndExecute= is sequential over the snapshot) and read by =HookTable.snapshot= under the table mutex. There is no hook-repoint command at this base — =ever hook= has =new/add/list/rm/ps/logs= and nothing that mutates a cursor after registration (=src/main.zig:1358-1403=) — so no external writer can race the watermark. If a repoint command is ever added, it must take the same table mutex and the monotonicity guard in P3.1 must be relaxed deliberately, not by accident.
+Cursors are written only by the single daemon thread (=pollAndExecute= is sequential over the snapshot) and read by =HookTable.snapshot= under the table mutex. There is no hook-repoint command at this base — =ever hook= has =new/add/list/rm/ps/logs= and nothing that mutates a cursor after registration (=src/main.zig:1358-1403=) — so no external writer can race the watermark. If a repoint command is ever added it must take the same table mutex, and P3.1's monotonicity guard must be relaxed deliberately, not by accident.
+
+This is a statement about the *hook table*. It is not a statement about the log; see [[#f4][F4]].
 
 ** What deliberately does not change
 
 - The 500 ms fixed poll. Removing it is the condvar item.
 - =Hook.cursor= stays a single =u64= with pattern-shape-dependent meaning. No schema change, no =hooks.json= migration, old files load unchanged.
-- Exact-topic hooks' fetch path (see [[#f2][F2]]).
-- Cursor-advances-on-spawn (=hook-execution.org=). A hook that is dispatched but whose child later fails still advances; this document does not revisit that.
+- Exact-topic hooks' fetch path ([[#f2][F2]]).
+- Cursor-advances-on-spawn (=hook-execution.org=). A hook that is dispatched but whose child later fails still advances.
 
 * Test Plan
 :PROPERTIES:
 :CUSTOM_ID: test-plan
 :END:
 
-All tests go in =src/tests/integration.zig=, which =build.zig= wires into =zig build test= as a fourth artifact. Note that *no existing test starts a real =HookDaemon=* — every hook test today simulates the daemon by calling =tm.fetch= / =tm.fetchPatternByOffset= directly. Tests 2 and 3 are the first to start the daemon thread, and the bounding rules below exist because of that.
+All tests go in =src/tests/integration.zig=, which =build.zig= wires into =zig build test= as a fourth artifact. *No existing test starts a real =HookDaemon=* — every hook test today simulates the daemon by calling =tm.fetch= / =tm.fetchPatternByOffset= directly. T2, T3, T5 and T7 are the first to start the daemon thread, and every one of them is bounded by wall clock for the reason T2 gives.
 
-** T1 — unit: the watermark is the head when nothing matches
+** T1 — unit: the watermark, including the case the first revision could not see
+:PROPERTIES:
+:CUSTOM_ID: t1
+:END:
 
-Deterministic, no threads. Publish 500 events to =t.noise=; call =fetchPatternByOffset(alloc, "t.never.", 0, 100, &scan_end)=; assert the returned slice is empty and =scan_end == 500=. Then publish 10 more and assert a second call from =scan_end= returns empty with =scan_end == 510=.
+Deterministic, no threads.
 
-Also assert the full-batch case does *not* over-advance: 500 events on =t.match.a=, fetch with =max_count = 100=, assert =events.len == 100= and =scan_end == events[99].offset + 1=, i.e. the watermark stops at the last delivered event, not at the head.
+1. *No match.* Publish 500 events to =t.noise=; call =fetchPatternByOffset(alloc, "t.never.", 0, 100, &scan_end)=; assert the returned slice is empty and =scan_end == 500=. Publish 10 more; assert a second call from =scan_end= returns empty with =scan_end == 510=.
+2. *Full batch, mixed traffic.* This fixture must interleave, or it tests nothing. Publish 100 events matching =t.match.= followed by 20 events on =t.other.= followed by 1 more =t.match.= event. Fetch with =max_count = 100=. Assert =events.len == 100=, and assert =scan_end= is *greater than* =events[99].offset + 1= — the loop consumes the non-matching tail of the current batch and stops at the 101st match. A fixture where every event matches (the first revision's) cannot distinguish this from =scan_end == events[99].offset + 1= and would pass under both readings.
+3. *Error path.* Assert =scan_end == start_offset= after a call that returns an error, and that it is written before any fallible operation (inspect, or assert via a fixture that forces =error.CorruptRecord=).
 
-*Regresses pre-fix?* Trivially — the parameter does not exist. T1 is a specification test, not the regression test. T2 is.
+*Regresses pre-fix?* Case 1 trivially — the parameter does not exist. T1 is a specification test; the regression test is T2.
 
 ** T2 — daemon: a never-matching hook reaches the head, bounded
-
-This is the test the brief requires to bound its own probe.
+:PROPERTIES:
+:CUSTOM_ID: t2
+:END:
 
 Fixture:
 - Temp data dir. =TopicManager= with =sync_on_append = false=.
-- Topic =t.noise=, *2,000* events. The size is chosen so that one pre-fix poll cycle scans 2,000 events — ≈5 ms in ReleaseFast, ≈30 ms in Debug — which bounds =HookDaemon.stop()=, because =stop()= joins the daemon thread and the thread only observes the shutdown flag between cycles. A 100,000-event fixture would make =stop()= itself the hang.
-- One hook, pattern =t.never.= (matches nothing), =addWithCursor(..., 0)=, command =/bin/true=.
+- Topic =t.noise=, *2,000* events. The size is chosen so one pre-fix poll cycle scans 2,000 events — ≈5 ms in ReleaseFast, ≈30 ms in Debug — which bounds =HookDaemon.stop()=, because =stop()= joins the daemon thread (=src/store/hooks.zig:685-692=) and =daemonLoop= checks the shutdown flag only at the top of a cycle (=:736-749=). A 100,000-event fixture would make =stop()= itself the hang.
+- One hook, pattern =t.never.=, =addWithCursor(..., 0)=, command =/bin/true=.
 - Start a real =HookDaemon= (=HookDaemon.init(alloc, &ht, &tm, empty_envp)=, =start()=).
 
 Probe — *this is the part an implementer must not get wrong*:
@@ -389,98 +533,125 @@ if (observed < 2000) {
 }
 #+end_src
 
-Rules the shape encodes:
+Rules the shape encodes, and which T3, T5 and T7 inherit by reference:
 
-1. *The loop is bounded by wall clock, not by an event.* There is no =wait=, no condvar, no "poll until it happens". Against pre-fix source the cursor never moves and the test *fails at 5 s with the observed value in the message* — "still at cursor 0 of 2000 after 5000 ms" — rather than hanging and producing no evidence.
+1. *The loop is bounded by wall clock, not by an event.* No =wait=, no condvar, no "poll until it happens". Against pre-fix source the cursor never moves and the test *fails at 5 s with the observed value in the message* — "still at cursor 0 of 2000 after 5000 ms" — rather than hanging and producing no evidence.
 2. *=daemon.stop()= runs on both paths*, before the assertion. A =return error= before =stop()= leaks a thread into the rest of the test binary.
-3. *The observed cursor is captured inside the loop and reported.* A bare =expect(cursor >= 2000)= after the loop would say "expected true, found false", which distinguishes nothing.
+3. *The observed value is captured inside the loop and reported.* A bare =expect(cursor >= 2000)= after the loop would say "expected true, found false", which distinguishes nothing.
 4. *5 s is ten poll cycles.* Post-fix the cursor advances on the first cycle, so the test normally finishes in under a second; the margin absorbs a loaded host.
 
-Reload step, in the same test: after =daemon.stop()= and the assertion, =deinit= the =HookTable=, re-=init= it against the same directory, snapshot, and assert the cursor is still 2,000. This is the testable form of the incident's "a restart does not fix it" finding (F3) — pre-fix, cursor 0 is what gets reloaded, and the busy loop resumes.
+*Reload step, in the same test:* after =daemon.stop()= and the assertion, =deinit= the =HookTable=, re-=init= it against the same directory, snapshot, and assert the cursor is still 2,000. This is the testable form of F3 — pre-fix, cursor 0 is what gets reloaded and the busy loop resumes.
 
-*Proof that it regresses* — required before this document goes to =complete=, not optional: =jj new= off the base, apply the test alone without P1/P2, run =zig build test=, confirm it fails with =CursorDidNotAdvance= and the "still at cursor 0 of 2000" line, and that the run terminates in ≈5 s rather than hanging. Record the observed message in History. Then apply the fix and confirm it passes. Run both under =-Doptimize=ReleaseFast= as well: the timing margins differ by 6× between build modes (see Motivation) and a 5 s deadline that is generous in ReleaseFast is only ~150 cycles in Debug — still ample, but the check is cheap.
+*Proof that it regresses* — required before this document goes to =complete=, not optional: =jj new= off the base, apply the test alone without P1/P2, run =zig build test=, confirm it fails with =CursorDidNotAdvance= and the "still at cursor 0 of 2000" line, and that the run terminates in ≈5 s rather than hanging. Record the observed message in History. Then apply the fix and confirm it passes. Run both under =-Doptimize=ReleaseFast= as well: the timing margins differ by 6× between build modes.
 
 ** T3 — daemon: scan cost becomes O(new events)
 
 T2 proves the cursor moves. It does not prove the *cost* fell, which is the actual acceptance criterion, and a timing assertion would be flaky on this host.
 
-Add a counter: =Log.reads: std.atomic.Value(u64)=, incremented with =.monotonic= in =readEventAt= (=src/store/store.zig:245=). One relaxed increment against two syscalls and an allocation is unmeasurable, and the counter is independently useful — expose it in =ever status= as a store-lifetime figure so the pathology is visible without =/proc= at all.
+Add a counter: =Log.reads: std.atomic.Value(u64)=, incremented with =.monotonic= in =readEventAt= (=src/store/store.zig:245=). One relaxed increment against two syscalls and an allocation is unmeasurable.
 
-Test: same fixture as T2. After the hook has caught up, snapshot =log.reads=, sleep 3 poll cycles (1.6 s), snapshot again. Assert the delta is *under 100* — i.e. bounded by a small constant rather than by ≈6,000 (3 cycles × 2,000 events). Pre-fix the delta is ≈6,000 and the test fails by two orders of magnitude, which is a margin no host load can close.
+*This counter is test-only instrumentation.* An earlier revision proposed exposing it in =ever status=; that is not implementable as written. =ever status= never talks to the running store: =handleStatus= (=src/main.zig:952=) opens the *data directory* and calls =ever.status.getStatus=, which scans segment files and reads =hooks.json= from disk; the only contact with the server is =probeServer=, a bare TCP connect reporting reachability. Exposing an in-memory counter would need a new wire request and response type, which this document does not propose and has not priced. (P4's store-wide SCAN total is unaffected — hooks.json cursors, the log head and per-topic offset counts are all derivable offline.)
+
+Test: same fixture as T2, bounded as in T2. After the hook has caught up, snapshot =log.reads=, wait 3 poll cycles, snapshot again. Assert the delta is *under 100* — a small constant rather than ≈6,000 (3 cycles × 2,000 events). Pre-fix the delta is ≈6,000 and the test fails by two orders of magnitude, a margin no host load can close.
 
 ** T4 — re-arm semantics are preserved
 
-Three cases, all deterministic at the =fetchPatternByOffset= seam (no daemon), extending the existing =from-beginning= / =--from N= tests rather than replacing them:
+Three cases, deterministic at the =fetchPatternByOffset= seam (no daemon), extending the existing =from-beginning= / =--from N= tests rather than replacing them:
 
-1. =--from-beginning=: 500 events of which 250 match =t.match.=; drain in batches of 100 from cursor 0, asserting all 250 arrive in offset order and that =scan_end= never exceeds =last_delivered.offset + 1= while matches remain undelivered.
+1. =--from-beginning=: 500 events of which 250 match =t.match.=; drain in batches of 100 from cursor 0, asserting all 250 arrive in offset order and that no matching offset is ever below =scan_end= without appearing in a returned batch.
 2. =--from N=: same, from an =N= in the middle; assert nothing before =N= is delivered and nothing at or after =N= is skipped.
-3. Armed at tail: register at =tipForPatternLocked=; publish 100 non-matching then 1 matching; assert the matching event is delivered even though the cursor jumped to the head on the first no-match scan.
+3. Armed at tail: register at =tipForPatternLocked=; publish 100 non-matching then 1 matching; assert the matching event is delivered even though the cursor jumped past the non-matching run on the first scan.
 
-Case 3 is the one that would catch a wrong implementation of P1 — a =scan_end= computed as "head at the end of the scan" from an *unlocked* read instead of the value the loop maintains.
+T4.1 and [[#t1][T1.2]] are the tests that catch =scan_end= being derived from =log.nextOffset()= instead of the loop cursor. T4.3 does *not* catch it — registering at tip and publishing 100 non-matching then 1 matching delivers the matching event under either derivation, because the head at entry is already past it. The first revision of this document named T4.3 as that guard and was wrong.
 
 ** T5 — the persistence cost does not regress (P3)
 
-Add a =saves: u64= counter to =HookTable=, incremented in =saveLocked=. Fixture: 20 never-matching hooks, no events published. Snapshot =saves=, run 4 poll cycles, snapshot again. Assert the delta is *0* — an idle store must not rewrite =hooks.json= at all. Then publish one event and assert the delta over the next cycle is *1*, not 20.
+Add a =saves: u64= counter to =HookTable=, incremented in =saveLocked=. Fixture: 20 never-matching hooks, no events published, real daemon, *bounded as in T2* — the probe waits on a wall-clock deadline and calls =stop()= on both paths; a bare =sleep(2 s)= is what this rule exists to prevent, and T5's fixture is fast enough that a bare sleep would appear to work.
+
+Snapshot =saves=, let 4 poll cycles elapse, snapshot again. Assert the delta is *0* — an idle store must not rewrite =hooks.json= at all. Then publish one event and assert the delta over the next cycle is *1*, not 20.
 
 Without this test the natural implementation of P2 writes =hooks.json= 40 times a second on an idle store and nobody notices until the next incident.
 
+** T7 — the cursor does not pass matched-but-undispatched events at the concurrency limit
+:PROPERTIES:
+:CUSTOM_ID: t7
+:END:
+
+The guard in [[#p2][P2]] step 4 is the one that protects delivery, and nothing else in this plan exercises it.
+
+Fixture: one hook, pattern =t.slow.=, command =sleep 30=; =MAX_CONCURRENT_HOOKS= is 16 (=src/store/hooks.zig:512=). Publish 25 matching events, then start the daemon. Bounded as in T2: poll =daemon.getProcessTable().activeCount()= on a wall-clock deadline of 5 s until it reaches 16, then assert =hook.cursor <= offset_of_17th_event=, i.e. the daemon stopped advancing at the limit rather than persisting =scan_end=. Call =stop()= on both paths; it SIGTERMs the process groups and reaps within =SHUTDOWN_GRACE_SECS= (5, =src/store/hooks.zig:516=), so =sleep 30= children do not outlive the test.
+
+Mutation that this and only this catches: persisting =scan_end= unconditionally rather than on dispatch-loop completion. The cursor jumps to the head, the 9 undispatched events are never retried, and delivery is silently lost — the exact failure this document exists to prevent.
+
 ** T6 — mutation checks
 
-Per the fleet rule that guards are mutated separately, not the feature as a whole. Each removal below must fail a *disjoint* set:
+Each removal must fail a *disjoint* set. A mutation that fails nothing is a finding about the tests, not a null result.
 
 | mutation | expected failure |
 |----------+------------------|
-| persist =scan_end= unconditionally, including on =ConcurrentLimitReached= | T4 (matched events skipped) |
-| persist =scan_end= even when the batch filled | T1 full-batch assertion, T4.1 |
-| drop the =new_cursor <= hook.cursor= no-op guard | T5 |
+| persist =scan_end= on =ConcurrentLimitReached= (i.e. ignore dispatch-loop completion) | T7 |
+| derive =scan_end= from =log.nextOffset()= instead of the loop cursor | T1.2, T4.1 |
+| clamp =scan_end= to the head captured at entry | none by construction — this is safe but wasteful; it is *not* a correctness guard and must not be listed as one |
+| omit =scan_end.* = start_offset= at function entry | T1.3 |
+| drop the =new_cursor <= hook.cursor= no-op guard | T5 first half |
 | drop the per-tick save batching | T5 second half |
 | revert P1/P2 | T2, T3 |
 
-A mutation that fails nothing is a finding about the tests, not a null result.
+*[Superseded 2026-08-03 (review M2): an earlier revision listed "persist =scan_end= even when the batch filled → T1 full-batch assertion, T4.1" as a mutation.* It is not a mutation: persisting =scan_end= on a full batch is the *correct* behaviour, safe under the P1 invariant. That row encoded the wrong reading of "the loop ran to completion" — the scan loop rather than the dispatch loop — and would have failed an implementer who read P2 correctly.*]*
 
 ** What is *not* tested here, and why
 
-- The P5 warning's threshold values. A test that asserts "warns at 100,000" is a test of a constant. What should be tested is the *state machine*: 3 consecutive over-budget cycles emit exactly one line, a fourth emits none, dropping under the clear threshold emits exactly one more. That is testable by injecting the cycle duration; it should be, and it does not need a 100,000-event fixture.
-- The =R=→=S= thread-state criterion from the draft. It is a =/proc= observation about a live process, not something a =zig build test= can assert without becoming a benchmark. T3's read counter is the testable form of the same claim.
+- P5's threshold *values*. A test asserting "warns at 100,000" is a test of a constant, and after M5 there is no constant. What should be tested is the *state machine*: 3 consecutive over-budget cycles emit exactly one line, a fourth emits none, dropping under the clear band emits exactly one more. Testable by injecting the cycle duration and the scanned-event count; it does not need a large fixture.
+- The =R=→=S= thread-state criterion from the draft. It is a =/proc= observation about a live process, not something =zig build test= can assert without becoming a benchmark. T3's read counter is the testable form of the same claim.
+- [[#f4][F4]]'s race. It needs a thread sanitizer and it is not this change's to fix.
 
 * Acceptance
 
-1. A prefix/wildcard hook whose pattern matches nothing advances its cursor to the log head within one poll cycle and stays there across a restart. (T2, F3)
-2. Per-tick event reads for a caught-up store are bounded by a small constant, not by log length. (T3)
-3. =--from-beginning=, =--from N= and tail-armed hooks deliver exactly what they deliver today; no matching event is skipped. (T4)
-4. An idle store performs zero =hooks.json= writes per poll cycle, and a busy one performs at most one. (T5)
-5. =ever hook list= carries a SCAN column and a totals line, and =ever status= a store-wide total. *Checked on stderr* — =hook list= does not write to stdout at this base and this document does not fix that.
-6. The saturation warning fires once on entering the degraded state, at most once per 5 minutes while degraded, and once on leaving; it is written to the store log and to no topic.
-7. The regression test T2 has been *shown to fail* against pre-fix source with a bounded run time and a message naming the observed cursor, and the observed message is recorded in History.
+Stage 1:
 
-Not acceptance criteria of this document, but recorded so they are not lost: F1 (one log file per execution) and F2 (exact-topic hooks are O(1) per idle cycle).
+1. A prefix/wildcard hook whose pattern matches nothing advances its cursor to the scan watermark within one poll cycle and stays there across a restart. (T2)
+2. Per-tick event reads for a caught-up store are bounded by a small constant, not by log length, *for prefix/wildcard hooks*. (T3)
+3. =--from-beginning=, =--from N= and tail-armed hooks deliver exactly what they deliver today; no matching event is skipped, including at the concurrency limit. (T4, T7)
+4. An idle store performs zero =hooks.json= writes per poll cycle, and a busy one performs at most one. (T5)
+5. The regression test T2 has been *shown to fail* against pre-fix source with a bounded run time and a message naming the observed cursor, and the observed message is recorded in History.
+6. The two in-source comments this document had to retract (=src/store/topic.zig:311-313= and =:344-350=) are corrected in the same change.
+
+Stage 3:
+
+7. =ever hook list= renames =Last Offset= to =CURSOR=, adds =SCAN=, and prints a totals line; =ever status= and =ever status --json= both carry the store-wide total; =SKILL.md= carries the legend. *Checked on stderr* — =hook list= does not write to stdout at this base and this document does not fix that.
+8. The saturation warning fires once on entering the degraded state, at most once per 5 minutes while degraded, once on leaving, names the largest contributing hook, and is written to the store log and to no topic.
+
+Not acceptance criteria of this document, but recorded so they are not lost: [[#f1][F1]] (one log file per execution), [[#f2][F2]] (exact-topic hooks O(1) per idle cycle), [[#f4][F4]] (the log race).
 
 * Relationship to existing documents
 
-This is deliberately a *new* document rather than an extension of [[./hook-registration-cursor.org]], which is =complete=. The argument, since the alternative was worth considering:
+This is deliberately a *new* document rather than an extension of [[./hook-registration-cursor.org]], which is =complete=:
 
-- That document specifies the cursor's *initial* value at registration and the B1 decision that prefix/wildcard cursors are global log offsets. This document specifies the cursor's *advancement* during the daemon loop. They are adjacent but not the same claim, and the earlier one's acceptance criteria are all still true.
-- This document adds an observability surface (P4), an alarm (P5) and three findings that have no home in a document about registration.
-- Reopening a =complete= document to bolt on a second implementation round would put two implementation histories under one state field, which the conventions do not accommodate.
+- That document specifies the cursor's *initial* value at registration and the B1 decision that prefix/wildcard cursors are global log offsets. This document specifies the cursor's *advancement* during the daemon loop. Adjacent, not the same claim, and the earlier one's acceptance criteria are all still true.
+- This document adds an observability surface (P4), an alarm (P5) and four findings that have no home in a document about registration.
+- Reopening a =complete= document to bolt on a second implementation round would put two implementation histories under one state field.
 
-What *is* required is inline supersession in the completed documents, which lands with this change:
+Inline supersession in the completed documents lands with this change:
 
-- [[./hook-registration-cursor.org]] — the claim that the daemon "advances the cursor as =event.offset + 1= for wildcard hooks" is exactly the defect specified here. Marked at the claim.
-- [[./hook-execution.org]] — the log filename spec (=<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log= with an anti-collision sequence number) did not ship; the shipped format is =<hook_id>-<epoch-ms>.log= and it collides (F1). Log rotation did not ship either, and =ever hook logs --tail N= does not exist. Marked at each claim, because those are the =[code]=-shaped inventory lines a reader would otherwise take as evidence.
-- [[./server-hooks.org]] — "Each hook has its own cursor and runs independently of other hooks" is false: one daemon thread walks all hooks sequentially and each pattern scan holds the global =TopicManager= mutex, so one lagging hook delays every other hook *and* every publisher. Also the fetch-function names and the cursor-on-completion claim are stale. Marked at each claim.
+- [[./hook-registration-cursor.org]] — the claim that the daemon "advances the cursor as =event.offset + 1= for wildcard hooks" is exactly the defect specified here; and the =--from <N>= row, whose shipped help text contradicts it. Both marked at the claim. This document *owns* the help-text retraction, in [[#non-goals][Non-Goals]] and in P2's re-arm table, so the marker's pointer resolves.
+- [[./hook-execution.org]] — the log filename spec with its anti-collision sequence number, log rotation, =hook logs --tail=, and the per-=hook_id= active-child check all did not ship. Marked at each claim, because those are the =[code]=-shaped inventory lines a reader would otherwise take as evidence.
+- [[./server-hooks.org]] — "Each hook has its own cursor and runs independently of other hooks" is false; the fetch-function names and the cursor-on-completion claim are stale; the "written atomically on every cursor update" line is still true and is *annotated* rather than superseded, because it constrains P3.
 
-* Open Questions / decisions needed
+* Open Questions
+:PROPERTIES:
+:CUSTOM_ID: open-questions
+:END:
 
-1. *F1 (log filename collision)* — fold the sequence number into this change (a few lines in =executeHookCommand=), or leave it to the hook-execution-log retention item? I have not widened scope. Recommendation: leave it, but do not let the retention item drop it — 44% of executions on a burst lose their log today.
-2. *F2 (exact-topic rescan)* — separate document, or fold in? Recommendation: separate and soon; it touches the client fetch path, which this document does not.
-3. *SCAN column, one name or two?* This document reports one column with a pattern-shape-dependent definition, mirroring =Hook.cursor='s existing polymorphism. The alternative is two columns (=SCAN= and =BEHIND=), but a delivery backlog for a pattern hook is not computable without performing the scan, so the second column would be empty exactly where it would be most useful.
-4. *Should the P5 warning also fire on a single hook's lag*, not just the total? A single hook at 150,000 and fifty at 3,000 have the same total but very different remediations (prune one hook vs. the store is genuinely behind). Cheap to add; not specified above because it needs a second threshold and I would rather ship one.
+1. *[[#f1][F1]] placement.* The supervisor has directed the fix to the hook-execution-log item. Review argues it does not belong there and should be its own item scheduled ahead of it; the argument is recorded at F1. Recorded, not relitigated.
+2. *[[#f4][F4]] ownership*, and whether the "single-writer publish discipline" wording in [[./hook-registration-cursor.org]] and =src/store/topic.zig:95-100= needs amending now that a thread per connection is confirmed. Deliberately not amended here: that wording was softened once already for good reasons and re-opening it belongs with whoever fixes the race, not with a document that only walked past it.
+3. *Stage 3 gating.* This document says stage 3 follows [[#f2][F2]]. If F2 is not scheduled, does stage 3 ship with the pattern-hook-only subtotal permanently, or wait? The subtotal is correct either way; the question is whether the totals line carries two numbers forever.
 
 * References
 
-- =~/Coding/github.com/rytswd/notes/docs/incident-2026-07-27-runaway-cpu.org= — Incident 1: method, =/proc= measurements, before/after table (1,150,705 → 51,733 read syscalls/sec after pruning by hand). All figures in that document describe a specific store on 2026-07-27 and are cited here as dated evidence, not as properties of the code.
+- =~/Coding/github.com/rytswd/notes/docs/incident-2026-07-27-runaway-cpu.org= — Incident 1: method, =/proc= measurements, before/after table (1,150,705 → 51,733 read syscalls/sec after pruning by hand). All figures describe a specific store on 2026-07-27 and are cited as dated evidence, not as properties of the code.
 - =~/Coding/github.com/rytswd/notes/reviews/round-4/proposed-air/ever--hook-scan-cursor-and-lag.org= — the triage draft this document was written from. Its stale claims are marked inline in [[#motivation][Motivation]].
-- =~/Coding/github.com/rytswd/notes/reviews/round-4/proposed-air/OVERVIEW.org= — why this is item 1 of 13, and the "1 before 2" / "9 after 1" ordering. The ordering arithmetic is checked in [[#non-goals][Non-Goals]] and the "9 after 1" coupling is sharpened in P2.
+- =~/Coding/github.com/rytswd/notes/reviews/round-4/proposed-air/OVERVIEW.org= — why this is item 1 of 13, and the "1 before 2" / "9 after 1" ordering. The arithmetic is checked in [[#non-goals][Non-Goals]] and the "9 after 1" coupling is sharpened in P2.
+- =~/.local/state/ace-ever4/reviews/spec-hook-scan-cursor-and-lag.org= — independent spec review (=ever4-revcursor=, 2026-08-03). Every finding it raised is either fixed above or answered in History.
 - [[./hook-registration-cursor.org]], [[./hook-execution.org]], [[./server-hooks.org]] — the completed documents this one supersedes claims in.
 - Companion round-4 items owned by other workers: hook GC and lease, hook test harness, hook pattern matching, hook execution log retention. Not specified here.
 
@@ -490,10 +661,46 @@ What *is* required is inline supersession in the completed documents, which land
 
   *Re-verified from source*: the no-match early return at =hooks.zig:864=; the discarded scan watermark in =topic.zig=; two =pread= per event in =store.zig:245=; the spin lock at =topic.zig:92=; =updateCursor= saving the whole table per call.
 
-  *Re-verified by probe* on a private store (=127.0.0.1:7991=, =--data-dir /var/tmp/speccursor-probe/data=; the live store was never addressed): frozen cursor on a never-matching hook (54 while head reached 252); scan throughput ≈400,000 events/s and 93.7% kernel time at 2.06M lag (ReleaseFast) versus ≈66,000 events/s (Debug); the 500 ms budget crossing between 128,800 and 257,600 events of lag; publish latency 2 ms idle → 21 ms under a saturated daemon; an exact-topic hook at the tip burning 18,804 read syscalls/s on an idle store.
+  *Re-verified by probe* on a private store (=127.0.0.1:7991=, =--data-dir /var/tmp/speccursor-probe/data=; the live store was never addressed): frozen cursor on a never-matching hook (54 while head reached 252); scan throughput ≈400,000 events/s and 93.7% kernel time at 2.06M lag (ReleaseFast) versus ≈66,000 events/s (Debug); the 500 ms budget crossing between 128,800 and 257,600 events of lag; an exact-topic hook at the tip burning 18,804 read syscalls/s on an idle store.
 
-  *Open question answered*: hook dispatch is *not* lossy. 50 events in a burst produced 50 executions and 28 log files — the =<hook-id>-<epoch-ms>.log= filename collides under =O_TRUNC=. Recorded as F1 with its own acceptance criterion; scope deliberately not widened.
+  *Open question answered*: hook dispatch is *not* lossy. 50 events in a burst produced 50 executions and 28 log files — the =<hook-id>-<epoch-ms>.log= filename collides under =O_TRUNC=.
 
-  *Stale claims from the draft marked at the claim rather than only here*: there is no =hook list --json= at this base, and =hook list= writes to stderr so its output is not greppable on stdout.
+  *Not verified*: the live-store figures in the incident — that store has since been pruned and probing it is forbidden; carried as dated evidence only. The supervisor's live observation at offsets 116589/116590 was not inspected directly; the mechanism behind it was reproduced independently.
 
-  *Not verified*: the live-store figures in the incident (111,031 events / 28 hooks / 2,004,113 rescanned) — that store has since been pruned and probing it is forbidden; they are carried as dated evidence only. The supervisor's live observation at offsets 116589/116590 was not inspected directly; the mechanism behind it was reproduced independently.
+- 2026-08-03: Fix round after independent spec review (=ever4-revcursor=, verdict *changes-requested*: 1 blocker, 6 major, 5 minor, 3 nits). Every source claim in the review was re-checked against the base before being adopted; all ten held. Document only; no source changed; state stays =draft=.
+
+  *B1 (blocker) — the safety discharge was built on a false premise, and the premise was inherited.* The first revision argued that the head is read under the same mutex =publish= takes. It is not: =publish= drops the manager mutex across =log.append= (=topic.zig:248=), =Log.append= takes the Log's own mutex (=store.zig:135=), =fetchPatternByOffset= never takes it, and =server.zig:97= spawns a thread per connection. The claim came from the doc-comment at =topic.zig:311-313=, which asserts the same thing — a =[code]=-shaped claim that nothing revalidated, propagating into a spec, which is the failure mode =common.md= names. Replaced with a per-event, lock-free discharge; the retraction is marked at the claim in P1, the source comment is added to the acceptance criteria, and the consequence for =scan_end= exceeding the entry head is now stated rather than looking like a bug.
+
+  *F4 added.* The =readBatch=/=append= race the review established from source is recorded as a finding with its own acceptance criterion, explicitly *not* fixed here, explicitly *not* established by a thread-sanitizer run, and with its relationship to this change stated precisely: the P1 invariant is unaffected because it is per-event, the fix reduces the exposure window for prefix hooks, and it neither causes nor cures the hazard.
+
+  *M1.* =Last Offset= is renamed to =CURSOR=. The first revision added a SCAN column beside a column whose meaning P2 silently destroys — and that column is the *only* CLI-visible symptom of the pathology at this base. P4 now argues the rename as part of the fix rather than as garnish.
+
+  *M2.* The buffer-full row of the invariant discharge was factually wrong: the marker and =!matchTopic= tests precede the buffer-full test, so once the buffer is full the loop keeps advancing =cursor= over non-matches to the next match (bounded by ~16, the chunk slack). Safe and desirable, but not "no change in behaviour". Also inherited from a source comment (=topic.zig:344-350=). T1's full-batch fixture now interleaves non-matching traffic, without which it cannot distinguish the readings; P2 step 3 now says *dispatch loop* in so many words; and the contradictory T6 mutation row is retracted at the row.
+
+  *M3.* The T3 read counter is now stated as test-only. =ever status= reads the data directory offline and never queries the store, so exposing an in-memory counter would need a new wire request/response that this document does not propose.
+
+  *M4.* P4 defined SCAN as cost and P5 justified its threshold as backlog. Under P4's own definition twenty ordinary exact-topic hooks total 100,000 and would hold the alarm on permanently — a counter-example this document had already measured as F2 before writing the justification. Trigger 2 now sums *prefix/wildcard* hooks only, with the reason stated, and the justification is rewritten in cost language. Both false sentences are retracted at the claim.
+
+  *M5.* Trigger 2's 100,000-event constant was a ReleaseFast number in a document that argues at length against absolute event counts; on Debug the budget is exhausted around 33,000, so it was a late warning, not an early one. Trigger 2 is now expressed as projected scan time against the *measured* scan rate, which the daemon already has for free from trigger 1's timing and P1's watermark. No constants beyond the two budget fractions.
+
+  *M6.* =src/store/status.zig= — where =ever status= is actually rendered — was missing from the file inventory, as was the fact that it defines a *second, offline* =HookInfo= distinct from the wire struct, and that =ever status --json= already exists and must carry the total too.
+
+  *m1.* Marker inclusivity is pinned: prefix SCAN is the marker-inclusive head (=nextOffset()=, not =total_events=), exact SCAN is the marker-inclusive offset-list length (=2 × offsets.len= reads, not =non_marker_count=).
+
+  *m2 — the evidence-honesty finding, taken seriously.* The publish-latency claim was a single unreplicated pass of ten round-trips extrapolated linearly by 21.5× to "≈280 ms" and "a 100× degradation". Re-measured to the rule: 3 alternating blocks of 20 per condition, 60 samples each, hooks added and removed live so the conditions interleave. Idle 2.3 ms median; 25 dead hooks (total lag 125,000) 15.2 ms median; *one* dead hook with the same per-hook lag 2.3 ms — identical to idle, because the daemon still reaches its sleep. Delta of medians 12.9 ms against a predicted single-hook scan of 12.5 ms; delta of *minima* 0.1 ms, which shows it is a lock-wait and not a throughput cost. The 280 ms figure is retained only as an explicitly labelled unverified projection. The scan table's own deviation from the ≥20-interleaved-runs rule is now flagged, with the argument for why it was not re-run (independent reproduction to within 0.5% is stronger evidence than more runs of the same harness).
+
+  *m3.* The =[Amended]= marker in [[./hook-registration-cursor.org]] pointed here for the =--from= help-text bug and this document did not mention it. Now owned in Non-Goals and in P2's re-arm table.
+
+  *m4.* =scan_end.* = start_offset= is required as the first statement of the function, so the error path cannot feed garbage into =max(cursor, scan_end)=.
+
+  *m5.* T3, T5 and T7 now inherit T2's wall-clock bounding rule by name. T5's fixture is fast enough that a bare =sleep= would appear to work, which is how the rule stops being followed.
+
+  *n1, n2, n3.* Line citations corrected (=topic.zig:314-315= for the lock; =status.zig:467-483=, not =main.zig handleStatus=, for per-hook cursor rendering). The Summary's complexity claim and the Non-Goals index arithmetic are now qualified as *prefix/wildcard only* — the incident store's other 14 hooks were exact-topic and contributed nothing to the 2,004,113 figure while each re-reading its whole topic every tick.
+
+  *T7 added.* Nothing in the first revision's plan exercised the =ConcurrentLimitReached= guard, which is the one that actually protects delivery. T7 fills the limit with =sleep 30= children and asserts the cursor stopped at the 17th event.
+
+  *Restructured* into three explicit stages — P1+P2+P3, then F2, then P4+P5 — adopting the review's ordering. The reason is M4: while an idle exact-topic hook contributes its whole topic size to the store's scan cost, P5's threshold cannot be justified coherently, so the observability half must follow the F2 fix rather than precede it.
+
+  *Adopted without change from the review*: no per-hook P5 threshold (name the largest contributor in the existing line instead — zero new constants, and it answers the remediation question rather than the detection one); one SCAN column in one unit with two formulas; the =EVER_OFFSET= nested-shell trap added to F1's acceptance criterion, because a naive probe records empty lines and that is indistinguishable from the symptom under test.
+
+  *Argued back on, once*: F1's placement. The review's case that it does not belong behind the retention item is good and is recorded in full at F1 — per-hook directories do not fix a same-hook same-millisecond collision, and a two-reviewer posture earned by deleting files does not transfer to adding a counter to a filename. The supervisor has directed it to the retention item and this document follows that; the argument is preserved so whoever owns that item sees it rather than assuming F1 comes along for free.
