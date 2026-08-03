@@ -90,8 +90,10 @@ and the store logged =Hook #3 (pid 3274710) exited with status 127=. So:
 8. *The envelope's =offset= is a global log offset; an exact-topic hook's cursor is a topic-local skip count.* In the probe, five events on =probe.done= carried envelope offsets 1–5 while =hook list= showed cursor =5=; a second topic's first event took global offset 7. The two numbers are in different coordinate systems. See [[*Synthesising the event]].
 9. *Hook execution logs live at =<data-dir>/hooks/<id>-<millis>.log=*, and =hook logs= selects the newest file whose name starts =<id>-= and ends =.log= (=src/net/server.zig=, =handleHookLogs=). Anything this feature writes into that directory would be picked up as a real execution.
 10. *=ProcessTable= is mutex-protected* (=src/store/hooks.zig=), read by the connection thread for =hook ps= and written by the daemon thread.
-11. *[read from source, not executed]* =reapChildren= calls =waitpid(-1, &status, WNOHANG)= every 500 ms and discards the status of any pid not in the process table (=src/store/hooks.zig:752-767=). This is the central implementation hazard — see [[*The reaper race]].
+11. *=reapChildren= is the sole =waitpid(-1, …, WNOHANG)= caller, it runs on more than one thread, and it discards the status of any pid not in the process table* (=src/store/hooks.zig:752-769=). Three call sites, not one: =daemonLoop= (=:738=, every 500 ms), =killChildrenForHook= (=:710=, =:723=, =:738= — reached from =Server.handleUnregisterHook=, =src/net/server.zig:318-329=, i.e. *on a connection thread* whenever anyone runs =ever hook rm=), and =shutdownChildren= (=:813=, =:826=). [Superseded: 2026-08-03] An earlier draft of this fact named only the daemon loop, and the design that rested on it stated the wrong invariant. This is the central implementation hazard — see [[*The reaper race]].
 12. *[read from source, not executed]* Cursor advance and one-shot removal live in =processHook=, one level *above* =executeHookCommand=, which touches neither. The structural separation this document needs already exists; it is not yet enforced by types.
+13. *The =EVER_*= variables are not =envp= entries.* The daemon builds one shell string — =cd '<cwd>' && [custom env] EVER_TOPIC='…' … EVER_DATA='<envelope>' exec <command>= — and passes it as a single =argv= element to =/bin/sh -c= (=src/store/hooks.zig:909-944=), escaping each value through the hand-written =appendShellEscaped= (=:1153-1163=). =EVER_SYNTHETIC= will be implemented in that prefix, and the =EVER_DATA=/stdin identity passes through that quoter — see [[*Test plan]] step 1. Custom =hook.env= pairs are additionally filtered by =isValidEnvKey= (=:1132-1140=) and *silently dropped* when the key is empty or non-identifier (=:914-926=); there is no CLI flag that sets them today, so every hook in the field has ="env":null=.
+14. *A single =argv= element is capped at 131,072 bytes on this kernel* — measured by bisection: the largest accepted element was 131,065 bytes plus a 6-byte prefix, i.e. exactly 32 pages including the NUL. Values of 100,000 and 130,000 bytes deliver to a hook today (measured); above roughly 130,800 the shell string exceeds the cap. *[read from source]* =execve= failing leaves the child at =std.os.linux.exit(127)= (=:1078-1081=) with no diagnostic at all — a second, independent producer of the ambiguous 127 that [[*Re-verification]] discusses. Relevant to =EVER_VALUE=; see [[*Alternatives considered]].
 
 * Proposal
 
@@ -109,7 +111,13 @@ The alternative — fork from the CLI — is rejected on evidence, not taste. It
 | user / umask / rlimits | store's                            | operator's                        |
 | fd 1,2               | regular file in =<data-dir>/hooks/=   | terminal, or whatever             |
 
-Failure 1 of the six was =chronoa send= to a session name that no longer existed. In an operator's interactive shell =$CHRONOA_DAEMON= is set; in the store's environment it is not. A client-side test would have printed a green transcript for the single failure that cost the most hours. The tool's value is entirely in being *the same path*, and the environment is where paths differ.
+The argument does not rest on any particular failure having gone green, and an earlier draft of this document made the mistake of resting it on one. *The general form:* a client-side fork can only ever produce *false greens about the environment*, and the environment is the one property of a delivery that cannot be reproduced outside the store process. Every other divergence in the table above is either reproducible with care or visible when it goes wrong; an environment difference is invisible by construction, because the transcript would faithfully report an environment nobody will ever deliver into.
+
+Failure 1 is a good illustration provided it is told accurately, and the accurate telling is a *stronger* argument. The source (=ace-operations.org:29-32=) records *two simultaneous causes*: a stale session name after a =pi -r= revival, *and* an empty =$CHRONOA_DAEMON=. A client-side test would have caught the first — verified: with =CHRONOA_DAEMON= set, =chronoa send <no-such-session> …= exits 3 with =error: session '…' not found=, so the transcript would have been *red*, not green. It is the second cause that a client-side test cannot see, and the sequencing is the point: *once the session name was fixed, a client-side preflight would have gone green while production stayed broken*, because =$CHRONOA_DAEMON= is present in an operator's shell and absent in the store's. A preflight that goes green at the moment the remaining bug becomes the only bug is worse than no preflight.
+
+[Superseded: 2026-08-03] The first draft of this section claimed a client-side test "would have printed a green transcript for the single failure that cost the most hours". That is false and falsifiable in one command; it collapsed two causes into one. The claim above replaces it.
+
+The tool's value is entirely in being *the same path*, and the environment is where paths differ.
 
 Executing on the *connection* thread rather than the daemon thread is also deliberate: a =hook test= against a 30-second command must not stall delivery for every other hook, which is what running it inline in =pollAndExecute= would do.
 
@@ -167,26 +175,26 @@ Two accommodations, both because the current CLI cannot express what the store c
 The transcript is the product. Its one job is to show the bytes rather than a view of the bytes.
 
 #+begin_src
-$ ever hook test 7 --topic ever4.spectest.done --payload '{"agent":"ever4-spectest","status":"done"}'
+$ ever hook test 5 --topic ever4.spectest.done --payload '{"agent":"ever4-spectest","status":"done"}'
 
-Hook             #7 (notify-orch)
+Hook             #5 (notify-orch)
 Pattern          ever4.                       (prefix)
 Topic            ever4.spectest.done          matches pattern: yes
 Command          /home/ryota/.local/state/ace-ever4/notify-orch.sh
 Working dir      /home/ryota/.local/state/ace-ever4
-Executed by      store 127.0.0.1:7890, pid 3241, uid 1000
+Executed by      store 127.0.0.1:17890, pid 3241, uid 1000
 Store PATH       /nix/store/…/bin:/home/ryota/.local/bin:…
 
-── stdin: 137 bytes, verbatim ──────────────────────────────────────────────
-{"topic":"ever4.spectest.done","offset":116637,"timestamp":1785717000000,"key":null,"value":"{\"agent\":\"ever4-spectest\",\"status\":\"done\"}"}
+── stdin: 140 bytes, verbatim ──────────────────────────────────────────────
+{"topic":"ever4.spectest.done","offset":7,"timestamp":1785719232750,"key":null,"value":"{\"agent\":\"ever4-spectest\",\"status\":\"done\"}"}
 ── end stdin ───────────────────────────────────────────────────────────────
 
 ── environment set by the store for this delivery ──────────────────────────
 EVER_TOPIC=ever4.spectest.done
-EVER_OFFSET=116637
-EVER_TIMESTAMP=1785717000000
+EVER_OFFSET=7
+EVER_TIMESTAMP=1785719232750
 EVER_KEY=
-EVER_DATA=(identical to stdin, 137 bytes)
+EVER_DATA=(identical to stdin, 140 bytes)
 EVER_SYNTHETIC=1     ← set only by `hook test`; unset during real delivery
 ── end environment ─────────────────────────────────────────────────────────
 
@@ -194,9 +202,11 @@ EVER_SYNTHETIC=1     ← set only by `hook test`; unset during real delivery
 …
 ── end output ──────────────────────────────────────────────────────────────
 
-Exit             0, after 41 ms
-Store            events 116637 → 116637; 42 hook cursors, none advanced
+Exit             0, after 41 ms   (signal: none, delivered: yes)
+Store            events 7 → 7; 42 hook cursors, none advanced   (conclusive)
 #+end_src
+
+*The stdin block, the =EVER_*= values and every byte count above are a verbatim capture; the header and output lines are illustrative.* Those 140 bytes are what the store actually delivered for that topic and that value on an isolated probe on 2026-08-03, at the offset and timestamp the event actually received, recorded by a hook that printed its own stdin and its own =wc -c=. The first draft of this document carried an *invented* envelope labelled "137 bytes" which was in fact 145 — a reviewer measured it, in the document whose thesis is that the byte count is the point. Anything used as a worked example here must be measured, because an implementer will copy it into a golden test.
 
 Rules, each of which is a defect this prevents:
 
@@ -204,9 +214,9 @@ Rules, each of which is a defect this prevents:
 2. *The byte count is printed with the block.* "Looks the same" is how the failure survived. A count lets a reader see that an embedded newline or a trailing byte is in the payload rather than in the display.
 3. *=EVER_DATA= is not printed twice.* It is byte-identical to stdin by construction; printing it again invites a reader to diff two renderings and conclude something about the second one. The transcript asserts the identity and prints the length.
 4. *The store's =PATH= is printed*, because it is the single most common reason a command that works in the operator's shell fails under the daemon, and because (per [[*Re-verification]]) it is the honest replacement for "the resolved path".
-5. *Delimiters are unambiguous and carry lengths*, so =--json= and the prose form contain the same information and neither is the "real" one.
+5. *Delimiters are unambiguous and carry lengths, and the prose form carries every field the JSON object carries*, so neither is the "real" one. That is a checkable property rather than a sentiment: =signal=, =delivered=, =reason= and =conclusive= must appear in the prose form — on the =Exit= and =Store= lines, as above — and not only under =--json=. A reviewer diffs the two field by field.
 
-=--json= emits =={"hook":{…},"event":{…},"stdin_bytes":<int>,"stdin":"<escaped>","env":{…}, "exit_code":<int|null>,"signal":<int|null>,"duration_ms":<int>,"output":"<escaped>", "delivered":<bool>,"reason":"<string|null>","store":{"events_before":…,"events_after":…, "cursors_changed":<int>,"conclusive":<bool>}}== on one line. Coordinate the exact key style with the in-flight =air/v0.1/cli-json-list-output.org= draft rather than inventing a second convention.
+=--json= emits =={"hook":{…},"event":{…},"stdin_bytes_written":<int>,"stdin_bytes_intended":<int>,"stdin":"<escaped>","env":{…}, "exit_code":<int|null>,"signal":<int|null>,"duration_ms":<int>,"output":"<escaped>", "delivered":<bool>,"reason":"<string|null>","store":{"events_before":…,"events_after":…, "cursors_changed":<int>,"conclusive":<bool>}}== on one line. The two stdin counts are separate fields rather than one because they can differ and the difference is the finding — see [[*The fork-to-registration window]]. Coordinate the exact key style with the in-flight =air/v0.1/cli-json-list-output.org= draft rather than inventing a second convention.
 
 ** Refusability
 
@@ -243,7 +253,9 @@ ID   NAME          PATTERN   KIND     COMMAND
 1 of 42 hooks would fire for 'ever4.spectest.status'.
 #+end_src
 
-It is a pure function of the hook table and =topic.matchTopic=: no execution, no publish, no cursor, no log file. It is also *strictly cheaper and lands sooner* than the execution half, and it is the piece the rest of the round-4 hook chain actually needs. See [[*What this makes checkable, and what it does not]].
+It is a pure function of the hook table and =topic.matchTopic=: no execution, no publish, no cursor, no log file. Using the store's own matcher is not an implementation detail — =fetchPatternByOffset= calls =matchTopic= too (=src/store/topic.zig:338=), so the query and delivery agree by construction. If =hook match= resolved client-side it would have to duplicate the matcher, which is exactly the divergence this document warns about for =buildEventJsonFromStore=; prefer a small server-side verb, or expose the one matcher through the library.
+
+*The contract needs stating precisely, and it is not the one the heading implies.* "Which hooks would this topic wake?" is only equivalent to "which hooks' patterns match?" while every registered hook is armed. =ever--hook-gc-and-lease.org= is scheduled *before* this item and introduces =armed= / =disabled= / =quarantined= plus =expires_at=; from the day it lands, a hook can match a topic and not wake for it. So: *=hook match= answers "whose pattern matches", it prints the hook's state in a column, and once states exist it marks the rows that match but would not fire.* Anything vaguer starts lying on the day item 2 ships — the same class of error this document catches in the OVERVIEW. It is also *strictly cheaper and lands sooner* than the execution half, and it is the piece the rest of the round-4 hook chain actually needs. See [[*What this makes checkable, and what it does not]].
 
 The same listing should back a =--dry-run= on =hook add= ("this pattern would match these existing topics; N hooks already cover it"), which catches failure 2 at the earliest possible moment. Noted as a follow-up, not specified here.
 
@@ -270,9 +282,19 @@ Exit 3 is separate from 1 because "the hook hung" and "the hook failed" call for
 
 *** By type
 
-Extract the delivery core out of =HookDaemon.executeHookCommand= (which today already touches neither cursors nor the log — fact 12) into a free function whose signature makes mutation a compile error:
+Extract the delivery core out of =HookDaemon.executeHookCommand= (which today already touches neither cursors nor the log — fact 12) into free functions whose signatures make mutation a compile error.
+
+*The extraction must be in two halves, and only the first is shared with the daemon.* =executeHookCommand= is *fire-and-forget*: it forks, writes stdin, registers the child in =ProcessTable= and returns; the exit status is collected later by =reapChildren=, and =processHook= advances the cursor immediately after the *spawn* (fact 12, =src/store/hooks.zig:866-888=). A single =deliver= that returns an exit status therefore cannot be the daemon's path — handing it to =pollAndExecute= would serialise all hook delivery behind each hook's runtime, bounded only by =DEFAULT_HOOK_TIMEOUT_SECS = 300=, which is exactly the synchronous model =air/v0.1/hook-execution.org= was written to replace and exactly what this document rejects for the daemon thread elsewhere.
 
 #+begin_src zig
+const Spawned = struct {
+    pid: i32,
+    pgid: i32,
+    started_ms: i64,
+    log_path: []u8,
+    completion: *Completion,  // null for daemon spawns; see "The reaper race"
+};
+
 const Delivery = struct {
     exit_code: ?u8,
     signal: ?u8,
@@ -280,24 +302,42 @@ const Delivery = struct {
     output: []u8,
 };
 
-/// Executes `hook.command` for `event` exactly as the daemon does.
-/// Takes no mutable store handle: it cannot publish and it cannot move a cursor.
-fn deliver(
+/// Builds the envelope and the shell string, opens the log file, forks,
+/// registers the child, writes stdin. Returns as soon as the child is
+/// running and tracked. This is the daemon's path AND the test's path.
+///
+/// Takes no mutable store handle: it cannot publish and it cannot move a
+/// cursor. `*ProcessTable` is passed because registration is the point,
+/// and it holds neither a cursor nor a log.
+fn spawn(
     allocator: Allocator,
     envp: [*:null]const ?[*:0]const u8,
+    data_dir: []const u8,
+    process_table: *ProcessTable,
     hook: Hook,               // by value — a snapshot
     event: store.Event,       // by value — never appended anywhere
-    opts: DeliverOpts,
-) !Delivery
+    opts: SpawnOpts,          // synthetic, deadline_ms, log directory
+) !Spawned
+
+/// Connection-thread only. Waits on the completion slot, reads and unlinks
+/// the log. Never called by the daemon.
+fn awaitCompletion(spawned: Spawned, deadline_ms: i64) !Delivery
 #+end_src
+
+=deliver = spawn + awaitCompletion= exists only as the =hook test= handler's composition of the two. =processHook= calls =spawn= alone, and its behaviour is unchanged.
+
+The guarantee lives on =spawn='s parameter list, which is where the publish and cursor paths would have had to enter:
 
 - No =*TopicManager= parameter → =publish= is unreachable → the log cannot grow.
 - No =*HookTable= parameter → =updateCursor= and =remove= are unreachable → no cursor can move and a =--once= hook cannot be auto-removed by a test.
 - =hook= and =event= are values, so nothing the callee does is visible to the caller's table.
+- =data_dir= is passed as a slice rather than reached through =self.hook_table.data_dir= (which is how =executeHookCommand= gets it today, =src/store/hooks.zig:949-955=), precisely so that no =*HookTable= is in scope. Note the log path is formatted into a fixed =[256]u8= with an =error.PathTooLong= failure mode, and =hook-tests/= is six bytes longer than =hooks/=; that margin needs a test, not an assumption.
 
-=processHook= then calls =deliver= and does its cursor bookkeeping itself, one level up, exactly as it does today. This is a refactor of ~40 lines with no behaviour change, and it is the part of this proposal a reviewer should scrutinise hardest, because it is the part everything else rests on.
+*Sizing, corrected.* An earlier draft called this "a refactor of ~40 lines with no behaviour change". =executeHookCommand= runs =src/store/hooks.zig:891-1129= — *239 lines*, essentially all of it the delivery core: envelope build, shell-string assembly through =appendShellEscaped=, log-file open, a ~60-line context header, =pipe2=, =fork=, =execve=, the stdin write and =ProcessTable= registration. [Superseded: 2026-08-03] The "~40 lines" figure understated it by roughly 5× and a scheduler would have sized this wrong. It is behaviour-preserving for the daemon *except* for the registration reordering required by [[*The fork-to-registration window]], which is called out there and is the one part of the refactor that changes what the daemon does.
 
-The =hook test= handler additionally never constructs an =Event= that anything else can reach: it is a stack value passed to =deliver= and dropped.
+This is the part of the proposal a reviewer should scrutinise hardest, because it is the part everything else rests on. It should land and be reviewed *separately* from the new subcommand.
+
+The =hook test= handler additionally never constructs an =Event= that anything else can reach: it is a stack value passed to =spawn= and dropped.
 
 *** By observation, on every run
 
@@ -344,43 +384,92 @@ On =offset=: the envelope's =offset= is a *global* log offset, whereas an exact-
 
 *This is the hazard the draft's "with the store lock untouched" does not cover, and the one most likely to be missed in implementation.*
 
-=HookDaemon.reapChildren= runs every 500 ms and calls =waitpid(-1, &status, WNOHANG)= — *any* child of the store process — then discards the status of any pid it does not recognise (=src/store/hooks.zig:752-767=, read from source). If the =hook test= handler forks a child on the connection thread and then calls =waitpid(child_pid, …)=, the daemon and the handler race:
+=HookDaemon.reapChildren= calls =waitpid(-1, &status, WNOHANG)= — *any* child of the store process — and discards the status of any pid it does not recognise (=src/store/hooks.zig:752-769=). It runs on the daemon loop every 500 ms, and it also runs on *connection* threads (fact 11). If the =hook test= handler forks a child and then calls =waitpid(child_pid, …)=, it races every one of those callers:
 
-- daemon wins → the handler's =waitpid= returns =ECHILD= and *the exit status is unrecoverable*;
-- handler wins → correct.
+- a reaper wins → the handler's =waitpid= returns =ECHILD= and *the exit status is unrecoverable*;
+- the handler wins → correct.
 
 A typical hook command finishes in tens of milliseconds against a 500 ms reap period, so this passes in development and loses intermittently in the field. A preflight that intermittently reports "exit status unknown" is a preflight nobody trusts, and it fails in the direction of a false green.
 
-*Resolution: the daemon stays the sole owner of =waitpid=.* Register the test's child in the existing mutex-protected =ProcessTable= (fact 10) with a completion slot:
+*The resolution rests on an invariant, and it is not the obvious one.* [Superseded: 2026-08-03] An earlier draft stated it as "the daemon stays the sole owner of =waitpid=". *That is already false at base* — =reapChildren= runs on connection threads too, via =Server.handleUnregisterHook= (=src/net/server.zig:318-329=) → =HookDaemon.killChildrenForHook= (=src/store/hooks.zig:701=), which calls it at =:710=, =:723= and =:738=. An implementer who believes the daemon is the sole owner will audit =daemonLoop= and will not notice that an =ever hook rm= issued during a =hook test= reaps the test's child from a third thread.
+
+*The true and load-bearing invariant:* =reapChildren= is the *sole* =waitpid(-1)= caller; it may run on any thread; and every status it collects is published through =ProcessTable.removeByPid= (=src/store/hooks.zig:566=). Nothing else in the store process may call =waitpid= in any form. Any new code path that wants a child's exit status must obtain it through the process table, not by waiting.
+
+So: register the test's child in the existing mutex-protected =ProcessTable= (fact 10) with a completion slot.
 
 #+begin_src zig
 pub const ProcessEntry = struct {
     // … existing fields …
     synthetic: bool = false,
-    /// Written by the reaper, read by the waiting connection thread.
+    /// Per-entry deadline. Daemon spawns get
+    /// `start_time + DEFAULT_HOOK_TIMEOUT_SECS * 1000`, preserving today's
+    /// behaviour exactly; `hook test` spawns get `start_time + --timeout`.
+    deadline_ms: i64,
+    /// Non-null only for `hook test` spawns. Refcounted; see below.
     completion: ?*Completion = null,
 };
 
 const Completion = struct {
     done: std.atomic.Value(bool),
     status: std.atomic.Value(u32),
+    /// 2 at creation: one reference for the ProcessTable slot, one for the
+    /// waiting connection thread. Whoever decrements it to 0 frees it.
+    refs: std.atomic.Value(u8),
 };
 #+end_src
 
-=reapChildren= already calls =removeByPid=; when the removed entry carries a =completion=, it stores the status and sets =done=. The connection thread waits on that, bounded by =--timeout=.
+=reapChildren= already calls =removeByPid=; when the removed entry carries a =completion=, it stores the status, sets =done=, and releases the table's reference. The connection thread waits on =done=, bounded by the harness deadline, and releases its own reference when it stops waiting — for *any* reason.
+
+*Ownership rule, stated because "both sides free carefully" is how this becomes a double free.* =Completion= is heap-allocated by the connection thread with =refs = 2=. There is exactly one release function, =release(c)= = =if (c.refs.fetchSub(1, .acq_rel) == 1) allocator.destroy(c)=. It is called exactly twice: once by =reapChildren= under the =ProcessTable= mutex after publishing the status, and once by the connection thread when it abandons the wait. Neither side ever frees unconditionally, and neither side reads =*Completion= after its own release. This matters concretely because =ProcessEntry= is copied *by value* out of =removeByPid= (=src/store/hooks.zig:566-581=), so the reaper still holds the pointer after the slot is cleared — a design in which the connection thread "just frees it on timeout" is a use-after-free that will never fire in development and will fire in the field.
+
+Every early-exit path between =ProcessTable.add= and the end of the wait — timeout, client disconnect, allocation failure, error return — goes through the same =release=. If the connection thread never reached =add=, it owns both references and releases twice.
 
 This falls out well for four other reasons:
 
-1. =checkTimeouts= already kills entries in the table, so a hanging *test* child is killed by the same code that kills a hanging *real* hook — the "same path" property extends to the failure case rather than stopping at the happy one.
+1. *A hanging test child is killed, but not by =checkTimeouts= as it stands.* [Superseded: 2026-08-03] An earlier draft claimed "=checkTimeouts= already kills entries in the table, so a hanging test child is killed by the same code that kills a hanging real hook". It does not: =checkTimeouts= (=src/store/hooks.zig:773-802=) compares every entry's =start_time= against the single global =DEFAULT_HOOK_TIMEOUT_SECS = 300= (=:509=), and =ProcessEntry= carries no per-entry deadline. With =--timeout= defaulting to 60 s the harness would return exit 3 while the child ran on for another 240 s. Two changes make the claim true: =deadline_ms= on =ProcessEntry= (above), with =start_time + 300 s= as the fallback so *daemon* behaviour is unchanged; and =checkTimeouts= comparing against it. The connection thread additionally sends =SIGTERM= to the pgid itself the moment its deadline expires, so exit 3 is honest at the instant it is returned rather than up to 1.5 s later; =deadline_ms= is the *backstop* that still bounds the child if the client disconnects and no connection thread is left to signal. These are not redundant — one bounds the operator's wait, the other bounds the child's life. Note in passing that =checkTimeouts= phase 2 does a 1 s =nanosleep= *on the daemon thread* (=:794=), so any timing-out child — test or real — stalls delivery for a second; that is a pre-existing cost this feature makes easier to trigger, and it is why the connection thread does its own =SIGTERM=.
 2. =shutdownChildren= already SIGTERMs the table, so stopping the store during a test cleans up.
 3. =hook ps= shows the running test — a long preflight ought to be visible — and =synthetic= gives it a column so it is never mistaken for real traffic.
 4. =MAX_CONCURRENT_HOOKS= (16) then applies to tests too. A test that cannot get a slot is exit 2, "the test could not be run", which is the honest answer rather than a queue.
 
-Rejected alternatives: routing the test through the daemon thread (a 30 s command stalls all hook delivery for 30 s); blocking =SIGCHLD= around the fork (does not help — the daemon's =waitpid(-1)= does not need the signal); =pidfd_open= + =waitid(WNOWAIT)= (still racy against a =waitpid(-1)= that reaps).
+Rejected alternatives: routing the test through the daemon thread (a 30 s command stalls all hook delivery for 30 s); blocking =SIGCHLD= around the fork (does not help — =reapChildren= does not need the signal); =pidfd_open= + =waitid(WNOWAIT)= (still racy against a =waitpid(-1)= that reaps, and it would break the sole-caller invariant this design depends on).
+
+** The fork-to-registration window
+
+*This is a defect in the daemon that this feature does not introduce, makes reachable on demand, and must therefore bound. It is stated here rather than fixed here.*
+
+=executeHookCommand= writes the entire envelope to the child's stdin pipe *before* registering the child in =ProcessTable=:
+
+#+begin_src
+src/store/hooks.zig:1085   _ = std.os.linux.close(pipe_fds[0]);
+src/store/hooks.zig:1089   writeAllFd(pipe_fds[1], json);      // blocking, unbounded
+src/store/hooks.zig:1090   _ = std.os.linux.close(pipe_fds[1]);
+   …
+src/store/hooks.zig:1122   if (!self.process_table.add(entry)) { … }
+#+end_src
+
+=writeAllFd= (=:1144-1151=) is a blocking loop on a raw =write=. If the envelope exceeds the pipe buffer (64 KiB on Linux) and the handler does not read stdin, the *caller* blocks for the child's entire lifetime, during which the child is invisible to =hook ps=, to =checkTimeouts= and to =shutdownChildren=.
+
+*Measured independently on an isolated probe, 2026-08-03.* Hook =#1= = a script that never reads stdin and sleeps 30 s; one event with a 90,000-byte value published at 01:05:44; an unrelated hook =#2= on a different topic given an event at 01:05:47. Store log:
+
+#+begin_src
+[2026-08-03 01:06:14] Hook #1: started pid 3710312, log: …/hooks/1-1785719144255.log
+[2026-08-03 01:06:14] Hook #2: started pid 3714748, log: …/hooks/2-1785719174268.log
+#+end_src
+
+The "started pid" line is printed *after* the stdin write, and appears 30 s after the publish. =hook ps= during the window reported "No running hook processes". The unrelated hook =#2= fired 27 s late: *one hook stalled the entire daemon*, which is the scenario this document rejects for the daemon thread elsewhere. Note also the log filename timestamp (=…1785719144255=, taken before the fork) versus hook =#2='s (=…1785719174268=): 30,013 ms apart in a single stalled cycle.
+
+*Why it is this document's problem.* =hook test= runs this code on a *connection* thread with an operator-supplied payload, and =--payload-file= exists precisely so that large and awkward payloads can be delivered. =ever hook test <id> --payload-file 100k.json= against a handler that does not =cat= wedges a connection thread with no deadline at all — =--timeout= is specified as bounding the *completion wait*, and the completion wait has not started yet. The feature turns an accident into a one-liner.
+
+*What this design does about it,* and no more:
+
+1. =spawn= registers the child in =ProcessTable= *before* writing stdin, so it is visible to =hook ps= and killable by =checkTimeouts= and =shutdownChildren= for the whole of its life. This is the one part of the =spawn= extraction that changes daemon behaviour — the child becomes visible earlier and its concurrency slot is taken earlier — and it should be reviewed as a behaviour change rather than waved through as part of a refactor.
+2. On the *test* path, the stdin write is bounded by the harness deadline (non-blocking fd plus =poll=, carried on =SpawnOpts=). A write that does not complete within it is *exit 2*, "the test could not be run", naming the bytes written and the bytes intended. It is not exit 1: nothing has been learned about the hook.
+3. The transcript reports bytes *written*, not bytes *intended*. This is not pedantry: =writeAllFd= returns =void= and breaks silently on =n <= 0=, so a short write today — a handler that exits early, closing the read end — truncates the envelope with no error anywhere. A transcript that printed the intended length would be asserting the document's central claim about bytes on the strength of a number it did not verify.
+4. The daemon's own instance of the unbounded write is *not* fixed here. Bounding delivery to a real hook changes delivery semantics (what does the store do with an event a handler will not read?) and that decision belongs with =ever--hook-gc-and-lease.org='s backoff-and-quarantine work, or its own item. This document only stops =hook test= from being the easy way to trigger it.
 
 ** Output capture
 
-The child's fd 1 and 2 are redirected to a regular file, exactly as in production — not to a pipe. This matters twice: libc's buffering mode and =isatty= must not differ from production, and a pipe with no concurrent drain deadlocks on output larger than the pipe buffer.
+The child's fd 1 and 2 are redirected to a regular file, exactly as in production — not to a pipe. This matters twice: libc's buffering mode and =isatty= must not differ from production, and a pipe with no concurrent drain deadlocks on output larger than the pipe buffer. (The stdin side has the same shape and is live today — see [[*The fork-to-registration window]].)
 
 The file is =<data-dir>/hook-tests/<hook-id>-<millis>.log=, deliberately *not* under =<data-dir>/hooks/=:
 
@@ -391,9 +480,12 @@ The file is read back into the response and *unlinked*. Nothing accumulates: the
 
 ** Resolving =<id-or-name>=
 
-Reuse the existing list-then-match resolution, with one change: names are not unique and the current =hook rm= silently takes the first match (fact 6). =hook test= must *refuse* an ambiguous name — exit 2, listing every candidate with its id and pattern. Testing the wrong hook and reporting success is the failure mode this feature exists to eliminate; reproducing it in the resolver would be self-defeating.
+Reuse the existing list-then-match resolution, with *two* changes. Both exist because testing the wrong hook and reporting success is the failure mode this feature exists to eliminate, and reproducing it in the resolver would be self-defeating.
 
-(=hook rm='s silent first-match is a separate defect, out of scope here. It is worth raising with =ever--hook-gc-and-lease.org=, which adds more name-addressed verbs onto the same resolver.)
+1. *Refuse an ambiguous name.* Names are not unique (fact 6) and =hook rm= silently takes the first match. =hook test= exits 2, listing every candidate with its id and pattern.
+2. *Refuse an argument that is both a valid id and a name.* =handleHookRm= (=src/main.zig:556-563=) tries =parseInt= first and only falls back to a name lookup on failure, so a hook *named* =3= can never be addressed by name at all. Verified live: with a hook =#3= named =rec= and a hook =#4= named =3=, =ever hook rm 3= removed =#3= and left =#4= standing. =hook test= must exit 2 when a numeric argument also matches a name, and offer =--id N= / =--name S= to disambiguate. This is the same silent-wrong-hook defect as fact 6, in the same resolver, one line of specification away.
+
+(=hook rm='s two behaviours are separate defects, out of scope here. Both are worth raising with =ever--hook-gc-and-lease.org=, which adds =gc= and =enable= onto the same resolver.)
 
 ** CLI declaration
 
@@ -403,14 +495,28 @@ Declared under the existing =hook= command in =src/main.zig='s =app= literal, in
 
 | Code | Name           | Direction | Body                                                                    |
 |------+----------------+-----------+-------------------------------------------------------------------------|
-| 0x10 | =hook_test=    | Request   | ={"hook_id":N,"topic":"…","value":"…","key":null,"offset":null,"timeout_ms":60000,"mark_envelope":false}= |
+| 0x10 | =hook_test=    | Request   | ={"hook_id":N,"topic":"…","value":"…","key":null,"offset":null,"timestamp":null,"timeout_ms":60000,"mark_envelope":false}= |
 | 0x90 | =hook_test_ok= | Response  | the =--json= object described in [[*The transcript]]                       |
 
 Errors use the existing =error_response= (=0xFF=) frame. Note the request carries =hook_id= only — name resolution happens client-side against =list_hooks=, as =hook rm= already does, so the ambiguity refusal is in one place.
 
 * What this makes checkable, and what it does not
 
-=ever hook test= is scheduled third in =reviews/round-4/proposed-air/OVERVIEW.org= on the argument that it "is what makes every later hook change verifiable". *On the evidence, that argument is largely wrong, and the part of this proposal that does the work is the non-executing =hook match= query, not the execution.* Item by item, against the sibling drafts as they stand on 2026-08-03:
+=ever hook test= is scheduled third in =reviews/round-4/proposed-air/OVERVIEW.org= on a two-clause argument, quoted in full because an earlier draft of this section quoted only the first half and then claimed to have refuted the whole:
+
+#+begin_quote
+*3 early despite being a feature.* =ever hook test= is what makes every later hook change verifiable, and it is the tool half of the preflight rule in item 8. Four of six silent notification failures would have been caught by it.
+#+end_quote
+
+Three separate claims, and they do not stand or fall together.
+
+1. *"Makes every later hook change verifiable" does not hold.* Counted item by item below: *1 of 15* acceptance criteria across the four sibling Ever items becomes checkable with this feature, and the one that does is checked by the non-executing =hook match= query rather than by executing anything.
+2. *"The tool half of the preflight rule in item 8" is true but does not gate anything.* =ace--supervisor-plumbing-preflight.org= is a skill edit; all three of its acceptance criteria are about what the skill *text* says, so it can land in full whether or not this command exists. It reads better with the command and does not wait for it.
+3. *"Four of six silent notification failures would have been caught" holds*, with the correction that it requires =--topic=, which the triage draft lacked. See [[*Against the six failures it claims to catch]].
+
+*Which metric the conclusion is about matters, and the two metrics disagree.* On *sibling acceptance criteria* the query half does all the work — 1 of 15, and =hook match= is what checks it. On *field failures* the execution half does most of the work — =hook test= catches failures 1, 3 and 4; =hook match= catches failure 2. [Superseded: 2026-08-03] An earlier draft wrote "the part of this proposal that does the work is the non-executing =hook match= query, not the execution" without naming the metric, which the six-failures table in this same document contradicts. Stated properly: *the query half is what unblocks the batch; the execution half is what the feature is for.* That is an argument about sequencing, not about value, and it is why the recommendation below is to split them rather than to demote either.
+
+Item by item, against the sibling drafts as they stand on 2026-08-03:
 
 ** =ever--hook-scan-cursor-and-lag.org= (item 1) — contributes almost nothing
 
@@ -443,14 +549,14 @@ The one real contribution is a fence in the other direction: once the cursor fix
 | A glob matching nothing does not rescan every tick                          | *No.* Performance                                                |
 | =hook list= distinguishes prefix from glob                                  | *No*, but =hook match= prints the kind for the same reason        |
 
-This is the item that most needs a tool, and what it needs is a match query with no execution — which is an argument for landing =hook match= early and independently of the execution half.
+This is the item that most needs a tool, and what it needs is a match query with no execution — which is an argument for landing =hook match= early and independently of the execution half. Its one open dependency runs the other way: item 2 is scheduled *before* it and introduces hook states, so =hook match= must fix its contract before then — see [[*Why =--all= is dropped]].
 
 ** =ever--hook-exec-log-retention.org= (item 10) — one contribution, one conflict this document resolves
 
 | Its acceptance criterion                                    | Checkable?                                                        |
 |-------------------------------------------------------------+-------------------------------------------------------------------|
 | 100k executions ⇒ bounded files/bytes; =ever status= reports | *No*                                                              |
-| Flat logs migrated or read-compatible; =hook logs= still works | *Indirectly yes* — =hook test= is a cheap way to mint a fresh execution log on demand, which today requires publishing a real event |
+| Flat logs migrated or read-compatible; =hook logs= still works | *No.* [Superseded: 2026-08-03] An earlier draft said "indirectly yes — a cheap way to mint a fresh execution log". It is not: [[*Output capture]] writes to =<data-dir>/hook-tests/= and unlinks, and =handleHookLogs= reads only =<data-dir>/hooks/<id>-*.log= (fact 9), so a =hook test= run mints nothing =hook logs= can see. Correcting this makes item 10 *0 of 3*, and the document's own conclusion stronger, not weaker |
 | Tight-loop hook cannot exhaust the disk                      | *No*                                                              |
 
 *The conflict, which neither draft names:* a preflight run in a loop writes a log file per run into the directory that item is trying to bound. This document resolves it by writing to =<data-dir>/hook-tests/= and unlinking after reading ([[*Output capture]]). The retention author needs to know both that this directory exists and that it is self-bounding, so that a sharding change to =<data-dir>/hooks/= does not accidentally adopt it.
@@ -487,9 +593,11 @@ jq -r '.value | fromjson | .status // empty'
 
 to =jq -r '.status' <<<"$EVER_VALUE"=, and — more to the point — the naive literal-byte guard =case "$EVER_VALUE" in *'"status":"done"'*)= *works*. It breaks nothing: it adds a variable, changes no existing bytes, and needs no protocol change.
 
-*This is higher value per line than =hook test=,* and this document recommends landing it first. It does *not* subsume =hook test=: it addresses failure 3 only, leaving 1 (dead session name), 2 (too broad), and 4 (wrong topic) untouched. The two are complements, and the ordering argument is that the cheap permanent fix should not wait behind the expensive general one.
+*This is higher value per line than =hook test=,* and this document recommends landing it first. It does *not* subsume =hook test=: it addresses failure 3 only, leaving 1 (dead session name), 2 (too broad), and 4 (wrong topic) untouched. The two are complements, and the ordering argument is that the cheap permanent fix should not wait behind the expensive general one. Note the asymmetry in kind, not only in cost: =hook test= makes failure 3 *visible*, and only to someone who remembers to run a preflight; =EVER_VALUE= makes it *not happen*.
 
-(=EVER_VALUE= belongs in its own document — it changes the hook delivery contract, which is a different blast radius. It is named here because a reviewer should be able to see that the cheaper option was considered and why it was not treated as sufficient.)
+*It is not, however, a three-line patch, and the reason is the bound this document names so that its own document does not have to discover it.* The =EVER_*= variables are shell assignments prefixed to a single =/bin/sh -c= argv element, not =envp= entries (fact 13). =EVER_VALUE= would put the payload into that element a *second* time, roughly doubling it. A single argv element is capped at 131,072 bytes on this kernel — measured, fact 14 — and a 90,000-byte value delivers today, so the doubling puts an event of that size over the cap. The failure mode is the worst available: =execve= returning =E2BIG= leaves the child at =std.os.linux.exit(127)= with *no diagnostic anywhere*, which is byte-for-byte indistinguishable from the deleted-script case this document spends a section on. So =EVER_VALUE= must either declare a size threshold above which it is omitted (and say so, in-band, where a handler can see it), or large values must move off the argv entirely. That is a real, checkable constraint, it is not obvious, and it is exactly what gets discovered in production if the change ships as "three lines, obviously safe".
+
+(=EVER_VALUE= belongs in its own document — it changes the hook delivery contract, which is a compatibility surface for shell scripts written by other people, and that is a different blast radius from adding a CLI verb. It is the same reason this document specifies =EVER_SYNTHETIC= as a contract from day one. It is named here because a reviewer should be able to see that the cheaper option was considered, why it was not treated as sufficient, and what it will cost.)
 
 ** =hook add --dry-run=
 
@@ -507,40 +615,57 @@ Each criterion names the failure it comes from, and each is checkable by a revie
 2. *Nothing moves.* On a quiescent store, before and after a =hook test=: the event count is unchanged, =hooks.json= is byte-identical, and every hook's cursor is unchanged including the tested hook's and including a =--once= hook, which is still registered afterwards. The command's own last transcript line reports the same, and reports =inconclusive= rather than failing if another event arrives mid-test.
 3. *The environment is the store's.* A hook tested with a marker variable set in the invoking shell does not see it; the transcript's environment block shows the store's =PATH=. A test run from a directory that is not the hook's cwd reports the hook's cwd and the command observes it. *(failure 1)*
 4. *=--topic= is enforced and load-bearing.* A prefix-pattern hook cannot be tested without =--topic=; a =--topic= that does not satisfy the pattern exits 2 naming both; a hook whose command branches on =$EVER_TOPIC= takes a different branch for a =.done= topic than for a =.exit= topic. *(failure 4)*
-5. *=--payload= is =ever pub='s argument.* For any =D=, =hook test --payload D= produces the same =value= bytes as =ever pub <topic> D=, including for =D= that is not valid JSON, and neither rejects it.
+5. *=--payload= is =ever pub='s argument.* Over a named sample set — ={}=; a nested-JSON object; =not json at all=; a payload containing ='=, =\=, =$=, a backtick and ="=; an empty string; a 100,000-byte value — =hook test --payload D= produces the same =value= bytes as =ever pub <topic> D=, and neither rejects any of them. ("For any =D=" was the earlier wording and is not checkable; the sample set is chosen so that each element is a quoting or sizing boundary rather than a repetition.)
 6. *Refusal works and costs nothing.* A handler containing =[ -n "${EVER_SYNTHETIC:-}" ] && exit 0= exits 0 without side effects under =hook test= and runs normally under a real event. With =--mark-envelope= off — the default — the stdin bytes are byte-identical to those of a real event with the same topic, key, offset, timestamp and value.
 7. *A deleted script is reported honestly.* Testing a hook whose script has been removed shows the shell's own diagnostic and exit 127 in the transcript, prints the store's =PATH=, and exits 1 (the hook failed) — not 2. The transcript does not claim to have detected an exec failure.
-8. *Exit statuses are distinguishable.* A command exiting 3 gives CLI exit 1; an unknown hook id gives 2; an ambiguous hook *name* gives 2 and lists every candidate; a command sleeping past =--timeout= gives 3 and the child is killed.
+8. *Exit statuses are distinguishable.* A command exiting 3 gives CLI exit 1; an unknown hook id gives 2; an ambiguous hook *name* gives 2 and lists every candidate; a numeric argument that also matches a hook *name* gives 2 rather than silently picking the id; a command sleeping past =--timeout= gives 3, and the child's process group is signalled by the connection thread *before* =hook test= returns, so the pgid is gone by the time the caller sees exit 3 rather than up to 1.5 s later. A payload larger than the pipe buffer delivered to a handler that never reads stdin gives 2 within =--timeout=, not a hung connection.
 9. *=ever hook match <topic>= lists every hook that would fire for that topic and nothing else*, runs no command, writes no file, and moves no cursor.
-10. *No fan-out exists.* There is no flag, alias or argument form of =hook test= that executes more than one hook.
+10. *No fan-out exists.* Checked against two artefacts rather than asserted universally: =ever hook test --help= lists no flag that takes a pattern or a set, and the =hook test= command declaration in =src/main.zig='s =app= literal has exactly one positional, no =takes_rest=, and no alias that accepts one.
 
 * Test plan
 
 Integration tests alongside =src/tests/integration.zig=, each against a store on an ephemeral port with its own temporary data directory. *Never against the default port or data directory* — the store on this workstation is production for it.
 
-1. *Envelope fidelity.* Publish a real event and capture what a recording hook receives; run =hook test= with the same topic/key/value and capture again. Assert the two stdin byte strings are equal. This is the test that makes criterion 6 mean something, and it is the one that would have caught the envelope-marking mistake had it been made.
+1. *Envelope fidelity, and the =EVER_DATA= identity.* Publish a real event and capture what a recording hook receives; run =hook test= with the same topic/key/value and capture again. Assert the two stdin byte strings are equal. This is the test that makes criterion 6 mean something, and it is the one that would have caught the envelope-marking mistake had it been made. The same recording hook has both =$EVER_DATA= and its own stdin in scope, so it must also assert they are byte-equal, with a payload containing ='=, =\=, =$=, a backtick and ="=. The document asserts that identity "by construction", but it is not free: =EVER_DATA= reaches the child through the hand-written =appendShellEscaped= quoter (fact 13), and the transcript prints only a length, which cannot detect a regression in a quoter. Verified to hold at base (138 bytes both sides, identical) — which makes this a pin, not a bug hunt, and pins are what stop it becoming one.
 2. *Non-mutation.* Snapshot event count, =hooks.json= bytes and the full cursor vector; run =hook test= (including against a =--once= hook and with a second, unrelated prefix hook registered); assert all three are identical and that the second hook did not run.
 3. *Mutation test of the type-level guard.* Re-introduce a mutable =*HookTable= parameter to =deliver= and add an =updateCursor= call; test 2 must FAIL. Restore. A guard that is not shown to fail when removed is not evidence. Run the same exercise for the publish path.
 4. *Escaping visibility.* A payload containing =\"status\":\"done\"= must appear escaped in the transcript's stdin block and unescaped in =ever sub= output; assert both, in the same test, so the divergence is pinned rather than described.
 5. *Environment isolation.* Start the store with a marker variable; run =hook test= from a process *without* it and one *with* a different value; assert the child observed the store's value both times.
 6. *Reaper race.* Loop =hook test= against a trivial command ≥200 times while the daemon polls, with a real hook firing concurrently; assert every run reports a definite exit status and none reports "unknown". *Prove it regresses:* against a version that calls =waitpid(child_pid)= from the connection thread, this test must fail. Also run under =zig build test -Doptimize=ReleaseFast= — this is concurrency-sensitive and a race may only manifest in a release build. *Bound the probe with a wall-clock cap* so a pre-fix run reports "still waiting after N s" rather than hanging and producing no evidence.
-7. *Timeout.* A hook sleeping past =--timeout= gives exit 3, the child and its process group are gone afterwards (check the pgid), and =hook ps= is empty.
-8. *Slot exhaustion.* With =MAX_CONCURRENT_HOOKS= real hooks running, =hook test= exits 2 with "the test could not be run", not 1.
-9. *No log-directory pollution.* Count entries in =<data-dir>/hooks/= before and after 50 =hook test= runs: unchanged. =<data-dir>/hook-tests/= is empty afterwards. =hook logs <id>= still returns the last *real* execution.
-10. *Ambiguity.* Two hooks with the same name; =hook test <name>= exits 2 and names both ids; =hook test <id>= works.
-11. *Match query.* Over a fixture of prefix, exact and (once item 9 lands) glob patterns, =hook match= returns exactly the set =topic.matchTopic= returns, asserted against the function directly rather than against a hand-written expectation.
+7. *Timeout.* A hook sleeping past =--timeout= gives exit 3; the child's process group has been signalled before the command returns; the pgid is gone and =hook ps= is empty within one daemon tick of that. *Prove it regresses:* against a version where the deadline is left to =checkTimeouts= and its global =DEFAULT_HOOK_TIMEOUT_SECS=, the pgid is still alive at exit 3 and this step must fail — which is what it asserted against the previous draft of this document, where it would have passed only by accident. Separately assert that a *daemon-spawned* hook still gets the 300 s default and not =--timeout='s 60 s, because the tempting fix for this step is to make the global smaller, which would start killing real hooks five times earlier than today.
+8. *Large payload, unread stdin.* A payload above the 64 KiB pipe buffer delivered to a handler that never reads stdin: assert =hook test= returns within =--timeout= with exit 2 naming bytes written versus bytes intended, that the child appears in =hook ps= *during* the window (i.e. it was registered before the write, not after), and that the daemon delivered an unrelated hook's event while it was in progress. Against base ordering — write before register — all three assertions fail; that is the regression this step pins. Measured shape to reproduce: a 90,000-byte value and a =sleep 30= handler stalled the whole daemon for 30 s and left =hook ps= empty throughout.
+9. *Slot exhaustion.* With =MAX_CONCURRENT_HOOKS= real hooks running, =hook test= exits 2 with "the test could not be run", not 1.
+10. *No log-directory pollution.* Count entries in =<data-dir>/hooks/= before and after 50 =hook test= runs: unchanged. =<data-dir>/hook-tests/= is empty afterwards. =hook logs <id>= still returns the last *real* execution.
+11. *Completion lifetime.* Under a loop of =hook test= runs that time out (exit 3) while a concurrent thread runs =ever hook rm= against other hooks — so that =reapChildren= is being driven from a connection thread as well as the daemon — assert no leak and no double free under the testing allocator. Mutate the =release= refcount to an unconditional =destroy= on the connection-thread side; this step must fail. This is the step that pins [[*The reaper race]]'s ownership rule, and it is the one most likely to pass by luck if written loosely.
+12. *Ambiguity.* Two hooks with the same name: =hook test <name>= exits 2 and names both ids. A hook *named* =3= alongside a hook =#3=: =hook test 3= exits 2 rather than silently choosing =#3=, and =--id 3= / =--name 3= each resolve unambiguously. Against base resolver behaviour the second case silently picks =#3=; that is the regression this pins.
+13. *Match query.* Over a fixture of prefix, exact and (once item 9 lands) glob patterns, =hook match= returns exactly the set =topic.matchTopic= returns, asserted against the function directly rather than against a hand-written expectation.
 
 * Risks and open questions
 
-- *The refactor is the risk.* Extracting =deliver= touches the daemon's hot path. It must be a behaviour-preserving refactor landed and reviewed *separately* from the new subcommand, so a bisect can tell the two apart.
+- *The refactor is the risk, and it is ~239 lines rather than the ~40 an earlier draft claimed.* Extracting =spawn= touches the daemon's hot path. It must land and be reviewed *separately* from the new subcommand, so a bisect can tell the two apart — and one part of it, moving =ProcessTable= registration ahead of the stdin write ([[*The fork-to-registration window]]), is a genuine daemon behaviour change that should be reviewed as one rather than absorbed into "refactor".
+- *This document specifies four changes inside =hooks.zig= that are not the new subcommand*: the =spawn=/=awaitCompletion= split, =ProcessEntry.deadline_ms= and the corresponding =checkTimeouts= comparison, the registration reorder, and =buildEventJsonFromStore= becoming =pub=. Each is small; together they are the majority of the risk, and none of them is visible from the CLI surface a reviewer would naturally read first.
 - *=hook test= runs the real command.* A hook that deploys, deletes or messages will do so. Mitigated by =EVER_SYNTHETIC=, the header printed before any output, and the absence of fan-out — but not eliminated, and the help text must say so in one line rather than burying it.
 - *=--mark-envelope= is a trap by construction.* Anyone who turns it on has stopped testing the production byte stream. The transcript must say so on the run, not only in the docs.
 - *Open: should =hook test= be able to target an unregistered hypothetical* (=--command … --pattern …=), so a hook can be exercised before =hook add=? It would catch failures earlier, but it means executing an arbitrary command supplied over the wire by anyone who can reach the store — a materially different security posture from executing a command an operator already registered. Deliberately excluded here; it needs its own document if wanted.
-- *Open: whether =hook match= should ship first and separately.* This document argues it should (see [[*What this makes checkable, and what it does not]]), but the sequencing decision is the supervisor's.
+- *Recommended sequencing, stated as a recommendation because the decision is the user's.* Given the 1-of-15 count above, and given that =EVER_VALUE= removes the failure class this harness only reveals, the honest order is: *=EVER_VALUE= first* (own document, small, permanent, bounded by fact 14); *=ever hook match= second* (own document, small — it touches none of =hooks.zig='s process machinery, and it is the only part that unblocks a sibling item); *=hook test= after items 1 and 2*, because its whole cost sits in the daemon's process machinery, which items 1 and 2 are about to move. An earlier draft of this document said only "the sequencing decision is the supervisor's" and declined to make the call; on the evidence assembled here it should make it, and this is the call. Neither companion document is written by this work — both are named, not drafted.
+
+* Supersession markers used by this work
+
+This work is the first in =air/= to leave inline markers on claims in completed documents, so it establishes a convention and must therefore state it rather than leave two tokens for a reader — or a lint — to reconcile. =air--supersession-lint.org= is being drafted in the same batch and proposes to enumerate markers *by argument shape rather than by vocabulary*; two undocumented tokens would silently halve its recall.
+
+| Marker        | Means                                                                                     |
+|---------------+-------------------------------------------------------------------------------------------|
+| =[Superseded: <date>, <doc>]= | The claim is *false* as it stands. A reader who acts on it does the wrong thing.           |
+| =[Amended: <date>, <doc>]=    | The claim is *true but incomplete*, and the omission is load-bearing. A reader who acts on it is not wrong, but is missing the constraint that matters. |
+
+Both carry a date and the document that occasioned them, both sit immediately after the claim they correct rather than only in a History section, and both have a matching History entry in the document they annotate. Where a claim inside this document has itself been retracted during review, the same =[Superseded: <date>]= marker is used inline at the claim, without a document reference, since the correction is local.
+
+Applied: four =[Superseded]= in =air/v0.1/hook-execution.org=; one =[Amended]= each in =air/v0.1/server-hooks.org= and =air/v0.1/integration-testing.org=.
 
 * References
 
-- =reviews/round-4/ace-operations.org= — finding 1 (the six silent failures) and suggested addition 4.
+- =reviews/round-4/ace-operations.org= — finding 1 (the six silent failures) and suggested addition 4. Note lines 29-32: failure 1 has *two* simultaneous causes, which the first draft of this document collapsed into one — see [[*Where the test executes]].
+- =~/.local/state/ace-ever4/reviews/spec-hook-test-harness.org= — independent spec review, 2026-08-03 (=ever4-revtest=, no shared context). Verdict changes-requested: 1 blocker, 5 major, 8 minor, 3 nit; all twelve of this document's numbered facts re-checked and held. Every finding is addressed at the claim it concerns; the History entry below records which were adopted, which were adopted with a different mechanism, and why.
 - =reviews/round-4/proposed-air/ever--hook-test-harness.org= — the triage draft this supersedes.
 - =reviews/round-4/proposed-air/OVERVIEW.org= — the ordering argument, disputed above.
 - =air/v0.1/hook-execution.org= — the execution model, log files, process table. Four claims in it are marked =[Superseded]= inline by this work: the =hook_logs= wire bodies, =hook logs= returning metadata plus =--tail=, deferring one-shot removal to reap, and "the process table is only accessed from the daemon thread — no mutex needed".
@@ -551,3 +676,4 @@ Integration tests alongside =src/tests/integration.zig=, each against a store on
 
 * History
 - 2026-08-03: Drafted from =reviews/round-4/proposed-air/ever--hook-test-harness.org=. Re-verified the whole =ever hook= surface post-=zig-cli-kit= migration at base =txpyxrnm 142d5e66=, against an isolated store on port 17890 under =/var/tmp=; the live store was not touched. Divergences from the triage draft, each argued at the point it appears: execution moves server-side (client env is not inherited — verified); the =synthetic= marker moves out of the envelope into =EVER_SYNTHETIC= so the delivered bytes stay production-faithful; =--all= is dropped and =--pattern= becomes a separate non-executing =ever hook match=; =--topic= is added and required for non-exact patterns, without which four of the six failures reduce to three; the "exec failure with the resolved path" acceptance criterion is replaced, since delivery goes through =/bin/sh -c= and Ever never observes an exec failure; and the exit-status vocabulary is defined rather than inherited, the =hook= family having none. Recorded the =waitpid(-1)= reaper race as the principal implementation hazard, and =EVER_VALUE= as a cheaper partial alternative that should land first.
+- 2026-08-03: Fix round against the independent spec review (=~/.local/state/ace-ever4/reviews/spec-hook-test-harness.org=, verdict changes-requested). All seventeen findings addressed; state remains =draft=; no source file touched. *Blocker.* The =deliver()= signature could not be shared with =processHook= without reintroducing synchronous hook delivery, which this document rejects elsewhere in the same breath — a self-contradiction an implementer would have followed literally, regressing a shipped fix. Split into =spawn= (fire-and-forget, the daemon's path and the test's) and =awaitCompletion= (connection-thread only); the type-level non-mutation guarantee moves onto =spawn='s parameter list, where the publish and cursor paths would have had to enter, so it is unweakened. *Majors.* The stated reaper invariant ("the daemon stays the sole owner of =waitpid=") was already false at base: =reapChildren= is also reached from a connection thread via =handleUnregisterHook= → =killChildrenForHook=, verified — replaced with the invariant that is actually true and load-bearing (=reapChildren= is the sole =waitpid(-1)= caller, may run on any thread, publishes every status through =removeByPid=), and fact 11 now records all three call sites. The =Completion= had no stated owner and the exit-3 path would have freed it under the reaper; specified as a two-reference count with a single =release= called exactly twice, rather than the review's "whichever side sees the transition frees it", because a refcount is checkable and "carefully" is not. =checkTimeouts= cannot honour =--timeout= — it compares against one global constant and =ProcessEntry= carries no per-entry deadline — so the claim that it already kills a hanging test child was false and acceptance 8 and test-plan step 7 asserted the opposite of what the design produced; added =deadline_ms= with the 300 s default preserved for daemon spawns, added a connection-thread =SIGTERM= at the deadline so exit 3 is honest at the instant it is returned, and rewrote both criteria. Documented the fork-to-registration window as a hazard this feature widens rather than introduces, reproduced independently (90,000-byte value, handler that never reads stdin: the child was untracked and invisible to =hook ps= for 30 s and an unrelated hook fired 27 s late), and bounded it on the test path only — the daemon's own unbounded write is named as a separate item, not adopted here. Replaced the counterfactual justifying server-side execution: measured that =chronoa send= to a missing session exits 3 with =CHRONOA_DAEMON= set, so a client-side test would have printed a *red* transcript, not a green one; the true argument is that a client-side fork can only produce false greens *about the environment*, and the accurate telling of failure 1 (green once the session name was fixed, while production stayed broken) is stronger than the one it replaces. *Minors and nits.* Refactor sizing corrected from ~40 to 239 lines (=hooks.zig:891-1129=); =spawn='s signature given the =data_dir= and =*ProcessTable= it actually needs; item 10's row corrected to *No*, making it 0 of 3 and the document's conclusion stronger; the scheduling refutation now quotes both clauses of the OVERVIEW, notes that item 8 does not gate on this tool, and names which metric it is about (the query half unblocks the batch, the execution half is what the feature is for); =hook match='s contract restated as "whose pattern matches", with a state column, before =ever--hook-gc-and-lease.org= introduces states and makes the looser reading a lie; the worked transcript replaced with a measured capture after the invented one was found to be 145 bytes under a "137 bytes" label; the =[Superseded]=/=[Amended]= distinction stated in a new section and at both =[Amended]= markers; numeric-name resolution specified to refuse rather than silently prefer the id (verified: =hook rm 3= removes =#3= and leaves the hook *named* =3= standing); the =EVER_DATA=/stdin identity moved from an assertion to a pin in test step 1, since it passes through a hand-written shell quoter that a printed length cannot check; facts 13 and 14 added for the =/bin/sh -c= delivery mechanism and the measured 131,072-byte =argv= cap; prose/=--json= parity made checkable; acceptance 5 given a named sample set and acceptance 10 given two artefacts to check. *Adopted from the review's conclusions:* the sequencing recommendation is now made rather than deferred — =EVER_VALUE= first, =ever hook match= second, =hook test= after items 1 and 2 — and the =EVER_VALUE= section carries the bound it needs, that doubling the payload inside a single =/bin/sh -c= argv element puts a 90,000-byte value over a measured 131,072-byte cap and fails as a silent 127, indistinguishable from the deleted-script case. Neither companion document is drafted by this work.
