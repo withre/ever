@@ -68,7 +68,7 @@ Add CLI flags to =ever hook add= for users who genuinely need historical replay:
 | =--from-beginning= | Start at offset 0 — replay everything, then follow |
 | =--from <N>= | Start at an explicit offset |
 
-*[Amended 2026-08-03: this row is correct, but the shipped CLI help text is not.* =src/main.zig= describes =--from= as "Start at an explicit *topic-local* offset (replay from there)". For prefix/wildcard hooks the cursor is a *global log offset* (B1 below), so the help text is wrong for exactly the patterns most users pass. Verified at =142d5e66=. Fixing the help string is not claimed by any current document — see [[./hook-scan-cursor-and-lag.org]].*]*
+*[Amended 2026-08-03: this row is correct, but the shipped CLI help text is not.* =src/main.zig= describes =--from= as "Start at an explicit *topic-local* offset (replay from there)". For prefix/wildcard hooks the cursor is a *global log offset* (B1 below), so the help text is wrong for exactly the patterns most users pass. Verified at =142d5e66=. Fixing the help string is out of scope for [[./hook-scan-cursor-and-lag.org]], which records the bug in its Non-Goals and in its P2 re-arm table so this pointer resolves; it belongs with whoever next touches that flag.*]*
 
 =--once= combined with =--from-beginning= or =--from <N>= is permitted but the user must have asked for it — no silent replay.
 
