@@ -1,5 +1,5 @@
 #+title: Hook Reclamation — Failure Backoff, Expiry, and =hook gc=
-#+state: draft
+#+state: ready
 #+FILETAGS: :subscriber:orchestrator:cli:
 
 * Summary
@@ -1150,3 +1150,16 @@ Any test that waits for a hook to fire must bound its own wait and fail on timeo
   Note the shape of this defect, because it is the third instance of the same shape in this document and the pattern is worth naming: a safety property that holds *by construction* for the case in the criterion, and by *coincidence* for a case the criterion does not cover. B1 was one (R2's threshold, correct for the tested path), B4 was another (the never-escalate invariant, true except through expiry and through a pre-satisfied counter). The tell each time was a criterion that could not distinguish the two reasons it passed.
 
   Still not verified: nothing implemented.
+
+- 2026-08-03: *Promoted to =ready=* after four review rounds with =ever4-revgc=, an independent reviewer with no shared context, which re-established every load-bearing measurement on its own probe stores rather than taking them from this document.
+
+  The chain, oldest first: =pvuvsnso= (95f26a05) the initial draft; =pzwlvllp= (587bb247) supersession markers in the two completed hook documents; =kmqpswrp= (4c90c06f) moving both disable rules out of the daemon; =wmmqrtxn= (19e89f82) restating those markers as pointers; =xxtvumsu= (f77f285a) removing generic non-zero exits from failure accounting; =tyozyqvs= (b054eeea) correcting the =server-hooks.org= marker's premise; =smpqzrvp= (c6ba4552) server-side name resolution; =kytswwzq= (5898f4a3) the field count and the autofs withdrawal; =owkwvluv= (ae040dca) one locked entry point per verb; =srpxukpl= (3d09a9ac) the lock order; =otwpynrk= (df324f43) deterministic 28i and self-quiescing =--from tail=.
+
+  Across those rounds the review raised 5 blockers, 11 major, 12 minor and 4 nit, plus two further majors and four minors in later addenda. Three of the five blockers changed the design rather than the wording: automatic disable moved from the daemon to =gc= entirely (M1), a generic non-zero exit stopped being evidence of anything (B3), and name resolution moved into the same critical section as the mutation it authorises (B5). One finding, R2b-1, was a defect this document introduced while fixing another, and R3-1 was a defect introduced while fixing that.
+
+  *What =ready= means here, stated because the state name promises more than this document has earned in one respect:*
+
+  - The specification is complete enough to implement from without consulting its author. Every automatic action is backed by an outcome the store observed; the one unattended disable is a TTL the registrant asked for; the tick ordering, the lock order and the attributable-failure set are each closed.
+  - *Nothing is implemented. All acceptance criteria are unexecuted.* They were checked for checkability, not for pass or fail. Several describe behaviour with no precedent in the current source — 6a, 25, 25b, 28a–28j — and were reasoned about rather than reproduced. Where a criterion is marked "this regresses today", the *current* behaviour was reproduced by hand at =142d5e66=; the replacement was not.
+  - *The two locking criteria, 28h and 28i, are integration-level by necessity rather than by preference.* There is nowhere inside the Zig test binary to bound a spin: =build.zig= sets no per-test timeout, the test runner imposes none, and =std.Thread= has =join= but no timed variant. A unit test for that class cannot fail, only hang, and in hanging it silences every other test in the binary. Whoever implements this must not move them inward.
+  - Implementation carries a *two-independent-reviewer* requirement, per =reviews/round-4/proposed-air/OVERVIEW.org=, because this chain can switch off a live registration. This document is one reviewer's worth of scrutiny on the *specification*; it is not one of the two.
