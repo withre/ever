@@ -136,7 +136,8 @@ For orientation only, and *explicitly an unverified projection*: the scan table 
 - *Garbage-collecting dead hooks.* Companion work. This document makes a dead hook cheap; GC removes it. Either alone leaves the other's failure mode live.
 - *A topic-prefix index.* Worth doing, and *not* needed to close this incident — post-fix, the *prefix/wildcard* per-tick cost is =H_p × E= where =H_p= is the count of prefix/wildcard hooks and =E= is events published per 500 ms. The incident's store had 28 prefix/wildcard hooks and roughly 1 event/s, i.e. ≈14 events scanned per cycle against 2,004,113. At the measured 400,000 events/s an index only starts to pay around =H_p × E ≳ 100,000= per cycle. This arithmetic is *only* about prefix/wildcard hooks; the incident store's other 14 hooks were exact-topic and are governed by [[#f2][F2]], not by this term. The draft's ordering (this item first, index later) survives.
 - *Condvar signalling on publish.* Same argument; it removes the fixed 500 ms latency floor, not the pathology.
-- *Hook-execution-log retention* and the log-filename collision ([[#f1][F1]]).
+- *Hook-execution-log retention.* Separate item.
+- *The hook execution log filename collision* ([[#f1][F1]]) — carried by its own item, =hook-exec-log-filename.org=, scheduled *ahead* of retention. F1 records the measured evidence and the design choice; the reasoning for the split is at F1 and is not the scope-tidiness argument.
 - *The exact-topic rescan* ([[#f2][F2]]) — its own document, ordered *between* this document's stages; see [[#staging][Implementation order]].
 - *The =readBatch=/=append= data race* ([[#f4][F4]]) — pre-existing, recorded here, fixed elsewhere.
 - *The CLI-writes-to-stderr bug*, and *the =--from= help-text bug*: =src/main.zig:1375= describes =--from= as "Start at an explicit *topic-local* offset (replay from there)", which is wrong for prefix/wildcard hooks, whose cursor is a global log offset (=tipForPatternLocked=, =src/store/topic.zig:127-137=). This document records the bug so the =[Amended]= marker in [[./hook-registration-cursor.org]] has somewhere to point, and does not claim the fix. It is one string literal and belongs with whoever next touches that flag.
@@ -390,9 +391,41 @@ The exact count is timing-dependent; the mechanism is not.
 
 Relation to the cursor change: *neither better nor worse.* The collision is a function of how close together two executions of one hook start, which this fix does not change. The one indirect effect is that a hook far behind which then catches up dispatches its backlog in batches of 100 — precisely the burst shape that collides — so a store running with the defect and then fixed will lose logs during the one catch-up cycle. A transient, not a regression.
 
-*Acceptance criterion, wherever it lands:* /N executions of one hook triggered inside one poll cycle produce N distinct log files, and =ever hook logs <id>= can distinguish them./ The burst must be produced with a *nested* shell — =sh -c 'echo $EVER_OFFSET >> file'=, not =echo $EVER_OFFSET >> file= — because =executeHookCommand= builds =… EVER_OFFSET='406' exec <command>= (=src/store/hooks.zig:929-944=) and the outer shell expands =$EVER_OFFSET= before the assignment takes effect. A naive probe records empty lines and looks like zero executions, which is indistinguishable from the symptom under test.
+*Acceptance criteria, carried by =hook-exec-log-filename.org=:*
 
-*Scope.* Not fixed here, per supervisor direction: the fix belongs to the hook-execution-log item (round-4 item 10). *Review disagrees with that placement and the argument is recorded because it is a good one:* moving execution logs into per-hook directories — which is what item 10 is scoped for — does *not* fix this, because two executions of the *same* hook in the same millisecond collide on =<epoch-ms>.log= inside =hooks/<id>/= exactly as they do in =hooks/=; item 10 would have to change the *filename* as well, which is a different change from the one it is scoped for. Item 10 also carries a two-reviewer posture because it *deletes* files inside the store, and adding a monotonic per-daemon counter to a filename deletes nothing and creates strictly more files, so attaching F1 to item 10 imports a review cost it does not earn. Whoever owns item 10 should read this paragraph before assuming F1 comes along for free.
+1. /N executions of one hook triggered inside one poll cycle produce N distinct log files, none of which is truncated by another./
+2. /=ever hook logs <id>= finds and orders the new-format files — a test that only counts files on disk passes while =hook logs= returns "no logs found"./
+3. /Log files written in the old =<id>-<epoch-ms>.log= format remain readable after the change./
+
+The burst must be produced with a *nested* shell — =sh -c 'echo $EVER_OFFSET >> file'=, not =echo $EVER_OFFSET >> file= — because =executeHookCommand= builds =… EVER_OFFSET='406' exec <command>= (=src/store/hooks.zig:929-944=) and the outer shell expands =$EVER_OFFSET= before the assignment takes effect. A naive probe records empty lines and looks like zero executions, which is indistinguishable from the symptom under test.
+
+*Scope: not fixed here, and not parked behind the retention item either. It is carried by its own item, =hook-exec-log-filename.org=, scheduled* ahead *of retention.*
+
+*Why not behind retention (round-4 item 10).* Two reasons, both of them review's and both correct. Moving execution logs into per-hook directories — which is what item 10 is scoped for — does *not* fix this: two executions of the *same* hook in the same millisecond collide on =<epoch-ms>.log= inside =hooks/<id>/= exactly as they do in =hooks/=. Sharding changes which directory the file lands in, not the name that collides. And item 10 carries a two-reviewer posture because it *deletes* files inside the store, whereas this fix deletes nothing and creates strictly more files, so that posture does not transfer and cannot be used as a reason to move the work there. An earlier revision of this document recommended the hand-off; that recommendation is withdrawn.
+
+*Why not folded into this document either — and this is not the scope-tidiness argument, which review rightly did not find persuasive.* The fix is not the size it looks. Review's assessment that it is /"genuinely three lines in =executeHookCommand="/ is true of the *writer* and false of the change, because *the filename has a reader*. =handleHookLogs= (=src/net/server.zig:544-546=) parses everything between =<id>-= and the first =.= as an integer and *silently skips the file* when the parse fails:
+
+#+begin_src zig
+const after_prefix = name[prefix.len..];
+const dot_pos = std.mem.indexOfScalar(u8, after_prefix, '.') orelse continue;
+const ts = std.fmt.parseInt(i64, after_prefix[0..dot_pos], 10) catch continue;   // <- silent skip
+#+end_src
+
+So the *specific* fix =hook-execution.org= originally specified — a =<seq>= suffix — makes every new log file invisible. Measured at this base, one hook, one execution, renaming only:
+
+#+begin_example
+$ ls data/hooks/                 -> 1-1785720605573.log
+$ ever hook logs 1              -> Log file: data/hooks/1-1785720605573.log  (content follows)
+
+$ mv 1-1785720605573.log 1-1785720605573-1.log
+$ ever hook logs 1              -> error: no logs found for this hook
+#+end_example
+
+That trades losing 38–44% of logs for being unable to read *any* of them. An implementer handed "it's three lines" writes exactly that.
+
+What the change actually is: a *format contract* with three consumers — the writer, =ever hook logs=, and whatever retention lands (which must sort and delete by age parsed from the same name) — plus back-compatibility with the old-format files already on disk (the live store held 105,272 of them before the July prune, ~2,961 after). And there is a real design choice to make once: a format-*preserving* fix (=O_CREAT | O_EXCL= and bump the millisecond on =EEXIST=, bounded, falling back to today's behaviour — no reader change, no back-compat problem, but the recorded timestamp becomes approximate), against a better *name* (=<seq>=, or the event =offset=, which is already unique per (hook, event) and would let an operator find the log for a known event) at the cost of changing the reader and handling both formats. Picking that inside a cursor spec prejudices it for the item that has to live with it.
+
+The residual reason to keep it out of stage 1 is real but secondary: stage 1's value is that it is two call sites and one out-parameter, and a fork-path change gives the incident closer a second reason to be reverted.
 
 ** F2 — exact-topic hooks re-read their entire topic every tick, and the cursor fix does not help them
 :PROPERTIES:
@@ -642,7 +675,7 @@ Inline supersession in the completed documents lands with this change:
 :CUSTOM_ID: open-questions
 :END:
 
-1. *[[#f1][F1]] placement.* The supervisor has directed the fix to the hook-execution-log item. Review argues it does not belong there and should be its own item scheduled ahead of it; the argument is recorded at F1. Recorded, not relitigated.
+1. *[[#f1][F1]] — decided, not open.* Its own item, =hook-exec-log-filename.org=, ahead of retention. Reasoning and measured evidence at [[#f1][F1]]. What remains open is for that item's owner, not for this one: format-preserving =O_EXCL= millisecond bump, or a new name (=<seq>= or the event offset) with the reader change and old-format compatibility that implies.
 2. *[[#f4][F4]] ownership*, and whether the "single-writer publish discipline" wording in [[./hook-registration-cursor.org]] and =src/store/topic.zig:95-100= needs amending now that a thread per connection is confirmed. Deliberately not amended here: that wording was softened once already for good reasons and re-opening it belongs with whoever fixes the race, not with a document that only walked past it.
 3. *Stage 3 gating.* This document says stage 3 follows [[#f2][F2]]. If F2 is not scheduled, does stage 3 ship with the pattern-hook-only subtotal permanently, or wait? The subtotal is correct either way; the question is whether the totals line carries two numbers forever.
 
@@ -703,4 +736,12 @@ Inline supersession in the completed documents lands with this change:
 
   *Adopted without change from the review*: no per-hook P5 threshold (name the largest contributor in the existing line instead — zero new constants, and it answers the remediation question rather than the detection one); one SCAN column in one unit with two formulas; the =EVER_OFFSET= nested-shell trap added to F1's acceptance criterion, because a naive probe records empty lines and that is indistinguishable from the symptom under test.
 
-  *Argued back on, once*: F1's placement. The review's case that it does not belong behind the retention item is good and is recorded in full at F1 — per-hook directories do not fix a same-hook same-millisecond collision, and a two-reviewer posture earned by deleting files does not transfer to adding a counter to a filename. The supervisor has directed it to the retention item and this document follows that; the argument is preserved so whoever owns that item sees it rather than assuming F1 comes along for free.
+  *Argued back on, once*: F1's placement. The review's case that it does not belong behind the retention item is good and is recorded in full at F1 — per-hook directories do not fix a same-hook same-millisecond collision, and a two-reviewer posture earned by deleting files does not transfer to adding a counter to a filename. The supervisor has directed it to the retention item and this document follows that; the argument is preserved so whoever owns that item sees it rather than assuming F1 comes along for free. *[Superseded 2026-08-03, later the same day — see the next entry: the hand-off was withdrawn and F1 is carried by its own item.]*
+
+- 2026-08-03: F1 placement decided against the argument rather than by direction (=speccursor= worker). The supervisor corrected its own fix instruction, noting that the "leave it to the retention item" line it relayed was this document's earlier recommendation and not review's, and asked for a decision on the merits.
+
+  *Decision: F1 is carried by its own item, =hook-exec-log-filename.org=, scheduled ahead of retention.* Review's two arguments against the retention hand-off are correct and are adopted: sharding into per-hook directories does not fix a same-hook same-millisecond collision, and a two-reviewer posture earned by deleting files does not transfer to a change that deletes nothing.
+
+  *But the fix is not folded in here either, and the reason is new evidence rather than scope tidiness — which review rightly did not find persuasive the first time.* Review assessed the fix as "genuinely three lines in =executeHookCommand=". That is true of the writer and false of the change, because *the filename has a reader*: =handleHookLogs= (=src/net/server.zig:544-546=) parses everything between =<id>-= and the first =.= as an integer and =catch continue=s on failure. Demonstrated at this base by renaming a single real log file and changing nothing else: =ever hook logs 1= goes from printing the log to =error: no logs found for this hook=. So the specific fix =hook-execution.org= specified — a =<seq>= suffix — trades losing 38–44% of logs for being unable to read *any* of them, and an implementer handed "it's three lines" writes exactly that. The change is a format contract with three consumers (writer, =ever hook logs=, and whatever retention lands, which must sort by age parsed from the same name), plus back-compatibility with the old-format files already on disk, plus a real design choice — format-preserving =O_EXCL= millisecond bump versus a better name (=<seq>=, or the event offset) with the reader change that implies. That belongs to one owner, decided once, not to a paragraph inside a cursor spec.
+
+  F1's acceptance criteria are extended accordingly: a test that only counts files on disk passes while =hook logs= returns "no logs found", so the criteria now require the reader to find and order the new format *and* old-format files to remain readable. Non-Goals and Open Questions updated; Open Questions item 1 is now a decision, not a question, and what remains open there is the format choice, which is the new item's to make.
