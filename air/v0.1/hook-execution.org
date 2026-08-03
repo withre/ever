@@ -37,6 +37,8 @@ No way to ask "what hooks are running right now?" or "what did hook #3 print las
 - Configurable concurrent execution limit (default 16)
 - Optional per-hook timeout (=--timeout= flag on =hook add=)
 
+/[Superseded: 2026-08-03 — the per-hook timeout *did not ship*. Verified at =142d5e66= (post zig-cli-kit migration): =Hook= has no =timeout_ms= field, =hook add= has no =--timeout= flag (its flags are =--once=, =--name=, =--from-beginning=, =--from=), and =HookDaemon.checkTimeouts= applies a fixed =DEFAULT_HOOK_TIMEOUT_SECS = 300= to every hook. The =--hook-max-concurrent= flag on =ever store start= did not ship either; =MAX_CONCURRENT_HOOKS= is a compile-time =16=. Treat the =timeout_ms= sections below as unimplemented proposal, not as an inventory of the code.]/
+
 * Non-Goals
 - Hook output streaming back to subscribers in real-time (future)
 - Hook retry on failure / retry policies (future)
@@ -112,6 +114,8 @@ fn reapChildren(self: *HookDaemon) void {
 #+end_src
 
 =handleChildExit= logs the exit code, calls =hook_table.updateCursor=, and handles one-shot hook removal.
+
+/[Superseded: 2026-08-03 — no =handleChildExit= exists at =142d5e66=. =HookDaemon.reapChildren= calls =waitpid(-1, …, WNOHANG)=, removes the entry from the =ProcessTable=, and *only logs* when =(status >> 8) & 0xFF= is non-zero. Cursor advancement and one-shot removal both happen in =processHook= at *spawn* time. Two consequences, both load-bearing for =air/v0.1/hook-gc-and-lease.org=: (a) the exit status is never persisted anywhere — not in the hook record, not in the per-execution log file — so the store's stderr is the only record; (b) =(status >> 8) & 0xFF= is *0 for a signal death*, so a child killed by a signal — including by this document's own 300 s timeout — is logged as nothing and is indistinguishable from exit 0. Measured on an isolated store 2026-08-03: a hook running =kill -9 $$= produces no daemon log line at all.]/
 
 ** Timeout Enforcement
 
@@ -199,6 +203,8 @@ Each log file begins with a metadata header:
 #+end_src
 
 The header lines use =#= prefix so they're easy to grep out. The exit footer is appended by the parent after =waitpid= reaps the child.
+
+/[Superseded: 2026-08-03 — *the exit footer is never written.* Verified at =142d5e66=: nothing in =src/store/hooks.zig= appends to the log file after the header, and =reapChildren= does not reopen it. The shipped header is also a different format — a literal "=== Hook Execution ===" banner followed by =Hook:= / =Pattern:= / =Command:= / =Topic:= / =Offset:= / =Timestamp:= / =Payload:= lines and a "===" terminator, with no =#= prefixes. Rotation ("keep the last N log files per hook") did not ship either — log files accumulate without bound, which is Incident 4 in =docs/incident-2026-07-27-runaway-cpu.org= (105,272 files / 476 MB) and round-4 item 10.]/
 
 ** Output Redirection
 
@@ -339,6 +345,8 @@ With background execution, cursor should advance when the child is *spawned*, no
 
 If the concurrent limit is reached and we can't spawn, cursor stays where it is — the event will be retried next tick.
 
+/[Superseded: 2026-08-03 — partially superseded by =air/v0.1/hook-gc-and-lease.org=. "Advance on spawn" remains the rule for a *dispatched* event, but a hook that is =disabled=, expired, or =quarantined= and not yet due is skipped before the fetch, so its cursor does not advance at all; and a hook whose =cwd= has vanished records a failure and advances the cursor *without* spawning. The last bullet's rationale — "failed hooks still advance the cursor" — is what makes reclamation reversible in *registration* but not in *delivery*: events published while a hook is broken are still lost. Recovering them needs =hook update= / an attempted-vs-delivered cursor split, which is =reviews/round-3/proposed-air/ever--hook-repoint-and-resilience.org= and is not scheduled.]/
+
 * Design Details
 
 ** Daemon Loop (revised)
@@ -388,3 +396,4 @@ The process table (=ArrayList(ChildProcess)=) is only accessed from the daemon t
 - 2026-04-08: Draft created. Identified four problems with current synchronous fork+exec+waitpid model in HookDaemon.
 - 2026-04-15: Marked complete. Background hook execution with PID tracking, timeout enforcement, and graceful shutdown implemented.
 - 2026-08-03: Superseded in part by [[./hook-scan-cursor-and-lag.org]] (=speccursor= worker, spec only — no code change). Four claims marked inline, all re-verified at =142d5e66=: (1) *Log File Management → File Naming* — the =<hook_id>-<YYYYMMDD>T<HHMMSS>-<seq>.log= scheme and its anti-collision sequence number did not ship; the shipped =<hook-id>-<epoch-ms>.log= with =O_TRUNC= destroys the earlier log when two executions of one hook start in the same millisecond (measured: 50 executions → 28 files); (2) *Rotation* did not ship — nothing prunes =data/hooks/=; (3) =ever hook logs --tail N= did not ship; (4) the per-=hook_id= active-child check in *Interaction with One-Shot Hooks* did not ship. A note was also added to *Cursor Advancement Strategy* pointing at the no-events case it does not cover. State left =complete=: the background-execution model this document specified did ship and works; the marked items are plan text that was never implemented and would otherwise read as description.
+- 2026-08-03: Four inline =[Superseded: …]= markers added by =ever4-specgc= while drafting =./hook-gc-and-lease.org=, all verified against =142d5e66=. Three are *corrections*, not supersessions — the per-hook =--timeout= flag and =timeout_ms= field, the =--hook-max-concurrent= flag, the =handleChildExit= function, the log-file exit footer and log rotation were all specified here and marked complete, but none of them shipped. The fourth marks the cursor-advancement strategy as partially superseded. The load-bearing one for anything that counts hook failures: =reapChildren= extracts =(status >> 8) & 0xFF=, which is 0 for a signal death, so a child killed by a signal — including by this document's own timeout path — is recorded as a success. No source changed.

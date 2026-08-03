@@ -127,6 +127,8 @@ Stored in =<data-dir>/hooks.json=:
 }
 #+end_src
 
+/[Superseded: 2026-08-03 — this record shape is incomplete in two ways. (a) =command= shipped as a single *string*, not an array of words; the array form above is the legacy format that =HookTable.load= still falls back to. (b) =air/v0.1/hook-gc-and-lease.org= adds =state=, =consecutive_failures=, =last_exit_status=, =last_error=, =next_attempt_at=, =expires_at=, =disabled_at=, =disabled_reason= and a file-level =version=. Also measured at =142d5e66=: a row missing any non-defaulted field causes =load= to discard the *entire* table silently (7 hooks → 0, no log line), after which the next registration rewrites the file with =next_id= reset to 1. Do not add a field to this record without a default.]/
+
 Written atomically (write to temp, rename) on every hook add/remove/cursor update.
 
 *[Amended 2026-08-03: still accurate, and load-bearing.* =HookTable.updateCursor= (=src/store/hooks.zig:239=) serialises the *entire* hook table and does a write-plus-rename on *every* cursor advance, with no "unchanged" guard. Today a never-matching hook never advances and therefore never writes; any change that advances cursors on scan must batch these writes or it turns a CPU defect into an I/O one. See P3 in [[./hook-scan-cursor-and-lag.org]].*]*
@@ -140,6 +142,8 @@ The hook daemon:
 4. On command completion: update cursor in =hooks.json= *[Superseded: the cursor advances on* spawn*, not on completion — see "Cursor Advancement Strategy" in [[./hook-execution.org]]. And it advances* only *on dispatch: a scan that matches nothing leaves it untouched, which is the defect in [[./hook-scan-cursor-and-lag.org]].]*
 5. Sequential per hook (same as =ever on=)
 6. On command failure: log to stderr, advance cursor (don't retry)
+
+/[Superseded: 2026-08-03 — step 6 is superseded by =air/v0.1/hook-gc-and-lease.org=. A hook that fails K=5 times consecutively enters =quarantined= and is retried on an exponential backoff with a 1 h ceiling rather than on every matching event; a hook whose =cwd= or literal absolute command path no longer exists is moved to =disabled= and is not dispatched at all. Step 4's "update cursor on command completion" is also stale in the shipped code: the cursor advances when the child is *spawned* (=HookDaemon.processHook=), not when it is reaped.]/
 
 ** How =ever hook add= works
 
@@ -211,3 +215,5 @@ Marked inline by the =speccursor= worker while drafting [[./hook-scan-cursor-and
 - *Registration example block* — =hook list= gained a NAME column and writes to stderr, and has no =--json=.
 - *Hook Table* — the "written atomically on every cursor update" line is still true and was annotated rather than superseded, because it constrains any fix that advances cursors more often.
 State left =complete=: the architecture this document specified did ship.
+** 2026-08-03 — Superseded in two places
+Marked inline by =ever4-specgc= while drafting =./hook-gc-and-lease.org=, verified against =142d5e66=. (1) The =hooks.json= record shape shown above is both stale (=command= shipped as a string, not an array) and about to grow eight fields for hook reclamation; measured alongside it, a row missing any non-defaulted field makes =HookTable.load= discard the entire table silently. (2) Execution-model step 6 ("on command failure: log to stderr, advance cursor, don't retry") is replaced by backoff/quarantine and provably-lossless disable. No source changed.
