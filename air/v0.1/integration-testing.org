@@ -26,7 +26,7 @@ Unit tests verify individual components, but the real value of Ever comes from t
 ** Test Architecture
 Integration tests start an in-process server (no TCP needed for basic tests) and exercise the full pipeline through the TopicManager API.
 
-[Amended: 2026-08-03, =v0.1/hook-test-harness.org=] This architecture does not cover hook *delivery*. A hook child inherits the store process's environment (verified live), so an in-process server inherits the *test binary's* environment — which silently satisfies any assertion about what a hook command receives, including the assertions that exist to prove environment isolation. Hook-delivery tests must spawn a real =ever start= process with its own =--data-dir= and its own port, and must never use the default port or =./data=: the store on this workstation is production for it.
+[Amended: 2026-08-03, =v0.1/hook-test-harness.org=] (=[Amended]= = true but incomplete, and the omission is load-bearing; =[Superseded]= = false as it stands. The distinction is stated in =v0.1/hook-test-harness.org=, "Supersession markers used by this work".) This architecture does not cover hook *delivery*. A hook child inherits the store process's environment (verified live), so an in-process server inherits the *test binary's* environment — which silently satisfies any assertion about what a hook command receives, including the assertions that exist to prove environment isolation. Hook-delivery tests must spawn a real =ever start= process with its own =--data-dir= and its own port, and must never use the default port or =./data=: the store on this workstation is production for it.
 
 For TCP-level integration tests:
 1. Start server on a random high port in a test thread
@@ -78,3 +78,4 @@ Or inline in relevant modules with descriptive test block names.
 * History
 - 2026-04-15: Marked complete. Integration tests in src/tests/integration.zig.
 - 2026-08-03: Test Architecture amended inline while specifying =v0.1/hook-test-harness.org=. The in-process harness cannot be used for hook-delivery tests: a hook child inherits the store process's environment, so an in-process store hands it the test binary's environment and silently satisfies the very assertions that exist to prove environment isolation. Hook-delivery tests spawn a real =ever start= with their own =--data-dir= and port, never the default port or =./data=.
+- 2026-08-03: Marker vocabulary note — =[Amended]= means the claim is true but incomplete in a load-bearing way; =[Superseded]= means it is false as it stands. Stated in =v0.1/hook-test-harness.org=.
