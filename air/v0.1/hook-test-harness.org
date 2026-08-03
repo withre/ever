@@ -1,0 +1,553 @@
+#+title: Hook Test Harness — exercise a delivery path without waiting for a real event
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:cli:testing:
+
+* Summary
+
+=ever hook test= delivers a synthetic event to one registered hook, through the same code the hook daemon uses, and prints exactly what the command received — the bytes on stdin, the environment the store set, the exit status, the output — while appending nothing to the durable log and advancing no cursor.
+
+It exists because a registered hook is not a working hook. A supervisor's notification path failed six times in one session and *every failure was silent*: a =chronoa send= to a session name that no longer existed, a pattern broad enough that ~52 status milestones would have arrived as user turns, a =status: "done"= guard that could never match because Ever nests the payload as an escaped JSON string inside =value=, and an =--on-exit= publishing to the same topic as real completions. The supervisor polled by hand for hours without noticing it was never being woken.
+
+Two consequences of that history shape this document more than the draft it comes from:
+
+1. *The test must execute inside the store process.* Verified live (see [[*Re-verification]]): a hook child inherits the *store's* environment, not the publishing client's. A =hook test= that forked from the CLI would run with the operator's =PATH= and session variables and would therefore have *passed* on failure 1 — the exact bug it was built to catch.
+2. *The envelope on stdin must stay byte-identical to production.* Marking the envelope =synthetic: true= would change the bytes a guard is compared against, in a tool whose whole claim is "these are the bytes". The synthetic marker belongs in the environment, where handlers already read =EVER_TOPIC=, and where it perturbs nothing. See [[*Refusability]].
+
+* Motivation
+
+Today the only way to exercise a hook is to publish a real event into a real topic. That appends to the durable log, advances the cursor of *every* hook whose pattern matches, fires all of them, and still does not show what any command received on stdin. So nobody does it, and a delivery path's first real exercise is the moment it is needed.
+
+The escaping failure is worth stating precisely, because it is the shape the tool must make visible. Ever delivers:
+
+#+begin_src json
+{"topic":"probe.done","offset":1,"timestamp":1785716928289,"key":null,"value":"{\"agent\":\"ever4-spectest\",\"status\":\"done\"}"}
+#+end_src
+
+A shell guard written as =case "$EVENT" in *'"status":"done"'*)= can never match, because the literal bytes are backslash-quoted. It looked correct for weeks because only its *reject* path had ever run: it declined an =exited= event for the wrong reason and therefore looked right. =ever sub= compounds this — verified live, it renders the payload *unescaped* for display:
+
+#+begin_src
+$ ever sub probe.done --from 0
+[probe.done:1] {"agent":"ever4-spectest","status":"done"}
+#+end_src
+
+so eyeballing the topic actively hides the defect. *Any output this feature produces must not repeat that mistake.*
+
+** Goals
+
+- =ever hook test <id-or-name> --topic <topic> [--payload <data>]= — synthesise a matching event, run the hook's command exactly as the daemon would, and print a labelled transcript: matched pattern, the stdin bytes verbatim with a byte count, the =EVER_*= environment, exit status, and the command's own output.
+- Structural guarantee, not a promise: the delivery path used by =hook test= cannot append to the log, cannot advance the tested hook's cursor, and cannot advance any other hook's cursor — enforced by the types it is handed, and re-checked observationally on every run.
+- A separate, non-executing query — =ever hook match <topic>= — answering "which hooks would this topic wake?", which is a different question and must not execute anything.
+- An exit-status vocabulary that distinguishes "the hook's command failed" from "the test could not be run" from "the test ran but did not conclude".
+- A refusal surface (=EVER_SYNTHETIC=) that handlers can key on, specified as a compatibility contract from the day it ships, because handlers are shell scripts written by other people.
+
+** Non-Goals
+
+- *Validating the command's logic.* This shows what was delivered and what the command did with it. Whether that was right stays with the author.
+- *A replacement for =hook logs=.* That is forensics after the fact; this is a preflight.
+- *Fan-out.* No mode of this command executes more than one hook. See [[*Why =--all= is dropped]].
+- *Fixing the escaping problem.* A companion change would remove the class outright; it is proposed in [[*Alternatives considered]] and deliberately kept out of this document's scope.
+- *Publishing.* =hook test= never calls =TopicManager.publish=. If you want a real event, use =ever pub=.
+
+* Re-verification
+
+The source triage note (=reviews/round-4/proposed-air/ever--hook-test-harness.org=) predates the CLI migration to =zig-cli-kit=. Everything below was re-checked at base =txpyxrnm 142d5e66= ("Migrate CLI to zig-cli-kit") on 2026-08-03, against an isolated store started on port 17890 with =--data-dir /var/tmp/ever-spectest-probe/data=. The live store was never touched.
+
+** Claims from the draft
+
+| Draft claim                                                        | Status                                                                                                |
+|--------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------|
+| "=ever hook= exposes =new/add/list/rm/ps/logs= only"               | *Holds.* Re-verified post-migration. =ever hook test= → =error: unknown subcommand 'test' for 'hook'=  |
+| "=--payload= accepts the payload as the user would publish it"     | *Adopted, and made explicit* — see [[*=--payload= semantics]]. The draft assumed it without saying so. |
+| "mark it =synthetic: true= in the envelope"                        | *Rejected*, with an argument — see [[*Refusability]]                                                    |
+| "=--all= / =--pattern= answers which hooks would fire"             | *Split out of this command entirely* — see [[*Why =--all= is dropped]]                                  |
+| "execute the command through the normal spawn path"                | *Adopted, and this is the load-bearing decision* — see [[*Where the test executes]]                      |
+| "with the store lock untouched"                                    | *Insufficient as stated.* The hazard is not a lock, it is =waitpid(-1)= — see [[*The reaper race]]      |
+| "Exit nonzero when the command does"                               | *Insufficient* — see [[*Exit status]]                                                                   |
+| Acceptance: "reports the exec failure with the resolved path"      | *Not achievable as worded* — see below                                                                |
+
+*** "reports the exec failure with the resolved path, not a generic error"
+
+Verified live: Ever never sees an exec failure. The daemon builds a shell string and runs =/bin/sh -c=, so =fork= succeeds, =execve("/bin/sh")= succeeds, and it is the *shell* that fails. A hook pointing at a deleted script produced, in its execution log:
+
+#+begin_src
+/bin/sh: line 1: /var/tmp/ever-spectest-probe/gone.sh: No such file or directory
+#+end_src
+
+and the store logged =Hook #3 (pid 3274710) exited with status 127=. So:
+
+- The transcript can show the shell's diagnostic and exit 127. It *cannot* distinguish "exec failed" from "the command deliberately exited 127", and must not claim to.
+- "The resolved path" is only present when the hook's command is an absolute path. A command found on =PATH= yields =sh: cmd: command not found= with no path — and *which* =PATH= is the store's, not the operator's. Reporting the store's =PATH= in the transcript is therefore worth more than reporting a resolved path, and this document specifies that instead.
+
+** Facts established at base (all verified live unless marked)
+
+1. *A hook child inherits the store's environment, not the client's.* A hook published to with =SPECTEST_CLIENT_MARKER=hello-from-client ever pub …= saw =SPECTEST_CLIENT_MARKER=<absent>=. The daemon passes =self.envp=, captured when the store started (=src/store/hooks.zig=). The child's =PATH= in the probe was the store's =PATH=, including a =direnv= entry from the shell that started it.
+2. *=ever status= never touches the network.* It takes =--data-dir= (default =./data=) and reads the directory. Run from a directory with no =./data= it prints =error: cannot open data directory './data'= and exits 1 — regardless of =EVER_PORT=. The supervisor's observation holds. Every =hook= subcommand, by contrast, is a wire client. *Consequence:* "the store" in this document always means the store reached over the wire at =--address= / =--port=, never a data directory.
+3. *=ever hook logs <id>= has no result-limiting flag*; =--limit 3= gives =error: unknown flag '--limit'=. The *wire* request already carries =max_bytes: u32 = 65536= (=protocol.HookLogsRequest=) — the capability exists and is simply not exposed. Unrelated to this feature, but it means "add a flag" here is a CLI-layer change, not a protocol change.
+4. *Framework error shape.* =zig-cli-kit= writes a readable line to stderr, then =main.zig='s =else => return err= lets Zig print an error-return trace pointing into the dependency's source. Every failure in the =hook= family exits *1* — =rm= on a missing name, =logs= on a missing hook, a missing required argument, an unknown flag, an unknown subcommand. *The family has no exit-status vocabulary at all*, so this document defines one rather than claiming to inherit one.
+5. *=.required = true= on a positional is currently advisory.* =ever hook logs= with no argument produced the handler's own =error: hook ID is required= (=src/main.zig:516=), not a framework error. A new subcommand must validate its own arguments.
+6. *Hook names are not unique, and name resolution silently takes the first match.* Two hooks named =guard= were registered; =ever hook rm guard= removed =#1= without a word about =#5=. Directly relevant: a preflight that silently tests the wrong hook is worse than no preflight. See [[*Resolving =<id-or-name>=]].
+7. *=ever pub= to a topic that does not exist fails* (=error: topic not found=, exit 1), and =pub= accepts arbitrary non-JSON bytes for a topic that does: =ever pub probe.done 'not json at all'= delivered ="value":"not json at all"=.
+8. *The envelope's =offset= is a global log offset; an exact-topic hook's cursor is a topic-local skip count.* In the probe, five events on =probe.done= carried envelope offsets 1–5 while =hook list= showed cursor =5=; a second topic's first event took global offset 7. The two numbers are in different coordinate systems. See [[*Synthesising the event]].
+9. *Hook execution logs live at =<data-dir>/hooks/<id>-<millis>.log=*, and =hook logs= selects the newest file whose name starts =<id>-= and ends =.log= (=src/net/server.zig=, =handleHookLogs=). Anything this feature writes into that directory would be picked up as a real execution.
+10. *=ProcessTable= is mutex-protected* (=src/store/hooks.zig=), read by the connection thread for =hook ps= and written by the daemon thread.
+11. *[read from source, not executed]* =reapChildren= calls =waitpid(-1, &status, WNOHANG)= every 500 ms and discards the status of any pid not in the process table (=src/store/hooks.zig:752-767=). This is the central implementation hazard — see [[*The reaper race]].
+12. *[read from source, not executed]* Cursor advance and one-shot removal live in =processHook=, one level *above* =executeHookCommand=, which touches neither. The structural separation this document needs already exists; it is not yet enforced by types.
+
+* Proposal
+
+** Where the test executes
+
+*Server-side, in the store process, on the connection thread.* A new wire message pair =hook_test = 0x10= / =hook_test_ok = 0x90= (next free codes; =0x0F=/=0x8F= are the last in use).
+
+The alternative — fork from the CLI — is rejected on evidence, not taste. It would deliver:
+
+| Property             | Real delivery                        | Client-side fork                  |
+|----------------------+--------------------------------------+-----------------------------------|
+| environment          | store's =envp= at start (fact 1)      | operator's shell                  |
+| =PATH=               | store's                              | operator's, usually richer        |
+| cwd                  | hook's recorded =cwd=                 | reproducible                      |
+| user / umask / rlimits | store's                            | operator's                        |
+| fd 1,2               | regular file in =<data-dir>/hooks/=   | terminal, or whatever             |
+
+Failure 1 of the six was =chronoa send= to a session name that no longer existed. In an operator's interactive shell =$CHRONOA_DAEMON= is set; in the store's environment it is not. A client-side test would have printed a green transcript for the single failure that cost the most hours. The tool's value is entirely in being *the same path*, and the environment is where paths differ.
+
+Executing on the *connection* thread rather than the daemon thread is also deliberate: a =hook test= against a 30-second command must not stall delivery for every other hook, which is what running it inline in =pollAndExecute= would do.
+
+** Command surface
+
+#+begin_src
+ever hook test <ID-OR-NAME> --topic <TOPIC> [OPTIONS]
+
+Arguments:
+  <ID-OR-NAME>              Hook ID (e.g. 7) or hook name
+
+Flags:
+      --topic <TOPIC>       Topic to synthesise the event on (required unless the hook's
+                            pattern is an exact topic, in which case it defaults to the pattern)
+      --payload <DATA>      Event value, exactly as `ever pub <topic> <DATA>` takes it
+                            (default: {})
+      --payload-file <PATH> Read the value from a file; `-` reads stdin
+      --key <KEY>           Event key (default: none, matching what `ever pub` can express)
+      --offset <N>          Envelope offset (default: the offset the next real event would take)
+      --timestamp <MS>      Envelope timestamp in ms (default: now; set it for a byte-stable
+                            transcript a test can compare against)
+      --timeout <DUR>       Harness deadline, e.g. 30s (default: 60s)
+      --json                Emit the transcript as a single JSON object instead of prose
+      --mark-envelope       Add "synthetic":true to the delivered envelope. Off by default;
+                            turning it on changes the bytes and invalidates a byte-level guard test.
+#+end_src
+
+=--topic= is required rather than inferred because inferring it is impossible for the patterns that matter. =notify-orch.sh= — the field artefact this feature was written for — is registered on the prefix =ever4.= and its entire branch table switches on =$EVER_TOPIC=:
+
+#+begin_src bash
+case "$TOPIC" in
+  *.done)      … ;;
+  *.exit)      … ;;
+  *.learnings) … ;;
+esac
+#+end_src
+
+Without =--topic= not one row of that table can be exercised. This is also what makes failure 4 — =--on-exit= publishing to the same =.done= topic as real completions — catchable: run the hook once with =--topic ever4.X.done= and once with =--topic ever4.X.exit= and read which rows fire.
+
+Validation: =--topic= must satisfy the hook's pattern under the store's own =matchTopic=. If it does not, exit 2 naming both, because testing a delivery that could never happen is a false green. The topic is *not* required to exist in the store — a preflight's purpose is to run before the first real event — but if it does not exist the transcript carries a warning, since =ever pub= to a missing topic fails (fact 7) and "the topic was never created" is itself a common cause of "the hook never fired".
+
+** =--payload= semantics
+
+*=--payload= is the value, not the envelope.* Its contract is defined by reference, and the reference is exact: =--payload D= must be accepted if and only if =ever pub <topic> D= would be accepted, and must produce the same =value= bytes.
+
+That answers the "what if it is not valid JSON" question by construction: *nothing special happens.* =ever pub= accepts arbitrary bytes (fact 7), so =hook test= accepts them, wraps them in the envelope with the same JSON escaping, and delivers. A preflight that rejected payloads production accepts would be a tool that lies in the safe direction, which is still lying — and it would train operators to distrust it.
+
+Two accommodations, both because the current CLI cannot express what the store can:
+
+- =--key= exists because =ever pub= has no key argument but the HTTP publish path does (=src/net/http.zig=), so real events *can* carry keys and a handler reading =.key= or =$EVER_KEY= is otherwise untestable. Note that =EVER_KEY= is set to the *empty string* for keyless events, not left unset — verified live.
+- =--payload-file -= exists because a payload containing quotes is exactly the payload that breaks under shell quoting, and requiring the operator to get that right in the tool that exists to catch quoting bugs would be perverse.
+
+** The transcript
+
+The transcript is the product. Its one job is to show the bytes rather than a view of the bytes.
+
+#+begin_src
+$ ever hook test 7 --topic ever4.spectest.done --payload '{"agent":"ever4-spectest","status":"done"}'
+
+Hook             #7 (notify-orch)
+Pattern          ever4.                       (prefix)
+Topic            ever4.spectest.done          matches pattern: yes
+Command          /home/ryota/.local/state/ace-ever4/notify-orch.sh
+Working dir      /home/ryota/.local/state/ace-ever4
+Executed by      store 127.0.0.1:7890, pid 3241, uid 1000
+Store PATH       /nix/store/…/bin:/home/ryota/.local/bin:…
+
+── stdin: 137 bytes, verbatim ──────────────────────────────────────────────
+{"topic":"ever4.spectest.done","offset":116637,"timestamp":1785717000000,"key":null,"value":"{\"agent\":\"ever4-spectest\",\"status\":\"done\"}"}
+── end stdin ───────────────────────────────────────────────────────────────
+
+── environment set by the store for this delivery ──────────────────────────
+EVER_TOPIC=ever4.spectest.done
+EVER_OFFSET=116637
+EVER_TIMESTAMP=1785717000000
+EVER_KEY=
+EVER_DATA=(identical to stdin, 137 bytes)
+EVER_SYNTHETIC=1     ← set only by `hook test`; unset during real delivery
+── end environment ─────────────────────────────────────────────────────────
+
+── stdout + stderr, as the store captures them ─────────────────────────────
+…
+── end output ──────────────────────────────────────────────────────────────
+
+Exit             0, after 41 ms
+Store            events 116637 → 116637; 42 hook cursors, none advanced
+#+end_src
+
+Rules, each of which is a defect this prevents:
+
+1. *The stdin block is written verbatim.* No pretty-printing, no unescaping, no re-serialising, no truncation. =ever sub= renders =value= unescaped and that rendering is what hid the bug for weeks; this block exists precisely to be the thing =ever sub= is not.
+2. *The byte count is printed with the block.* "Looks the same" is how the failure survived. A count lets a reader see that an embedded newline or a trailing byte is in the payload rather than in the display.
+3. *=EVER_DATA= is not printed twice.* It is byte-identical to stdin by construction; printing it again invites a reader to diff two renderings and conclude something about the second one. The transcript asserts the identity and prints the length.
+4. *The store's =PATH= is printed*, because it is the single most common reason a command that works in the operator's shell fails under the daemon, and because (per [[*Re-verification]]) it is the honest replacement for "the resolved path".
+5. *Delimiters are unambiguous and carry lengths*, so =--json= and the prose form contain the same information and neither is the "real" one.
+
+=--json= emits =={"hook":{…},"event":{…},"stdin_bytes":<int>,"stdin":"<escaped>","env":{…}, "exit_code":<int|null>,"signal":<int|null>,"duration_ms":<int>,"output":"<escaped>", "delivered":<bool>,"reason":"<string|null>","store":{"events_before":…,"events_after":…, "cursors_changed":<int>,"conclusive":<bool>}}== on one line. Coordinate the exact key style with the in-flight =air/v0.1/cli-json-list-output.org= draft rather than inventing a second convention.
+
+** Refusability
+
+*The synthetic marker lives in the environment, not in the envelope.*
+
+- =EVER_SYNTHETIC=1= is set for, and only for, deliveries made by =hook test=.
+- It is *absent* — not empty — during real delivery. The distinction matters here specifically: =EVER_KEY= is already set-but-empty for keyless events (verified live), so "set but empty" means something else in this environment and cannot be overloaded.
+- The documented handler idiom is exactly one line, and it is the idiom handlers already use for =EVER_TOPIC=:
+
+#+begin_src bash
+[ -n "${EVER_SYNTHETIC:-}" ] && { echo "refusing synthetic event"; exit 0; }
+#+end_src
+
+- The value is =1=. It is never any other value. If a future need arises for variants, they get new variables; =EVER_SYNTHETIC= is a boolean-presence flag forever. This is stated now because it is a compatibility surface for shell scripts written by other people from the day it ships.
+
+*Why not the envelope, which is what the draft asked for.* Adding ="synthetic":true= to the JSON changes the bytes on stdin between test and production. The tool's entire claim is "these are the bytes your guard will be compared against"; a tool that alters them to advertise itself has falsified its own transcript, and it does so in exactly the byte-level-guard class of bug that motivated the feature. A handler doing =case "$EVENT" in *…*)= would be compared against a different string in test than in production.
+
+=--mark-envelope= is provided for the case where a handler genuinely cannot read its environment (an =ssh= or =sudo= hop that scrubs it, a handler that re-execs). It is off by default, and the transcript states plainly, when it is on, that the stdin block is no longer production-faithful.
+
+*Refusability is a courtesy, not a safety mechanism.* A hook whose command deletes something will delete it. The transcript's header prints the command and cwd before any output, and the honest mitigation is the operator reading it, plus [[*Why =--all= is dropped]].
+
+** Why =--all= is dropped
+
+The draft's =--all= / =--pattern= answers "which hooks would this topic wake?" — a *different question*, needing no execution. Two decisions:
+
+1. *=--all= is dropped entirely.* A flag that turns "run one command" into "run every matching command" is an incident with a keystroke. On the incident store that would have been 42 hooks, 24 of them pointing at deleted scripts. There is no mode of =hook test= that executes more than one hook.
+2. *=--pattern= becomes its own non-executing verb: =ever hook match <topic>=.* Not a flag on =hook test=, because the word =test= implies execution and a flag that silently makes an executing command non-executing is precisely the ambiguity that produced the six failures.
+
+#+begin_src
+$ ever hook match ever4.spectest.status
+ID   NAME          PATTERN   KIND     COMMAND
+#7   notify-orch   ever4.    prefix   /home/ryota/.local/state/ace-ever4/notify-orch.sh
+
+1 of 42 hooks would fire for 'ever4.spectest.status'.
+#+end_src
+
+It is a pure function of the hook table and =topic.matchTopic=: no execution, no publish, no cursor, no log file. It is also *strictly cheaper and lands sooner* than the execution half, and it is the piece the rest of the round-4 hook chain actually needs. See [[*What this makes checkable, and what it does not]].
+
+The same listing should back a =--dry-run= on =hook add= ("this pattern would match these existing topics; N hooks already cover it"), which catches failure 2 at the earliest possible moment. Noted as a follow-up, not specified here.
+
+** Exit status
+
+The =hook= family currently exits 1 for everything (fact 4), so there is nothing to inherit. Four codes, and one rule that makes them memorable:
+
+*0 and 1 are verdicts about the hook. 2 and 3 are verdicts about the harness.*
+
+| Code | Meaning                          | Examples                                                                      |
+|------+----------------------------------+-------------------------------------------------------------------------------|
+|    0 | Delivered; command exited 0      |                                                                               |
+|    1 | Delivered; command failed        | nonzero exit (including 127), or killed by a signal                           |
+|    2 | *The test did not run*           | unknown/ambiguous hook, =--topic= not matching the pattern, store unreachable, no execution slot, fork/pipe/log failure, store-unchanged assertion violated |
+|    3 | *The test ran but did not conclude* | command exceeded =--timeout= and was killed; no verdict available          |
+
+The command's own exit code is *not* propagated into the CLI's exit status. It is reported in the transcript and in =--json=, but 127 is the most informative code in this system and colliding it with a shell's own 127 would make =ever hook test … ; echo $?= unreadable. A script that wants the raw code reads =--json=.
+
+Exit 3 is separate from 1 because "the hook hung" and "the hook failed" call for different actions, and because a preflight that reports failure for a slow command trains people to ignore it.
+
+** Structural non-mutation
+
+"Must not touch the durable log" is enforced three ways, in decreasing strength.
+
+*** By type
+
+Extract the delivery core out of =HookDaemon.executeHookCommand= (which today already touches neither cursors nor the log — fact 12) into a free function whose signature makes mutation a compile error:
+
+#+begin_src zig
+const Delivery = struct {
+    exit_code: ?u8,
+    signal: ?u8,
+    duration_ms: u64,
+    output: []u8,
+};
+
+/// Executes `hook.command` for `event` exactly as the daemon does.
+/// Takes no mutable store handle: it cannot publish and it cannot move a cursor.
+fn deliver(
+    allocator: Allocator,
+    envp: [*:null]const ?[*:0]const u8,
+    hook: Hook,               // by value — a snapshot
+    event: store.Event,       // by value — never appended anywhere
+    opts: DeliverOpts,
+) !Delivery
+#+end_src
+
+- No =*TopicManager= parameter → =publish= is unreachable → the log cannot grow.
+- No =*HookTable= parameter → =updateCursor= and =remove= are unreachable → no cursor can move and a =--once= hook cannot be auto-removed by a test.
+- =hook= and =event= are values, so nothing the callee does is visible to the caller's table.
+
+=processHook= then calls =deliver= and does its cursor bookkeeping itself, one level up, exactly as it does today. This is a refactor of ~40 lines with no behaviour change, and it is the part of this proposal a reviewer should scrutinise hardest, because it is the part everything else rests on.
+
+The =hook test= handler additionally never constructs an =Event= that anything else can reach: it is a stack value passed to =deliver= and dropped.
+
+*** By observation, on every run
+
+The server samples, immediately before and immediately after the delivery:
+
+- the log head offset and the total event count,
+- the =(hook_id, cursor)= vector for *every* registered hook.
+
+The result is printed as the transcript's last line. If anything changed, the command exits 2 and says which hook's cursor moved.
+
+*Honest caveat, because this is a measurement that can lie.* The daemon runs concurrently; if a real event arrives mid-test, real cursors legitimately advance and a naive check reports a false alarm. So the check is *conditional on the head offset*: if the head moved, the line reads
+
+#+begin_src
+Store            3 events published by others during the test — cursor check inconclusive
+#+end_src
+
+and the exit status is unaffected. Under the acceptance test the store is quiescent and the check is exact. A check that cried wolf under load would be switched off within a week.
+
+*** By test
+
+See [[*Test plan]] — including a mutation test that removes the type-level guard and confirms the assertion fires.
+
+*** The implementation this forbids
+
+The obvious shortcut is "publish to a scratch topic and let the daemon deliver it". It must be rejected explicitly, because it looks like the small change and it is wrong in three ways at once: it appends to the durable log, it advances the tested hook's cursor, and it wakes *every other hook* whose pattern matches — on the incident store, a prefix hook like =ever4.= would have fired for a scratch topic under it. Reviewers should treat any patch containing a =publish= call in the =hook test= path as an automatic rejection.
+
+* Design Details
+
+** Synthesising the event
+
+| Field       | Value                                                                       |
+|-------------+-----------------------------------------------------------------------------|
+| =topic=     | =--topic=, validated against the hook's pattern                              |
+| =offset=    | =--offset=, else the offset the next real event would receive (global scale) |
+| =timestamp= | current wall clock in ms, else =--timestamp= if determinism is needed        |
+| =key=       | =--key=, else null                                                           |
+| =value=     | =--payload=/=--payload-file= bytes verbatim, else ={}=                        |
+
+The envelope is produced by the *same* =buildEventJsonFromStore= the daemon uses. It is currently private to =src/store/hooks.zig=; make it =pub= (or move it beside =deliver=) rather than writing a second builder, because two builders will diverge and the divergence will be invisible.
+
+On =offset=: the envelope's =offset= is a *global* log offset, whereas an exact-topic hook's cursor is a topic-local skip count (fact 8). =hook list='s "Last Offset" column and the envelope's =offset= are therefore in different coordinate systems for exact-topic hooks. The default must be the global head, not the hook's cursor, and the transcript must not present the two side by side without labels — a transcript that teaches a false equivalence is worse than one that omits the number.
+
+** The reaper race
+
+*This is the hazard the draft's "with the store lock untouched" does not cover, and the one most likely to be missed in implementation.*
+
+=HookDaemon.reapChildren= runs every 500 ms and calls =waitpid(-1, &status, WNOHANG)= — *any* child of the store process — then discards the status of any pid it does not recognise (=src/store/hooks.zig:752-767=, read from source). If the =hook test= handler forks a child on the connection thread and then calls =waitpid(child_pid, …)=, the daemon and the handler race:
+
+- daemon wins → the handler's =waitpid= returns =ECHILD= and *the exit status is unrecoverable*;
+- handler wins → correct.
+
+A typical hook command finishes in tens of milliseconds against a 500 ms reap period, so this passes in development and loses intermittently in the field. A preflight that intermittently reports "exit status unknown" is a preflight nobody trusts, and it fails in the direction of a false green.
+
+*Resolution: the daemon stays the sole owner of =waitpid=.* Register the test's child in the existing mutex-protected =ProcessTable= (fact 10) with a completion slot:
+
+#+begin_src zig
+pub const ProcessEntry = struct {
+    // … existing fields …
+    synthetic: bool = false,
+    /// Written by the reaper, read by the waiting connection thread.
+    completion: ?*Completion = null,
+};
+
+const Completion = struct {
+    done: std.atomic.Value(bool),
+    status: std.atomic.Value(u32),
+};
+#+end_src
+
+=reapChildren= already calls =removeByPid=; when the removed entry carries a =completion=, it stores the status and sets =done=. The connection thread waits on that, bounded by =--timeout=.
+
+This falls out well for four other reasons:
+
+1. =checkTimeouts= already kills entries in the table, so a hanging *test* child is killed by the same code that kills a hanging *real* hook — the "same path" property extends to the failure case rather than stopping at the happy one.
+2. =shutdownChildren= already SIGTERMs the table, so stopping the store during a test cleans up.
+3. =hook ps= shows the running test — a long preflight ought to be visible — and =synthetic= gives it a column so it is never mistaken for real traffic.
+4. =MAX_CONCURRENT_HOOKS= (16) then applies to tests too. A test that cannot get a slot is exit 2, "the test could not be run", which is the honest answer rather than a queue.
+
+Rejected alternatives: routing the test through the daemon thread (a 30 s command stalls all hook delivery for 30 s); blocking =SIGCHLD= around the fork (does not help — the daemon's =waitpid(-1)= does not need the signal); =pidfd_open= + =waitid(WNOWAIT)= (still racy against a =waitpid(-1)= that reaps).
+
+** Output capture
+
+The child's fd 1 and 2 are redirected to a regular file, exactly as in production — not to a pipe. This matters twice: libc's buffering mode and =isatty= must not differ from production, and a pipe with no concurrent drain deadlocks on output larger than the pipe buffer.
+
+The file is =<data-dir>/hook-tests/<hook-id>-<millis>.log=, deliberately *not* under =<data-dir>/hooks/=:
+
+- =hook logs= selects the newest =<id>-*.log= in =<data-dir>/hooks/= (fact 9). A test log placed there would be returned as if it were a real execution, quietly corrupting forensics.
+- =ever--hook-exec-log-retention.org= is concurrently trying to bound =<data-dir>/hooks/= after it reached 105,272 files. A preflight run in a loop by CI must not feed that directory.
+
+The file is read back into the response and *unlinked*. Nothing accumulates: the feature adds no new unbounded directory, which is the whole point of keeping it out of the other item's way. On harness failure the file is left in place and its path named in the error, so a crash still leaves evidence, and the daemon sweeps orphans in =hook-tests/= at startup.
+
+** Resolving =<id-or-name>=
+
+Reuse the existing list-then-match resolution, with one change: names are not unique and the current =hook rm= silently takes the first match (fact 6). =hook test= must *refuse* an ambiguous name — exit 2, listing every candidate with its id and pattern. Testing the wrong hook and reporting success is the failure mode this feature exists to eliminate; reproducing it in the resolver would be self-defeating.
+
+(=hook rm='s silent first-match is a separate defect, out of scope here. It is worth raising with =ever--hook-gc-and-lease.org=, which adds more name-addressed verbs onto the same resolver.)
+
+** CLI declaration
+
+Declared under the existing =hook= command in =src/main.zig='s =app= literal, in the same style as its siblings. Two framework facts constrain it (facts 4, 5): positional =.required= is advisory, so =<ID-OR-NAME>= is validated in the handler; and an unhandled error reaches =main='s =else => return err= and prints a Zig error-return trace into the dependency's source. Every =hook test= failure path must therefore terminate through the handler with a message and an explicit =std.process.exit(N)=, never by returning an error — otherwise a preflight failure prints a stack trace into =zig-cli-kit=, which is both useless and alarming.
+
+** Wire protocol
+
+| Code | Name           | Direction | Body                                                                    |
+|------+----------------+-----------+-------------------------------------------------------------------------|
+| 0x10 | =hook_test=    | Request   | ={"hook_id":N,"topic":"…","value":"…","key":null,"offset":null,"timeout_ms":60000,"mark_envelope":false}= |
+| 0x90 | =hook_test_ok= | Response  | the =--json= object described in [[*The transcript]]                       |
+
+Errors use the existing =error_response= (=0xFF=) frame. Note the request carries =hook_id= only — name resolution happens client-side against =list_hooks=, as =hook rm= already does, so the ambiguity refusal is in one place.
+
+* What this makes checkable, and what it does not
+
+=ever hook test= is scheduled third in =reviews/round-4/proposed-air/OVERVIEW.org= on the argument that it "is what makes every later hook change verifiable". *On the evidence, that argument is largely wrong, and the part of this proposal that does the work is the non-executing =hook match= query, not the execution.* Item by item, against the sibling drafts as they stand on 2026-08-03:
+
+** =ever--hook-scan-cursor-and-lag.org= (item 1) — contributes almost nothing
+
+| Its acceptance criterion                                     | Checkable with =hook test=?                                          |
+|--------------------------------------------------------------+----------------------------------------------------------------------|
+| Pattern matching nothing reaches lag 0; hot thread in state S | *No.* =hook test= never runs the poll loop and never reads the log    |
+| =--from-beginning= / =--from N= replay unaffected             | *No.* Arming and cursor semantics; =hook test= deliberately has none   |
+| =hook list= shows a =lag= column                              | *No.* Different command                                              |
+| Regression test bounds its own probe                          | *No*, though =hook test='s exit 3 is the same discipline as a feature |
+
+The one real contribution is a fence in the other direction: once the cursor fix makes "a scan advances the cursor" true, this document's *cursors unchanged* assertion is what stops that behaviour leaking into the test path. Narrow, but worth having, and it argues for landing the harness's invariant test *after* the cursor fix so it fences something real.
+
+** =ever--hook-gc-and-lease.org= (item 2) — contributes little, and needs a decision from this document
+
+| Its acceptance criterion                                | Checkable with =hook test=?                                                 |
+|---------------------------------------------------------+-----------------------------------------------------------------------------|
+| Deleted script ⇒ =disabled= after first fire             | *No* — and this needs an explicit rule, below                               |
+| =--ttl 2h= disabled at expiry                            | *No.* Wall-clock lease                                                      |
+| =hook gc --dry-run= names exactly the 24                 | *No.* Different command, though it shares =hook match='s output conventions  |
+| Disabled state durable across restart                    | *No*                                                                        |
+
+*The rule that item needs from this one:* a synthetic delivery must *not* feed =consecutive_failures= or trigger the disable-on-127 transition. That follows from [[*Structural non-mutation]] — the test path holds no mutable =HookTable= — but it must be stated in that document too, because the tempting implementation ("=hook test= is a cheap way to trigger the first fire") would let a preflight disable a healthy hook. The two documents also both want a "resolved command exists?" check; it should exist once and be shared.
+
+** =ever--hook-pattern-matching.org= (item 9) — the strongest case, and it is the query half
+
+| Its acceptance criterion                                                   | Checkable?                                                       |
+|----------------------------------------------------------------------------+------------------------------------------------------------------|
+| =*.done= fires for =a.done= and =proj.impl.done=, not =proj.done.summary=    | *Yes* — =ever hook match= answers all three in three commands     |
+| Existing prefix patterns match identically before/after                     | *Partly.* =hook match= is the operator-facing oracle; the pin stays a Zig unit test over a recorded topic list |
+| A glob matching nothing does not rescan every tick                          | *No.* Performance                                                |
+| =hook list= distinguishes prefix from glob                                  | *No*, but =hook match= prints the kind for the same reason        |
+
+This is the item that most needs a tool, and what it needs is a match query with no execution — which is an argument for landing =hook match= early and independently of the execution half.
+
+** =ever--hook-exec-log-retention.org= (item 10) — one contribution, one conflict this document resolves
+
+| Its acceptance criterion                                    | Checkable?                                                        |
+|-------------------------------------------------------------+-------------------------------------------------------------------|
+| 100k executions ⇒ bounded files/bytes; =ever status= reports | *No*                                                              |
+| Flat logs migrated or read-compatible; =hook logs= still works | *Indirectly yes* — =hook test= is a cheap way to mint a fresh execution log on demand, which today requires publishing a real event |
+| Tight-loop hook cannot exhaust the disk                      | *No*                                                              |
+
+*The conflict, which neither draft names:* a preflight run in a loop writes a log file per run into the directory that item is trying to bound. This document resolves it by writing to =<data-dir>/hook-tests/= and unlinking after reading ([[*Output capture]]). The retention author needs to know both that this directory exists and that it is self-bounding, so that a sharding change to =<data-dir>/hooks/= does not accidentally adopt it.
+
+** Against the six failures it claims to catch
+
+The draft claims four of six. That holds — but *only with =--topic=*, which the draft does not have.
+
+| # | Failure                                     | Caught by                                                        |
+|---+---------------------------------------------+------------------------------------------------------------------|
+| 1 | =chronoa send= to a dead session name        | =hook test= — and *only* because it runs in the store's environment |
+| 2 | Pattern too broad (~52 status milestones)   | =hook match= — the query, not the execution                       |
+| 3 | =status:"done"= guard could never match      | =hook test= with a realistic =--payload=; the transcript's stdin block |
+| 4 | =--on-exit= on the same =.done= topic         | =hook test --topic …= — requires =--topic=; impossible as drafted   |
+| 5 | "nonzero exit means crash" (pty flattening) | Nothing in Ever. =chronoa--exit-reason.org=                       |
+| 6 | (the correlation fix, not a failure)        | —                                                                |
+
+* Alternatives considered
+
+** Make the delivered envelope unambiguous instead — and do it anyway
+
+Failure 3 exists because the payload is nested as an escaped JSON string. The narrow, permanent fix is *two lines in =executeHookCommand=*: export the raw payload alongside the envelope.
+
+#+begin_src bash
+EVER_DATA   # the full envelope, unchanged — value is an escaped string   (today)
+EVER_VALUE  # the payload bytes, exactly as published, unescaped          (proposed)
+#+end_src
+
+Verified: no =EVER_VALUE= exists today; the daemon sets =EVER_TOPIC=, =EVER_OFFSET=, =EVER_TIMESTAMP=, =EVER_KEY=, =EVER_DATA= only. With it, the field script that motivated this document collapses from
+
+#+begin_src bash
+jq -r '.value | fromjson | .status // empty'
+#+end_src
+
+to =jq -r '.status' <<<"$EVER_VALUE"=, and — more to the point — the naive literal-byte guard =case "$EVER_VALUE" in *'"status":"done"'*)= *works*. It breaks nothing: it adds a variable, changes no existing bytes, and needs no protocol change.
+
+*This is higher value per line than =hook test=,* and this document recommends landing it first. It does *not* subsume =hook test=: it addresses failure 3 only, leaving 1 (dead session name), 2 (too broad), and 4 (wrong topic) untouched. The two are complements, and the ordering argument is that the cheap permanent fix should not wait behind the expensive general one.
+
+(=EVER_VALUE= belongs in its own document — it changes the hook delivery contract, which is a different blast radius. It is named here because a reviewer should be able to see that the cheaper option was considered and why it was not treated as sufficient.)
+
+** =hook add --dry-run=
+
+Catches failure 2 at the earliest possible moment, needs no execution machinery, and is cheap. But it cannot catch 1 or 3, which require running the command, and it does not help an *already registered* hook — which is every hook at the moment anyone becomes suspicious. It is strictly weaker than =hook match= + =hook test=, and it should be *implemented as* =hook match= run before registration rather than as a third code path.
+
+** A =--dry-run= on =ever pub=
+
+Rejected. It would have to answer "which hooks would this wake" (that is =hook match=) or actually deliver (that is =hook test=), and attaching either to the publish verb puts a non-publishing mode on the one command whose entire contract is that it publishes.
+
+* Acceptance
+
+Each criterion names the failure it comes from, and each is checkable by a reviewer without inheriting the author's context.
+
+1. *The transcript shows the bytes, not a view of them.* For a hook guarding on =status: "done"= against a nested-JSON payload, =ever hook test= prints a stdin block containing =\"status\":\"done\"= — backslashes present — with a byte count, and the same run through =ever sub= prints it unescaped. Both outputs appear in the test's evidence, because the pair is the point. *(failure 3)*
+2. *Nothing moves.* On a quiescent store, before and after a =hook test=: the event count is unchanged, =hooks.json= is byte-identical, and every hook's cursor is unchanged including the tested hook's and including a =--once= hook, which is still registered afterwards. The command's own last transcript line reports the same, and reports =inconclusive= rather than failing if another event arrives mid-test.
+3. *The environment is the store's.* A hook tested with a marker variable set in the invoking shell does not see it; the transcript's environment block shows the store's =PATH=. A test run from a directory that is not the hook's cwd reports the hook's cwd and the command observes it. *(failure 1)*
+4. *=--topic= is enforced and load-bearing.* A prefix-pattern hook cannot be tested without =--topic=; a =--topic= that does not satisfy the pattern exits 2 naming both; a hook whose command branches on =$EVER_TOPIC= takes a different branch for a =.done= topic than for a =.exit= topic. *(failure 4)*
+5. *=--payload= is =ever pub='s argument.* For any =D=, =hook test --payload D= produces the same =value= bytes as =ever pub <topic> D=, including for =D= that is not valid JSON, and neither rejects it.
+6. *Refusal works and costs nothing.* A handler containing =[ -n "${EVER_SYNTHETIC:-}" ] && exit 0= exits 0 without side effects under =hook test= and runs normally under a real event. With =--mark-envelope= off — the default — the stdin bytes are byte-identical to those of a real event with the same topic, key, offset, timestamp and value.
+7. *A deleted script is reported honestly.* Testing a hook whose script has been removed shows the shell's own diagnostic and exit 127 in the transcript, prints the store's =PATH=, and exits 1 (the hook failed) — not 2. The transcript does not claim to have detected an exec failure.
+8. *Exit statuses are distinguishable.* A command exiting 3 gives CLI exit 1; an unknown hook id gives 2; an ambiguous hook *name* gives 2 and lists every candidate; a command sleeping past =--timeout= gives 3 and the child is killed.
+9. *=ever hook match <topic>= lists every hook that would fire for that topic and nothing else*, runs no command, writes no file, and moves no cursor.
+10. *No fan-out exists.* There is no flag, alias or argument form of =hook test= that executes more than one hook.
+
+* Test plan
+
+Integration tests alongside =src/tests/integration.zig=, each against a store on an ephemeral port with its own temporary data directory. *Never against the default port or data directory* — the store on this workstation is production for it.
+
+1. *Envelope fidelity.* Publish a real event and capture what a recording hook receives; run =hook test= with the same topic/key/value and capture again. Assert the two stdin byte strings are equal. This is the test that makes criterion 6 mean something, and it is the one that would have caught the envelope-marking mistake had it been made.
+2. *Non-mutation.* Snapshot event count, =hooks.json= bytes and the full cursor vector; run =hook test= (including against a =--once= hook and with a second, unrelated prefix hook registered); assert all three are identical and that the second hook did not run.
+3. *Mutation test of the type-level guard.* Re-introduce a mutable =*HookTable= parameter to =deliver= and add an =updateCursor= call; test 2 must FAIL. Restore. A guard that is not shown to fail when removed is not evidence. Run the same exercise for the publish path.
+4. *Escaping visibility.* A payload containing =\"status\":\"done\"= must appear escaped in the transcript's stdin block and unescaped in =ever sub= output; assert both, in the same test, so the divergence is pinned rather than described.
+5. *Environment isolation.* Start the store with a marker variable; run =hook test= from a process *without* it and one *with* a different value; assert the child observed the store's value both times.
+6. *Reaper race.* Loop =hook test= against a trivial command ≥200 times while the daemon polls, with a real hook firing concurrently; assert every run reports a definite exit status and none reports "unknown". *Prove it regresses:* against a version that calls =waitpid(child_pid)= from the connection thread, this test must fail. Also run under =zig build test -Doptimize=ReleaseFast= — this is concurrency-sensitive and a race may only manifest in a release build. *Bound the probe with a wall-clock cap* so a pre-fix run reports "still waiting after N s" rather than hanging and producing no evidence.
+7. *Timeout.* A hook sleeping past =--timeout= gives exit 3, the child and its process group are gone afterwards (check the pgid), and =hook ps= is empty.
+8. *Slot exhaustion.* With =MAX_CONCURRENT_HOOKS= real hooks running, =hook test= exits 2 with "the test could not be run", not 1.
+9. *No log-directory pollution.* Count entries in =<data-dir>/hooks/= before and after 50 =hook test= runs: unchanged. =<data-dir>/hook-tests/= is empty afterwards. =hook logs <id>= still returns the last *real* execution.
+10. *Ambiguity.* Two hooks with the same name; =hook test <name>= exits 2 and names both ids; =hook test <id>= works.
+11. *Match query.* Over a fixture of prefix, exact and (once item 9 lands) glob patterns, =hook match= returns exactly the set =topic.matchTopic= returns, asserted against the function directly rather than against a hand-written expectation.
+
+* Risks and open questions
+
+- *The refactor is the risk.* Extracting =deliver= touches the daemon's hot path. It must be a behaviour-preserving refactor landed and reviewed *separately* from the new subcommand, so a bisect can tell the two apart.
+- *=hook test= runs the real command.* A hook that deploys, deletes or messages will do so. Mitigated by =EVER_SYNTHETIC=, the header printed before any output, and the absence of fan-out — but not eliminated, and the help text must say so in one line rather than burying it.
+- *=--mark-envelope= is a trap by construction.* Anyone who turns it on has stopped testing the production byte stream. The transcript must say so on the run, not only in the docs.
+- *Open: should =hook test= be able to target an unregistered hypothetical* (=--command … --pattern …=), so a hook can be exercised before =hook add=? It would catch failures earlier, but it means executing an arbitrary command supplied over the wire by anyone who can reach the store — a materially different security posture from executing a command an operator already registered. Deliberately excluded here; it needs its own document if wanted.
+- *Open: whether =hook match= should ship first and separately.* This document argues it should (see [[*What this makes checkable, and what it does not]]), but the sequencing decision is the supervisor's.
+
+* References
+
+- =reviews/round-4/ace-operations.org= — finding 1 (the six silent failures) and suggested addition 4.
+- =reviews/round-4/proposed-air/ever--hook-test-harness.org= — the triage draft this supersedes.
+- =reviews/round-4/proposed-air/OVERVIEW.org= — the ordering argument, disputed above.
+- =air/v0.1/hook-execution.org= — the execution model, log files, process table. Four claims in it are marked =[Superseded]= inline by this work: the =hook_logs= wire bodies, =hook logs= returning metadata plus =--tail=, deferring one-shot removal to reap, and "the process table is only accessed from the daemon thread — no mutex needed".
+- =air/v0.1/server-hooks.org= — registration, the hook table, and the "Execution env: store's cwd + hook's cwd" row that this document turns into a design constraint.
+- =air/v0.1/hook-registration-cursor.org= — cursor semantics and the exact/prefix coordinate-system split.
+- =air/v0.1/integration-testing.org= — where the tests above belong.
+- Field artefacts, read directly: =~/.local/state/ace-ever4/event-status.sh= (why a literal-byte guard on ='"status":"done"'= cannot match) and =~/.local/state/ace-ever4/notify-orch.sh= (a branch table on =$EVER_TOPIC= that had to be exercised row by row by hand).
+
+* History
+- 2026-08-03: Drafted from =reviews/round-4/proposed-air/ever--hook-test-harness.org=. Re-verified the whole =ever hook= surface post-=zig-cli-kit= migration at base =txpyxrnm 142d5e66=, against an isolated store on port 17890 under =/var/tmp=; the live store was not touched. Divergences from the triage draft, each argued at the point it appears: execution moves server-side (client env is not inherited — verified); the =synthetic= marker moves out of the envelope into =EVER_SYNTHETIC= so the delivered bytes stay production-faithful; =--all= is dropped and =--pattern= becomes a separate non-executing =ever hook match=; =--topic= is added and required for non-exact patterns, without which four of the six failures reduce to three; the "exec failure with the resolved path" acceptance criterion is replaced, since delivery goes through =/bin/sh -c= and Ever never observes an exec failure; and the exit-status vocabulary is defined rather than inherited, the =hook= family having none. Recorded the =waitpid(-1)= reaper race as the principal implementation hazard, and =EVER_VALUE= as a cheaper partial alternative that should land first.
