@@ -1,0 +1,568 @@
+#+title: Hook Reclamation — Failure Backoff, Expiry, and =hook gc=
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:cli:
+
+* Summary
+
+Nothing in Ever reclaims a hook registration. A hook survives the run that created it, the disappearance of its script, the wipe of its working directory, and every restart of the store. This document specifies four mechanisms that bound a hook's lifetime without ever losing one silently:
+
+1. *Failure accounting and backoff.* A hook that fails repeatedly enters =quarantined= and is retried on an exponential schedule with a one-hour ceiling. It returns to =armed= by itself on the first success. It never escalates to anything worse.
+2. *Provably-lossless automatic disable.* Two — and only two — conditions let the daemon stop a hook on its own: its working directory no longer exists, or its command is a literal absolute path that no longer exists *and* its last dispatch exited 127. Both are cases where the command demonstrably cannot run.
+3. *Optional expiry.* =ever hook add --ttl <dur>= stores an absolute =expires_at=; at expiry the hook is disabled, never deleted. Off by default. Renewable.
+4. *=ever hook gc=* — an operator command that reports by default, acts only with =--yes=, and cannot take a hook from =armed= to removed in one step.
+
+Nothing here deletes a hook automatically, under any condition, ever.
+
+This document *does not* fix the poll-cycle rescan cost that dominated the 2026-07-27 incident. That is =ever--hook-scan-cursor-and-lag= (round-4 item 1). See [[#scope-boundary][What this does not fix]].
+
+* Motivation
+
+** The failure mode, re-established from source at this base
+
+Verified against =txpyxrnm= / =142d5e66= ("Migrate CLI to zig-cli-kit"), 2026-08-03. All line references are to that commit.
+
+The hook daemon builds a single shell string per dispatch and hands it to =/bin/sh -c= (=src/store/hooks.zig=, =executeHookCommand=):
+
+#+begin_src
+cd '<hook.cwd>' && [NAME='v' ...] EVER_TOPIC='...' ... exec <hook.command>
+#+end_src
+
+Three properties follow directly, and all three matter for anything that tries to decide whether a hook is dead:
+
+- *=hook.command= is a shell fragment, not an argv.* It is stored as one string and interpolated unquoted so that pipes and redirects work as the user intended (=hooks.zig=, comment above the =shell_cmd.appendSlice(hook.command)= call). There is no "resolved command path" to stat in the general case.
+- *=hook.cwd= is a stored absolute path* (=main.zig= =handleHookAdd= reads =/proc/self/cwd=), and it is consumed by a =cd= that short-circuits the whole command with =&&=. If =cwd= is gone, the command *provably never executes*.
+- *The exit status is never recorded anywhere durable.* =reapChildren= computes =(status >> 8) & 0xFF= and, if non-zero, writes one line to the store's stderr. It is not written to the hook record and not written to the per-execution log file under =data/hooks/=. Recovering "how often has this hook failed" today means grepping the store's stderr log, which is exactly what the incident had to do.
+
+Nothing in =pollAndExecute= consults liveness of any kind. Every hook in the table is polled every 500 ms for as long as the store runs.
+
+** Measured, and dated
+
+*** The incident's census is history, not a property of the store
+
+The triage draft cites "24 of 42 hooks (57%) pointed at command paths that no longer existed" and "7 of 8 orchestration script directories under =/tmp= had been cleared". That was a *snapshot of one store on 2026-07-27*, taken before the operator hand-pruned it. Re-measured on *2026-08-03T00:28Z* against the same store (=~/Coding/github.com/withre/ace-stack/data/hooks.json=, read-only inspection — no probe, no registration, no removal):
+
+| Metric                                   | 2026-07-27 (incident) | 2026-08-03 (re-measured) |
+|------------------------------------------+-----------------------+--------------------------|
+| hooks registered                         | 42                    | 16                       |
+| command is a literal absolute path       | (not broken out)      | 7                        |
+| ... of those, path missing               | 24                    | 0                        |
+| command first token is not a path at all | (not broken out)      | 9                        |
+| =cwd= missing                            | (not broken out)      | 0                        |
+
+The 57% figure must not be quoted as a current fact and must not be used to size anything. What survives re-verification is the *mechanism*, and the store's own stderr log confirms it independently (=~/.local/state/chronoa/logs/ever-store.log=, 15,297,533 bytes, read 2026-08-03):
+
+- 69,470 lines matching =exited with status 127=, of which *69,094 are hook #20 alone* (=gate-watcher=, =/tmp/ever-orch/gate-watch.sh=).
+- The last such line is timestamped =2026-07-27 23:05:43= — the manual prune. There has been no exit-127 line since.
+- Other exit statuses present: 1,368 × 2, 171 × 1, 10 × 3, 1 × 126.
+
+So the incident's story reproduces exactly, and the remedy that ended it was removal by hand.
+
+*** Exit-status semantics, measured
+
+Measured 2026-08-03 on an isolated store (own =--data-dir= under =/var/tmp=, port 7931, torn down afterwards), one hook per case, one published event:
+
+| Case                                            | Observed exit | Logged by daemon?            |
+|-------------------------------------------------+---------------+------------------------------|
+| =cwd= absent, command fine (=/bin/echo hello=)  | 1             | yes                          |
+| command is an absolute path that does not exist | 127           | yes                          |
+| command exists but is not executable            | 126           | yes                          |
+| command resolved from =PATH= (=echo hello=)     | 0             | no (only non-zero is logged) |
+| script exits 3                                  | 3             | yes                          |
+| script kills itself with =SIGKILL=              | *(nothing)*   | *no*                         |
+
+The last row is a defect that anything counting failures must handle. =reapChildren= extracts =(status >> 8) & 0xFF=, which is 0 for a signal death. *A hook killed by a signal — including by the daemon's own 300-second timeout — is today indistinguishable from a hook that exited 0.* Any naive =consecutive_failures= counter built on the existing extraction would silently treat every timeout kill as a success.
+
+The first row matters too: the =cwd=-missing class does *not* produce 127. It produces whatever the host's =/bin/sh= returns for a failed =cd= — measured 1 here (=/bin/sh= is bash 5.3 on this host); the value is shell-dependent and *the design must not key on it*. This is the entire =/tmp=-wipe class from the incident, and a GC keyed on exit 127 misses all of it.
+
+*** The record format is more fragile than it looks
+
+=HookTable.load= parses =hooks.json= with =ignore_unknown_fields = true=, tries the current format, then falls back to a legacy format, then =catch return=. Measured on the isolated store:
+
+- *Unknown fields are silently discarded on the next write.* Injecting =state=, =consecutive_failures= and =expires_at= into all 7 rows, restarting, and publishing one event: all 7 hooks loaded, and the first =saveLocked= (triggered by the first cursor update, i.e. within one poll cycle) rewrote the file with those fields gone. This is the downgrade path, and it is lossy and immediate.
+- *One malformed row destroys the entire registry, silently.* Deleting the =cursor= key from a single row took the table from *7 hooks to 0 hooks loaded*, with **no error, no warning and no log line** — only =Hook daemon started (0 hooks loaded)=. The next =ever hook add= then rewrote =hooks.json= with one row and =next_id= reset to *1*, permanently destroying the other six registrations and reusing their IDs.
+
+That second finding is the reason this document treats the record migration as a first-class hazard rather than a detail. Adding a field without a Zig default to =HookJson= would do exactly this to every existing store on first start of the new binary.
+
+*** A working hook that failed 139 times in a row
+
+From the store's stderr log, hook =#186= (=chronoafix.= → =~/.local/state/acefix-chronoafix/notify-orch.sh=), which belongs to *another fleet* and is registered on the live store right now:
+
+| Period                              | Outcome                                     |
+|-------------------------------------+---------------------------------------------|
+| up to 2026-07-26 01:39              | 87 consecutive successes                    |
+| 2026-07-26 01:39 → 2026-07-29 00:27 | *139 consecutive failures*, all exit 1      |
+| 2026-07-29 01:36 onwards            | 109 successes, most recent 2026-08-03 00:36 |
+
+Its script exists and its =cwd= exists. It is working today. Any rule that escalates from "failing repeatedly" to "disabled" at any threshold at or below 139 would have permanently silenced a neighbouring fleet's notification path, and the operator would have found out only when something did not happen. This single hook is the argument for everything conservative in this document.
+
+** Goals
+
+- A repeatedly-failing hook stops costing a dispatch per matching event, without being switched off.
+- A hook that provably cannot run is stopped automatically, kept, and re-armable.
+- A registration can be given an explicit lifetime at creation, and renewed.
+- An operator can see what is reclaimable, and why, before anything happens.
+- The disabled/quarantined state and all counters survive a restart.
+- A store written by the previous binary loads with no change in hook count or behaviour.
+
+** Non-Goals
+
+- *Reaping on lag, age, or topic silence.* Beyond the incident's own reasoning (a low-traffic topic is indistinguishable from an abandoned one), there is a structural reason: =Hook.cursor= is *polymorphic in the pattern shape* — a topic-local skip count for exact topics, a global log offset for prefix/wildcard patterns (=hooks.zig= doc comment on =Hook.cursor=; =TopicManager.tipForPatternLocked=). There is no single "lag" number comparable across hooks. Of the 16 hooks on the live store, 9 carry topic-local counts and 7 carry global offsets. Lag may be *reported*; it must never be a reclamation input.
+- *Automatic deletion of anything, ever.* Reclamation means =disabled=. Deletion is =ever hook rm= or =ever hook gc --purge --yes=, both operator-initiated, and the latter refuses to act on a hook that is not already =disabled=.
+- *Repointing a hook's command* (=ever hook update=). See [[#repoint-coupling][Coupling]].
+- *Recovering events missed while a hook was broken.* See [[#repoint-coupling][Coupling]]; this is today's behaviour and this document does not change it.
+- *Per-hook execution timeouts.* The daemon uses a fixed 300 s (=DEFAULT_HOOK_TIMEOUT_SECS=). Making it per-hook is out of scope, but see [[#signal-accounting][signal accounting]] — the fixed timeout interacts with failure counting and that interaction *is* in scope.
+
+* Proposal
+
+** Record format
+
+Eight fields are added to =Hook=, =HookJson= and =HookJsonLegacy=. *Every one carries a Zig default*, so a row written by the previous binary parses unchanged.
+
+| Field                  | Type          | Default   | Meaning                                                                        |
+|------------------------+---------------+-----------+--------------------------------------------------------------------------------|
+| =state=                | =[]const u8=  | ="armed"= | =armed= / =quarantined= / =disabled=                                           |
+| =consecutive_failures= | =u32=         | =0=       | Reset to 0 on any success                                                      |
+| =last_exit_status=     | =?i32=        | =null=    | =0..255= = exit code; *negative = −signal* (=-9= = SIGKILL)                    |
+| =last_error=           | =?[]const u8= | =null=    | Short reason for the last failed attempt; =null= if the last attempt succeeded |
+| =next_attempt_at=      | =?i64=        | =null=    | Epoch ms; while =now < next_attempt_at= the hook is skipped                    |
+| =expires_at=           | =?i64=        | =null=    | Epoch ms; =null= = no expiry                                                   |
+| =disabled_at=          | =?i64=        | =null=    | Epoch ms when the hook entered =disabled=                                      |
+| =disabled_reason=      | =?[]const u8= | =null=    | One of the reason strings in [[#reason-strings][Reason strings]]               |
+
+=state= is a *string*, not a Zig enum, so that a record written by a later binary carrying a state this one does not know still parses. An unrecognised =state= value is treated as =armed= and logged once at load, naming the hook id and the value. Rationale: a hook wrongly armed is noisy; a hook wrongly disabled is a silent outage, and round-4's recurring failure class is silent outages.
+
+=expires_at= is stored *absolute*, never as a remaining duration, so a restart cannot extend a lifetime.
+
+A =version: u32 = 1= field is added to =HookFileJson= and written as =2=. The current binary does not branch on it; it exists so a future reader can tell a downgraded file from an original one. This is the only defence available — see [[#downgrade][Downgrade]].
+
+*** Load path hardening (required, not optional)
+
+Given the measured "one bad row loses everything, silently" behaviour, the migration cannot land without this:
+
+- If =hooks.json= exists, is non-empty, and *both* parse attempts fail, the store must:
+  1. log an error naming the file, its size, and the parse error;
+  2. rename it to =hooks.json.unparseable-<epoch_ms>=;
+  3. start with an empty table. It must *not* silently start empty and then overwrite the file.
+- If =hooks.json= parses but yields zero hooks while the file is larger than a threshold that could not hold zero hooks (say 64 bytes), that is the same condition and takes the same path.
+
+Without this, any future field addition that misses a default silently destroys every registration on every store, and the operator's first sign is that nothing fires.
+
+** States
+
+Three states. The observable difference is one sentence: *a =quarantined= hook fires again on its own; a =disabled= hook never does until an operator says so.*
+
+| State         | Polled?                            | Leaves by itself?           | How it is entered                                               |
+|---------------+------------------------------------+-----------------------------+-----------------------------------------------------------------|
+| =armed=       | every tick                         | —                           | default; any success; =hook enable=                             |
+| =quarantined= | only when =now >= next_attempt_at= | yes — one success → =armed= | =consecutive_failures= reaches K                                |
+| =disabled=    | *never*                            | *no*                        | expiry, provably-lossless rule, =hook disable=, =hook gc --yes= |
+
+There is *no automatic transition from =quarantined= to =disabled=*, at any threshold. Hook #186 above is why.
+
+*** Skip ordering matters
+
+The quarantine check must happen in =processHook= *before* the =fetch= / =fetchPatternByOffset= call, and disabled hooks must be skipped in =pollAndExecute= before =processHook= is entered. This is not a micro-optimisation: for a prefix/wildcard hook whose pattern matches nothing, that fetch is a walk of the whole log (=TopicManager.fetchPatternByOffset=, =topic.zig=). Skipping it turns a quarantined hook's cost from 2 scans/second into 1 scan/hour at the backoff ceiling, and a disabled hook's cost into zero.
+
+** Failure accounting and backoff
+
+*** What counts as a failure
+
+An attempt fails if any of:
+
+- the child exited non-zero → =last_exit_status = code=, =last_error = "exit"=;
+- the child was terminated by a signal → =last_exit_status = -signal=, =last_error = "signal"=;
+- the pre-dispatch guard refused to spawn (see below) → =last_error = "cwd-missing"=;
+- =fork=, =execve= setup or log-file creation failed → =last_error = "spawn-failed"=.
+
+Hitting =MAX_CONCURRENT_HOOKS= is *not* a failure. It is backpressure, the cursor already does not advance, and counting it would quarantine healthy hooks during a burst.
+
+*** <<signal-accounting>>Signal deaths must be decoded
+
+=reapChildren= currently does =(status >> 8) & 0xFF=, which is 0 for a signal death. It must decode the full wait status: =WIFEXITED= → exit code; =WIFSIGNALED= → =-WTERMSIG=. Without this, the daemon's own 300-second timeout kill is recorded as a success and a hung hook never quarantines — which is the exact hook class most worth backing off.
+
+*** The curve, pinned
+
+- =K = 5=. The fifth consecutive failure moves the hook to =quarantined=.
+- =delay(n) = min(30s × 2^(n − K), 1h)= for =n = consecutive_failures=, giving 30 s, 1 m, 2 m, 4 m, 8 m, 16 m, 32 m, 1 h, 1 h, … from n = 5 onwards.
+- Ceiling = 1 h, and it is a fixed point. A permanently broken hook costs 24 fork/execs per day forever. That is cheap enough that there is no case for escalating further, and escalating further is what would have killed hook #186.
+- One success sets =consecutive_failures = 0=, =next_attempt_at = null=, =last_error = null=, and =state = armed=.
+
+*** The cursor during quarantine
+
+While a hook is quarantined, its cursor does not advance, because no dispatch is attempted. Matching events accumulate in the log and are delivered when the hook next attempts — oldest first. This is strictly better than today, where a dispatch that exits 127 still advances the cursor past the event.
+
+The interaction to be aware of: a long-quarantined prefix hook resumes with a large backlog, drained 100 events per poll cycle and at most =MAX_CONCURRENT_HOOKS= (16) concurrently. That is a real burst, and it is the same burst =hook enable= faces — see [[#reversibility][Reversibility]].
+
+** Provably-lossless automatic disable
+
+Only two conditions. Both are cases where it is provable from the daemon's own construction that the command cannot have run.
+
+*** R1 — working directory absent
+
+At dispatch time, before forking, =stat(hook.cwd)=. If it returns =ENOENT=:
+
+- do not fork;
+- record the attempt as a failure with =last_error = "cwd-missing"=;
+- advance the cursor exactly as a spawn would (see [[#repoint-coupling][Coupling]] for why);
+- when =consecutive_failures= reaches K, instead of =quarantined=, set =state = disabled=, =disabled_reason = "cwd-missing"=, provided =stat(cwd)= still returns =ENOENT= at that moment.
+
+This is provable: the dispatch string is =cd '<cwd>' && … exec <cmd>=, so a failed =cd= short-circuits before the command. It also covers the incident's whole =/tmp=-wipe class, which exit-127 matching does not. Only =ENOENT= qualifies — =EACCES=, =EIO=, =ESTALE=, =ELOOP=, =ENOTDIR= and =ENAMETOOLONG= must all be treated as "unknown", counted as an ordinary failure, and left to quarantine. An NFS mount that is down returns =ESTALE= or =EIO=, not =ENOENT=.
+
+*** R2 — command is a literal absolute path that is absent, and the last dispatch exited 127
+
+Both halves are required, and the static half is deliberately narrow. A token qualifies only if:
+
+- it is the first whitespace-delimited token of =hook.command=; *and*
+- it begins with =/=; *and*
+- it contains none of =$=, backtick, =*=, =?=, =[=, =~=, =\=, =:=, single or double quote.
+
+Then, and only then, if =stat(token) == ENOENT= *and* =last_exit_status == 127=, set =state = disabled=, =disabled_reason = "command-missing"=. The stat must be re-run at the moment of disabling, not reused from an earlier tick.
+
+Why both halves:
+
+- *The static half alone is unsound.* Of the 16 hooks on the live store on 2026-08-03, *9 have a first token that is not a path*: =sh= (×5), =echo= (×2), =chronoa= (×2). A rule that stats the first token and disables on failure would switch off 56% of a working store, including hooks belonging to four other fleets. It is also blind to an autofs path, which can return =ENOENT= to =stat= and still resolve when the shell execs it.
+- *The exit-127 half alone is unsound.* 127 is also what a script returns when it deliberately exits 127, or when a command *inside* the script is not found. Requiring the path to be absent as well makes the conjunction provable.
+
+The cost of requiring an observed 127 is one wasted fork/exec per dead hook, once. Compared with a false positive that silences someone's notification path, that is not a cost worth optimising.
+
+*** R3 — expiry
+
+If =expires_at != null= and =now >= expires_at=, set =state = disabled=, =disabled_reason = "expired"=, at poll time, before any fetch. Log *once*, at the transition — not once per tick. (The incident's 15 MB log is what one un-deduplicated per-tick log line looks like.)
+
+*** Everything else
+
+No other automatic disable exists. In particular, no rule involving lag, cursor distance, age, =created_at=, topic emptiness, or failure *ratio* (hook #186 ran at a 42% lifetime failure rate and is healthy).
+
+** Expiry, and why this is a TTL and not a lease
+
+The triage draft calls this "leasing the registration to the run that made it", and proposes =--ttl= / =--lease= as synonyms. They are not the same thing and the difference is load-bearing.
+
+A *lease* is held against a liveness signal: the holder renews, and expiry means the holder is gone. A *TTL* is a wall clock. Ever has no way to observe whether the run that registered a hook is still alive — there is no owner field, no session handle, no heartbeat. Shipping a wall clock under the name "lease" invites exactly the failure the incident's own non-goal warns about: a long-running rig whose hooks vanish mid-run, silently, on a timer nobody remembers setting. Hook =#170= (=ace-stack.support.tick=) has been registered since at least April.
+
+So: implement a TTL, call it a TTL, and make renewal explicit.
+
+- =ever hook add --ttl <dur>= — parsed with the existing =timers.parseDuration= (=src/store/timers.zig=, accepts =s= / =m= / =h= / =d=, rejects =0= and bare integers), stored as =expires_at = now + dur=.
+- =ever hook renew <id|name> [--ttl <dur>]= — sets =expires_at = now + dur=, or extends by the original TTL if =--ttl= is omitted. Refuses on a hook with no =expires_at= (a TTL is not something you can acquire by renewing).
+- *No default TTL, ever.* Omitting =--ttl= means =expires_at = null=, which is today's behaviour.
+- =--lease= is *not* provided as an alias. If a real lease is wanted later it needs an owner identity and a heartbeat, and it should not inherit this name.
+
+** =ever hook gc=
+
+*** Shape
+
+#+begin_src bash
+ever hook gc                         # report only; reclaims nothing; exit 0
+ever hook gc --yes                   # applies R1/R2/R3 candidates (disable, never delete)
+ever hook gc --include-quarantined --yes   # additionally disables hooks flagged under W1
+ever hook gc --purge --state disabled --yes  # removes hooks that are ALREADY disabled
+#+end_src
+
+=--dry-run= is accepted as an explicit synonym for the default, so scripts can state their intent. Running without =--yes= is always a dry run; there is no configuration that changes that.
+
+*** Output, in two sections
+
+#+begin_example
+RECLAIMABLE (2)
+  #31  air.old.        /tmp/ever-orch/notify.sh    cwd-missing       cwd ENOENT: /tmp/ever-orch
+       last exit 1, 12 consecutive failures, last attempt 2026-08-01T09:14:02Z
+  #44  build.done      /tmp/rig/deploy.sh          command-missing   stat ENOENT: /tmp/rig/deploy.sh, last exit 127
+       last exit 127, 5 consecutive failures, last attempt 2026-08-02T22:03:11Z
+
+FLAGGED FOR REVIEW (1) — not reclaimed by --yes
+  #186 chronoafix.     ~/.local/state/.../notify-orch.sh   quarantined
+       139 consecutive failures, last exit 1, command and cwd both present
+       (requires --include-quarantined; a hook in this section may be healthy)
+
+2 reclaimable, 1 flagged, 0 reclaimed (dry run; pass --yes to act)
+#+end_example
+
+Rules:
+
+- The *reclaimable* section contains only R1, R2 and R3 matches. Every line carries the rule name and the evidence that proves it — the path that returned =ENOENT=, or the expiry timestamp.
+- The *flagged* section contains W1 (=state == quarantined= and =consecutive_failures >= 20=) and nothing else. It is informational. =--yes= alone does not touch it.
+- A hook that is =armed= with =consecutive_failures == 0= appears in neither section under any rule except R3 expiry. A working hook is not a candidate, by construction.
+- Lag is *not* printed by =gc= at all, to remove the temptation to act on it. It belongs in =hook list=, which is =ever--hook-scan-cursor-and-lag='s surface.
+
+*** The one-step invariant
+
+*No single command takes a hook from =armed= to removed.* =--purge= requires =--state disabled= and =--yes=, and refuses (exit non-zero, changes nothing) if any named hook is not already =disabled=. =ever hook rm <id>= keeps its current behaviour: it is explicit, single-target, and already exists.
+
+*** Why =--purge= exists at all
+
+Because [[#downgrade][downgrade re-arms everything]]. Disabling is not durable against a rollback of the store binary; removal is. An operator who has decided a hook is dead and expects to roll back needs a reclamation that survives.
+
+** Reversibility <<reversibility>>
+
+*** =ever hook enable <id|name>=
+
+Sets =state = armed=, =consecutive_failures = 0=, =next_attempt_at = null=, =last_error = null=, =disabled_at = null=, =disabled_reason = null=. =expires_at= is *cleared* — re-arming a hook that expired and immediately re-expiring it would be a trap. Re-arming with a fresh TTL is =ever hook enable <id> --ttl <dur>=.
+
+=ever hook disable <id|name>= is the inverse, with =disabled_reason = "operator"=.
+
+*** What "with its cursor" actually means
+
+The cursor is *not touched* by disable, by expiry, by quarantine, or by enable. Concretely, for an event published while the hook was disabled:
+
+- The event is still in the log — Ever never deletes it on a hook's account.
+- On =enable=, the hook resumes from its stored cursor, so *that event is delivered*, along with every other matching event since. Delivery is bounded at 100 events per poll cycle and 16 concurrent children.
+- This can be a large burst. =ever hook enable= therefore *prints the pending count before acting* — =nextOffset() − cursor= for a prefix/wildcard hook, =non_marker_count − cursor= for an exact-topic hook, both cheap — and accepts =--from tail= to skip the backlog and resume at the head instead.
+- Default is to replay, because the stated non-goal is that nothing is lost silently. =--from tail= is the explicit opt-out, and it reuses the vocabulary =hook add= already has.
+
+One consequence worth stating plainly rather than discovering: re-enabling a long-disabled prefix/wildcard hook restores its contribution to the full-log rescan until it catches up. On a store without round-4 item 1's fix, that is the incident's pathology re-armed on purpose. =enable= should say so in its output when the pending count is large.
+
+** CLI surface
+
+Verified 2026-08-03 at =142d5e66=, *after* the zig-cli-kit migration (=src/main.zig=, the =hook= command's =subcommands= array). The triage draft's closing line was written before that migration; it still holds, and the details are:
+
+| Verb           | Exists today                                           | Flags today                                                |
+|----------------+--------------------------------------------------------+------------------------------------------------------------|
+| =hook new=     | yes                                                    | —                                                          |
+| =hook add=     | yes                                                    | =--once=, =--name=, =--from-beginning=, =--from <N>=       |
+| =hook list=    | yes                                                    | —                                                          |
+| =hook rm=      | yes (aliases =remove=, =delete=; accepts id *or* name) | —                                                          |
+| =hook ps=      | yes                                                    | —                                                          |
+| =hook logs=    | yes                                                    | =<id>= required                                            |
+| =hook gc=      | *no*                                                   | —                                                          |
+| =hook enable=  | *no*                                                   | —                                                          |
+| =hook disable= | *no*                                                   | —                                                          |
+| =hook renew=   | *no*                                                   | —                                                          |
+| =hook update=  | *no*                                                   | — (not proposed here; see [[#repoint-coupling][Coupling]]) |
+
+=hook add= has no =--ttl= and no =--timeout=. Global flags =--address/-a= and =--port/-p= exist, with =EVER_HOST= / =EVER_PORT=.
+
+This document adds =gc=, =enable=, =disable=, =renew=, and =--ttl= on =add=. =hook list= gains a =STATE= column; for =quarantined= it shows the time until the next attempt, for =disabled= it shows the reason. That column is the primary observable distinguishing the two states.
+
+Wire protocol: four new request/response pairs, following the existing numbering (=register_hook 0x07=, =unregister_hook 0x08=, =list_hooks 0x09=, =hook_ps=, =hook_logs=). Existing =list_hooks_ok= gains the new fields; a client built before this change ignores them, and one built after must tolerate their absence when talking to an older store.
+
+** <<reason-strings>>Reason strings
+
+Fixed vocabulary, so that scripts and reviewers can match on them: =cwd-missing=, =command-missing=, =expired=, =operator=, =gc=, =gc-quarantined=. =last_error= additionally uses =exit=, =signal=, =spawn-failed=.
+
+** <<downgrade>>Downgrade
+
+Measured, not assumed. An older binary reading a file written by the new one:
+
+1. parses successfully (=ignore_unknown_fields = true=);
+2. ignores =state=, =expires_at=, =consecutive_failures= and the rest;
+3. polls *every* hook, including the disabled ones, because it has no concept of state;
+4. rewrites =hooks.json= without those fields on the first cursor update — measured to happen within one poll cycle of the first matching event.
+
+Every disabled hook re-arms, every TTL is erased, and the failure history is gone. There is no way to prevent this from the new binary's side, because the old binary does not check a version field. What this document can do, and does:
+
+- write =version: 2= so a *future* reader can detect the round trip;
+- make =ever hook gc= (report mode) the documented pre-downgrade step, since its output is the only record of what was disabled and why;
+- provide =--purge=, because removal is the only reclamation a downgrade cannot undo.
+
+This must be stated in the release notes for the change. A downgrade is one-way and lossy.
+
+* Design Details
+
+** Rejected: stat the command path before spawning
+
+The triage draft proposes "on dispatch, stat the resolved command first: unrunnable means record the failure and disable rather than spawn-and-fail". Rejected as the *sole* criterion, for the reasons in R2 above: =hook.command= is a shell fragment, 9 of 16 live hooks have a non-path first token, and =stat= disagrees with =execve= for autofs and for anything reached through =PATH=. The static check survives as one half of a conjunction, never on its own.
+
+The =cwd= check *is* done before spawning (R1), because =cwd= is a stored absolute path with exactly one consumer and no ambiguity.
+
+** Rejected: reaping on lag
+
+Covered under Non-Goals; the structural reason (polymorphic cursor) is worth repeating here because it is not obvious from the draft: comparing =Hook.cursor= to the log head is only meaningful for prefix/wildcard hooks. For an exact-topic hook the cursor is a per-topic skip count and the comparison is a category error. Any implementation tempted to add "lag" to the GC input set should be sent back to =hooks.zig='s =Hook.cursor= doc comment.
+
+** Rejected: a failure *ratio*
+
+Hook #186 has a 42% lifetime failure rate (139 of 335 dispatches) and is healthy. Consecutive count, reset on success, is the only accounting that distinguishes "broken" from "flaky".
+
+** Ordering inside the daemon tick
+
+=daemonLoop= gains no new phase. Inside =pollAndExecute=, per hook, in order:
+
+1. =state == "disabled"= → skip, no fetch.
+2. =expires_at= reached → transition to =disabled= (log once), skip.
+3. =next_attempt_at= in the future → skip, no fetch.
+4. =stat(cwd) == ENOENT= → record failure, advance cursor, maybe disable (R1), skip.
+5. fetch and dispatch as today.
+
+Steps 1–4 must all precede the fetch. Step 4 is per-tick, not per-event: one =stat= per hook per tick on a table of tens of hooks is negligible next to the fetch it replaces.
+
+** Persistence pressure
+
+=HookTable.saveLocked= rewrites the whole file on every mutation, and =updateCursor= already calls it per delivered event. Failure accounting adds writes on the failure path. This is not a new problem and this document does not solve it, but the implementation must not add a save per *tick* — only per state transition and per delivered event, as today.
+
+** <<scope-boundary>>What this does not fix
+
+The incident's CPU burn came from =fetchPatternByOffset= walking the whole log for hooks whose pattern never matches. This document reduces that cost only as a side effect: a disabled hook is not polled, and a quarantined one is polled hourly instead of twice a second. But:
+
+- a hook that *never fires* can never accumulate failures, so *no rule here will ever disable it*. It can only be reclaimed by TTL or by an operator. The incident's most expensive hooks by scan lag (=#17=, =#19=, =#157=, =#158=, all at cursor 0) were in exactly that category.
+- the reduction depends on someone having run =gc --yes=, or on a TTL having been set at registration.
+
+The general fix is =ever--hook-scan-cursor-and-lag= (round-4 item 1: advance the cursor on scan). The two are complementary and neither substitutes for the other. Do not justify this document with the 2,004,113-events-per-cycle figure; that number belongs to item 1.
+
+* <<repoint-coupling>>Coupling with =ever--hook-repoint-and-resilience=
+
+The triage draft says to land this with round-3's =ever--hook-repoint-and-resilience.org= — "or the repoint path has nothing to repoint from". *That document is not scheduled in this batch and will not be implemented alongside this one.* This design therefore stands alone. What that costs, precisely:
+
+** Already landed from that draft
+
+Its third goal — a =--from tail= default so "follow new events only" is a declaration rather than offset arithmetic — *shipped*. At this base, =ever hook add= with neither =--from= nor =--from-beginning= sends =start_cursor = null= and the server resolves the tip under the publish lock (=main.zig= =handleHookAdd=; =air/v0.1/hook-registration-cursor.org=, History 2026-04-21 and 2026-04-28). Only the first two goals remain open.
+
+** What is degraded without the repoint half
+
+1. *A disabled hook can only come back at its original command.* There is no =hook update=, so a hook whose script moved must be removed and re-added, which loses the cursor (a new registration starts at the tip). =enable= restores the registration, not a corrected one.
+2. *Events arriving while a hook is broken are still lost.* R1 advances the cursor without spawning, matching what a spawn that exits 127 does today. The alternative — freezing the cursor — is the time bomb round-3 names explicitly: the moment the script returns, the hook replays the whole backlog. Round-3's answer is a separate "attempted" cursor, and that is the repoint half's design to make. *Reversible in this document means the registration comes back, not the missed events.* Quarantine is the exception: it does not advance the cursor, so events during a quarantine window are deferred rather than dropped.
+3. *No "skip and warn" on a missing command.* This document disables instead, which is a stronger action taken on stronger evidence. A store that wants the softer behaviour needs round-3.
+
+** What a later repoint implementation must inherit from this design
+
+Three requirements, stated so that whoever implements repoint does not have to reverse-engineer them:
+
+1. A successful =hook update= must set =state = armed=, =consecutive_failures = 0=, =next_attempt_at = null=, =last_error = null=, =disabled_reason = null=. Otherwise a repointed hook stays quarantined or disabled and the repoint appears to do nothing.
+2. If repoint introduces a separate "attempted" cursor, failure accounting must key on *delivery* outcomes only. Counting both an attempt and its delivery would double the effective K.
+3. =state= is a string with unknown values tolerated (treated as =armed=, logged once). Repoint may add its own state without a coordinated release.
+
+* Acceptance
+
+Each criterion is checkable from this document alone, against a store built from the change, with no access to the author. "Isolated store" means a store started with its own =--data-dir= and a port other than 7890.
+
+** Migration and durability
+
+1. *No-op on an existing store.* Take a =hooks.json= written by the pre-change binary containing at least three hooks with different =cursor= values. Start the new binary against it. =ever hook list= reports the same number of hooks, the same ids, names, patterns, commands and cursors, and every hook shows state =armed=.
+2. *Round trip.* After (1), publish one event matching one hook so a save occurs. Re-read =hooks.json=: every row now carries =state="armed"=, =consecutive_failures=0=, =last_exit_status=null=, =expires_at=null=, and the file carries =version: 2=. No pre-existing field changed except =cursor=.
+3. *Disabled survives restart.* Disable a hook (=ever hook disable <id>=), stop the store, start it again. =hook list= shows it =disabled= with the same =disabled_reason=, and publishing a matching event produces no new file under =data/hooks/= and no new process in =hook ps=.
+4. *Quarantine survives restart.* Drive a hook to =quarantined= (below), stop and start the store, and confirm =consecutive_failures= and =next_attempt_at= are unchanged in =hook list= and in =hooks.json=.
+5. *Unparseable file is not destroyed.* Corrupt =hooks.json= (delete one required key from one row). Start the store. It logs an error naming the file, renames it to =hooks.json.unparseable-<ms>=, and starts empty. Registering a new hook does *not* overwrite the renamed file. *This criterion regresses today: at =142d5e66= the same input silently takes 7 hooks to 0, logs nothing, and the next registration rewrites the file with =next_id= reset to 1.*
+6. *Unknown state is loud and safe.* Hand-edit one row to =state: "future-state"=. On start the store logs a warning naming that hook id and the value, and the hook behaves as =armed=.
+
+** Backoff and quarantine
+
+7. *K is 5.* A hook whose command exits 1 every time (command and =cwd= both present) is =armed= after 4 dispatches and =quarantined= on the 5th. =hook list= shows =quarantined= and a next-attempt time about 30 s out.
+8. *The curve.* From =quarantined=, successive failures produce next-attempt gaps of approximately 30 s, 1 m, 2 m, 4 m, 8 m, 16 m, 32 m, 1 h, and then 1 h indefinitely. Checkable from =next_attempt_at= in =hooks.json= without waiting out the whole curve.
+9. *Quarantine never becomes disable.* Leave a hook failing for at least 200 consecutive dispatches. It is still =quarantined=. No amount of failure moves it to =disabled= on its own.
+10. *Self-healing.* Repair the failing command so it exits 0. Without any operator command, the hook fires at its next scheduled attempt, and afterwards =hook list= shows =armed= with =consecutive_failures= 0.
+11. *Observable difference.* With one hook =quarantined= and one =disabled=, both with working commands, publish matching events and wait past the quarantined hook's next-attempt time. The quarantined hook fires; the disabled hook does not. This is the whole distinction.
+12. *Signal deaths count.* A hook whose command kills itself with =SIGKILL= reaches =quarantined= after 5 dispatches, and =last_exit_status= is =-9=. *This regresses today: at =142d5e66= such a dispatch produces no log line at all, because =(status >> 8) & 0xFF= is 0 for a signal death.*
+13. *Backpressure is not failure.* Saturate =MAX_CONCURRENT_HOOKS= with long-running hooks and let another hook's events be deferred. That hook's =consecutive_failures= stays 0.
+14. *A quarantined hook does not scan.* With a prefix hook quarantined at a 1 h next-attempt on a store holding a large log, the store's read-syscall rate attributable to that hook is zero between attempts. Measurable without =strace=, as in the incident's notes:
+
+#+begin_src bash
+a=$(awk '/^syscr/{print $2}' /proc/$PID/io); sleep 3
+b=$(awk '/^syscr/{print $2}' /proc/$PID/io); echo $(( (b-a)/3 ))
+#+end_src
+
+** Automatic disable — and its limits
+
+15. *R1 fires.* Register a hook from a directory, delete the directory, publish 5 matching events. The hook becomes =disabled= with =disabled_reason = "cwd-missing"=, and no child process is spawned for any of the 5 (nothing new appears under =data/hooks/=).
+16. *R2 needs both halves.* Register a hook whose command is an absolute path to a script, delete the script, publish 5 matching events: the hook becomes =disabled= with =disabled_reason = "command-missing"= and =last_exit_status = 127=. Now register a second hook whose script *exists* and exits 127 deliberately: after 5 dispatches it is =quarantined=, not =disabled=.
+17. *No static-only disable.* Register hooks with commands =echo hi=, =sh -c 'exit 0'= and =chronoa --version= (any command resolved through =PATH=). None is ever disabled, and none is quarantined while it exits 0. *A rule that stats the first token would disable 9 of the 16 hooks on the reference census below.*
+18. *Only ENOENT.* A hook whose command path exists but is not executable exits 126; it is =quarantined=, never =disabled=. A hook whose command path is unreadable due to permissions on a parent directory (=EACCES= from =stat=) is =quarantined=, never =disabled=.
+19. *Expiry disables, does not delete.* =ever hook add --ttl 30s <pattern> -- <cmd>=; after 30 s the hook is =disabled= with reason =expired=, still present in =hook list=, and the store logged the expiry *exactly once* (not once per 500 ms tick).
+20. *No default TTL.* A hook added without =--ttl= has =expires_at: null= in =hooks.json= and is never expired.
+21. *Renew.* =ever hook renew <id> --ttl 1h= on a hook with a TTL moves =expires_at= forward by about an hour. =ever hook renew <id>= on a hook with no =expires_at= fails with a non-zero exit and changes nothing.
+22. *Lag is never an input.* A hook whose cursor is millions of events behind the head, whose command and =cwd= both exist and which has never failed, is =armed=, is not listed as reclaimable by =gc=, and is not flagged.
+
+** =hook gc=
+
+23. *Dry run is the default and is inert.* On any store, run =ever hook gc= twice. Both invocations print byte-identical output, exit 0, and leave =hooks.json='s mtime and contents unchanged.
+24. *Evidence is printed.* Every line in the RECLAIMABLE section names the rule (=cwd-missing= / =command-missing= / =expired=) and the concrete evidence — the path that returned =ENOENT=, or the expiry timestamp. A reviewer can re-run =stat= on that path by hand and get the same answer.
+25. *Quarantined is flagged, not reclaimed.* With a hook at 139 consecutive failures whose command and =cwd= both exist: =gc= lists it under FLAGGED FOR REVIEW; =gc --yes= does not touch it; =gc --include-quarantined --yes= disables it.
+26. *Working hooks are never candidates.* On the reference census below — 16 hooks, none with a missing =cwd=, none with a missing absolute command path, none with a TTL — =ever hook gc= reports *zero* entries in the RECLAIMABLE section.
+27. *No one-step deletion.* =ever hook gc --purge --yes= without =--state disabled= refuses and changes nothing. With =--state disabled= it removes only hooks already in =disabled=; an =armed= or =quarantined= hook named on the same command line causes the whole invocation to refuse.
+28. *=--yes= only disables.* After =ever hook gc --yes= on a store with reclaimable candidates, the hook count in =hook list= is unchanged; only states changed.
+
+** Reversibility
+
+29. *Enable restores the registration and the cursor.* Disable a hook. Publish 3 matching events. Run =ever hook enable <id>=. It prints a pending count of 3 before acting, and the hook then fires for all 3 events, oldest first, producing 3 new files under =data/hooks/=.
+30. *=--from tail= opts out.* Repeat (29) with =ever hook enable <id> --from tail=. The pending count is still printed, no historical event fires, and the next event published *after* the command does fire.
+31. *Enable clears the counters.* After (29), =hook list= shows the hook =armed= with =consecutive_failures= 0 and no =disabled_reason=, and =hooks.json= has =expires_at: null=.
+32. *Enable does not resurrect a TTL.* Enable a hook that was disabled by expiry: it is =armed= with =expires_at: null=, and it does not immediately re-expire.
+
+** Reference census (for criteria 17 and 26)
+
+Live store =~/Coding/github.com/withre/ace-stack/data/hooks.json=, read-only, *2026-08-03T00:28Z*, head offset ≈ 116,628. Included so criteria 17 and 26 are checkable without access to that machine.
+
+| ID  | Pattern                   | Command — first token                             | Token kind | cwd exists |
+|-----+---------------------------+---------------------------------------------------+------------+------------|
+| 3   | =air-progress=            | =sh=                                              | PATH       | yes        |
+| 4   | =ever.agents.merge-ready= | =echo=                                            | PATH       | yes        |
+| 6   | =ever.agents.status=      | =echo=                                            | PATH       | yes        |
+| 7   | =air-progress=            | =sh=                                              | PATH       | yes        |
+| 8   | =air-review=              | =sh=                                              | PATH       | yes        |
+| 9   | =air-security=            | =sh=                                              | PATH       | yes        |
+| 10  | =air-pm=                  | =sh=                                              | PATH       | yes        |
+| 11  | =op.notify=               | =chronoa=                                         | PATH       | yes        |
+| 12  | =op.health=               | =chronoa=                                         | PATH       | yes        |
+| 170 | =ace-stack.support.tick=  | =~/.local/state/ace-support/healthcheck.sh=       | absolute   | yes        |
+| 186 | =chronoafix.=             | =~/.local/state/acefix-chronoafix/notify-orch.sh= | absolute   | yes        |
+| 193 | =acefix.=                 | =~/.local/state/acefix/log-event.sh=              | absolute   | yes        |
+| 220 | =org-air3.work.=          | =/tmp/org-air-ace/notify.sh=                      | absolute   | yes        |
+| 221 | =org-air3.monitor.tick=   | =/tmp/org-air-ace/tick.sh=                        | absolute   | yes        |
+| 226 | =airfix.=                 | =~/.local/state/acefix-air-orch/notify.sh=        | absolute   | yes        |
+| 227 | =ever4.=                  | =~/.local/state/ace-ever4/notify-orch.sh=         | absolute   | yes        |
+
+Nine PATH-resolved first tokens, seven absolute paths, all seven present, no missing =cwd=. The patterns span at least six independent fleets (=air*=, =op.=, =org-air3.=, =acefix.=, =chronoafix.=, =airfix.=, =ace-stack.support.=, =ever4.=), which is the operational reason every default in this document is inert.
+
+* Test plan
+
+Test discipline required by the fleet: prove each regression test fails against the pre-change source before it passes, and mutate each guard independently.
+
+** Unit (=src/store/hooks.zig=)
+
+1. =HookJson= defaults: parse a fixture with no new fields → all defaults as specified.
+2. =HookFileJson= with =version= absent → loads; with =version: 2= → loads.
+3. Backoff arithmetic: table-driven over =n = 5..15=, asserting the exact millisecond delays and the 1 h clamp.
+4. Wait-status decoding: =WIFEXITED= codes 0/1/126/127 and =WIFSIGNALED= 9/15 map to =last_exit_status= 0/1/126/127/−9/−15. *Must fail against the current =(status >> 8) & 0xFF=.*
+5. R2 token qualification: a table of command strings — =/abs/path.sh=, =./rel.sh=, =echo hi=, =$HOME/x.sh=, =~/x.sh=, =sh -c '…'=, =/abs/path.sh | tee /tmp/x=, =/abs/with space/x.sh= — asserting which qualify. Only the first and the pipe form qualify.
+6. State transitions: armed→quarantined at K, quarantined→armed on success, quarantined stays quarantined at 500 failures, disabled never leaves without an explicit call.
+
+** Integration (=src/tests/integration.zig=)
+
+7. Criteria 1–6 (migration), driven against a temp data dir.
+8. Criteria 15, 16, 17, 18 (disable rules), each with its own hook so a mutation that breaks one rule fails a disjoint test.
+9. Criteria 19–21 (TTL), using short durations.
+10. Criteria 29–32 (enable / =--from tail=).
+11. Criterion 23 (=gc= idempotence): capture stdout twice and the file mtime.
+
+** Mutation checks
+
+Each of these must fail a *different* test set. A mutation that fails nothing is a finding:
+
+- remove the =ENOENT=-only restriction in R1 (accept any =stat= error) → criterion 18;
+- remove the =last_exit_status == 127= half of R2 → criterion 16's second half;
+- remove the token-qualification restriction in R2 → criterion 17;
+- allow quarantine to escalate to disabled → criteria 9 and 25;
+- reset =consecutive_failures= on any completion rather than on success → criterion 10;
+- move the quarantine check after the fetch → criterion 14;
+- drop a default from one new field → criterion 1.
+
+** Bounded probes
+
+Any test that waits for a hook to fire must bound its own wait and fail on timeout rather than hang. Any test that reads =hooks.json= while the store is running must retry until it parses — the file is written by =open(TRUNC)= then =rename=, and a read racing the write can legitimately see an empty file, which parses as "no hooks" and is indistinguishable from the failure under test.
+
+* Open questions
+
+1. *K = 5 and a 1 h ceiling* are pinned here so the document is implementable, but they are the two numbers most worth a second opinion. The evidence constrains them only loosely: hook #186's 139-failure run says the *ceiling behaviour* (retry forever, never escalate) matters far more than the exact K.
+2. *=gc --include-quarantined= threshold* is set at 20 consecutive failures. It is a display threshold only — nothing acts on it without two explicit flags — so it is cheap to change.
+3. *Should =gc= be able to act on a hook it has never seen fail?* As specified, R1 and R2 both require a dispatch to have been attempted, so a hook whose pattern never matches is never a candidate. An alternative is to let =gc= (never the daemon) evaluate R1 on demand, since =stat(cwd) == ENOENT= is provable without a dispatch. That would let an operator reclaim the incident's =#17/#19/#157/#158= class. *Recommendation: yes, and it is specified that way for =gc= — the daemon still requires an observed failure.* Flagged because it is the one place where =gc='s rule set is deliberately wider than the daemon's.
+4. *Per-hook execution timeout* remains fixed at 300 s. Once signal deaths are counted (criterion 12), a hook that hangs will quarantine, which is a behaviour change for anything currently relying on hangs being invisible. Believed to be an improvement; called out because it is not obviously in scope from the title.
+
+* References
+
+- =~/Coding/github.com/rytswd/notes/docs/incident-2026-07-27-runaway-cpu.org= — the census, the 89,221 × exit 127 figure, and the manual prune. Note that the hook census in that document is a 2026-07-27 snapshot; see the re-measurement above.
+- =~/Coding/github.com/rytswd/notes/reviews/round-4/proposed-air/ever--hook-gc-and-lease.org= — the triage draft this document was written from.
+- =~/Coding/github.com/rytswd/notes/reviews/round-3/proposed-air/ever--hook-repoint-and-resilience.org= — the recovery half, *not scheduled in this batch*. See [[#repoint-coupling][Coupling]].
+- [[./server-hooks.org]] — original hook design. Its "on command failure: log to stderr, advance cursor (don't retry)" and its =hooks.json= shape are superseded here.
+- [[./hook-execution.org]] — background execution, process groups, log files. Its =--timeout= / =timeout_ms= claims did not ship; see the inline marker there.
+- [[./hook-registration-cursor.org]] — cursor semantics, and the source of the polymorphic-cursor constraint that rules out lag-based reaping.
+- Adjacent, uncommitted in the default workspace: =air/v0.1/hook-ergonomics/= (=hook-auto-topic=, =hook-ping=, =hook-with-schedule=). Only =hook-auto-topic= interacts — if a hook owns a lifecycle-managed topic, disabling or removing the hook needs a stated policy for that topic. Not specified here; noted so it is not missed.
+
+* History
+
+- 2026-08-03: Draft created (=ever4-specgc=) from the round-4 triage note. Verified at =txpyxrnm= / =142d5e66=: =zig build= and =zig build test= both green before any claim was written. All measurement was done on an isolated store (own =--data-dir= under =/var/tmp=, port 7931, torn down afterwards); the live store was inspected read-only only and no hook on it was registered, modified or removed. Findings that changed the draft's design rather than confirming it:
+  - =hook.command= is a shell fragment, not an argv; 9 of 16 live hooks have a non-path first token, so the draft's "stat the resolved command" is unsound alone. Split into a conjunction (R2).
+  - The =/tmp=-wipe class exits 1, not 127, because the daemon prepends =cd '<cwd>' && =. Added R1, which is the stronger and simpler predicate the draft omits.
+  - A signal-killed hook currently reports exit 0, so failure counting needs a wait-status decode first.
+  - One malformed row in =hooks.json= silently drops the entire table (measured 7 → 0) and the next registration overwrites the file with =next_id= reset to 1. Load-path hardening added as a prerequisite of the record migration.
+  - Downgrade is lossy and immediate (measured): unknown fields are erased on the first save.
+  - Hook #186 failed 139 consecutive times and is healthy today, which is why quarantine never escalates to disabled.
+  - "Lease" renamed to TTL throughout; a lease needs an owner and a heartbeat that Ever does not have.
+  - Round-3's =--from tail= default has already shipped; that draft is partly stale.
+
+  Not verified: nothing was implemented, so every acceptance criterion is unexecuted. The two criteria marked as regressing today (5 and 12) were confirmed to fail against =142d5e66= by reproducing the current behaviour by hand, not by writing the tests. The =gc= output format is illustrative and has not been rendered by any code.
