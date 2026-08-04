@@ -1,0 +1,162 @@
+#+title: JSON Output for List Commands
+#+state: draft
+#+FILETAGS: :cli:orchestrator:store:
+
+* Summary
+Add a =--json= flag to the resource-listing CLI commands — =ever hook list=, =ever timer list=, =ever topic list=, and =ever hook ps= — so they emit machine-readable JSON instead of the aligned human-readable tables. Empty results print =[]= rather than a prose "No items" message, so output is always valid JSON suitable for piping into =jq= and friends.
+
+* Motivation
+Today the list commands only print padded, column-aligned text:
+
+#+begin_src
+$ ever hook list
+ID   NAME                 Pattern                   Command                        Last Offset
+#1   deploy-prod          deploy.trigger            ./deploy.sh                    5640
+#2   log-agent            agent.                    ./log-agent.sh                 27601
+#+end_src
+
+This is great for humans and useless for scripts. Anyone wiring Ever into automation has to scrape fixed-width columns, which breaks the moment a name, pattern, or command contains spaces (all of which are legal). There is no stable, parseable contract for "what hooks/timers/topics exist".
+
+=ever status= already supports =--json= (see =store-status.org=), and the project's interface design (=air/context/interface-design.org=) calls for a =--json= flag on machine-facing commands across the board. The list commands are the most obvious gap: they are exactly the commands a supervising agent or shell script wants to introspect.
+
+** Goals
+- =ever hook list --json= prints a JSON array of hook objects
+- =ever timer list --json= prints a JSON array of timer objects
+- =ever topic list --json= prints a JSON array of topic objects
+- =ever hook ps --json= prints a JSON array of running-process objects
+- Empty result sets print =[]= (valid JSON), not a prose message
+- JSON is well-formed and properly escaped (names/commands may contain quotes, spaces, backslashes, control characters)
+- Human-readable output is unchanged when =--json= is absent
+
+** Non-Goals
+- Changing the human-readable table layouts
+- Adding =--json= to single-item or action commands in this doc (e.g. =timer info=, =hook logs=) — those are a natural follow-on but tracked separately; see "Future Work"
+- A general =--format= system (yaml, csv, templates) — out of scope
+- Pretty-printing / indentation control flags (=--pretty=) — emit compact JSON for now
+- Changing =ever sub --json-values= / =ever wait --json-values=, which already exist and address a different concern (per-event value formatting on the stream commands)
+
+* Proposal
+
+** Affected commands and flag
+
+Add a single boolean flag to each listing subcommand, matching the existing =status= definition:
+
+#+begin_src zig
+.{ .name = "json", .takes_value = false, .description = "Output as JSON" }
+#+end_src
+
+| Command            | Handler           | JSON shape                       |
+|--------------------+-------------------+----------------------------------|
+| =ever topic list=  | =handleTopicList= | array of topic objects           |
+| =ever hook list=   | =handleHookList=  | array of hook objects            |
+| =ever hook ps=     | =handleHookPs=    | array of running-process objects |
+| =ever timer list=  | =handleTimerList= | array of timer objects           |
+
+** Output: =ever hook list --json=
+
+Derived from =client.HookInfoOwned=. Always a top-level array; one object per hook.
+
+#+begin_src json
+[
+  {"id": 1, "name": "deploy-prod", "pattern": "deploy.trigger", "command": "./deploy.sh", "cwd": "/srv/app", "cursor": 5640, "once": false},
+  {"id": 2, "name": null, "pattern": "agent.", "command": "./log-agent.sh", "cwd": "/srv/app", "cursor": 27601, "once": false}
+]
+#+end_src
+
+- =name= is =null= when the hook has no name (matches the optional field)
+- =cwd= and =once= are included (present in the data model but hidden from the human table)
+- =env= is omitted for now (rarely set, and the human view never shows it); revisit if needed
+
+** Output: =ever timer list --json=
+
+Derived from =client.TimerInfo=.
+
+#+begin_src json
+[
+  {"name": "nightly-build", "schedule": "0 2 * * *", "topic": "agent.build", "fire_count": 42, "persistent": true, "last_fired_at": 1718900000000, "created_at": 1716100000000}
+]
+#+end_src
+
+- Timestamps are epoch milliseconds (raw =i64=, matching =last_fired_at= / =created_at= in the data model)
+- =payload= is omitted from the list view (can be large); =timer info --json= would carry it in the follow-on
+
+** Output: =ever topic list --json=
+
+The wire call (=listTopics=) currently returns bare names. Emit an array of objects rather than an array of strings, so per-topic stats (event count, segment count) can be added later without breaking the schema:
+
+#+begin_src json
+[
+  {"name": "agent.build"},
+  {"name": "agent.test"}
+]
+#+end_src
+
+** Output: =ever hook ps --json=
+
+Derived from =client.HookProcessInfoOwned=. Include both the raw =start_time= and a computed =elapsed_ms= (the human view shows elapsed seconds):
+
+#+begin_src json
+[
+  {"hook_id": 1, "pid": 48213, "pattern": "deploy.trigger", "command": "./deploy.sh", "start_time": 1718900000000, "elapsed_ms": 1340}
+]
+#+end_src
+
+** Empty results
+
+When there are no items, print exactly =[]= followed by a newline. Do *not* print "No hooks registered." / "No timers registered." / "No topics." in JSON mode — those messages are not valid JSON and would break parsers.
+
+* Design Details
+
+** Per-handler structure
+
+Each list handler gains a branch at the point where it currently prints. Sketch for =handleHookList=:
+
+#+begin_src zig
+const as_json = ctx.flagBool("json");
+// ... fetch result ...
+if (as_json) {
+    try printHooksJson(allocator, result.hooks);
+} else {
+    // existing table-printing code, unchanged
+}
+#+end_src
+
+** JSON construction and escaping
+
+Reuse the existing =appendJsonEscaped(json, allocator, s)= helper already in =main.zig= (used by =buildEventJson=). It correctly escapes =" \ \n \t \r=, backspace, form-feed, and other control characters — exactly what's needed since hook commands, patterns, and timer payloads are arbitrary strings.
+
+Each =printXJson= builder:
+1. Opens with =[=
+2. Emits comma-separated objects, numbers via =std.fmt=, strings via =appendJsonEscaped=, optionals as =null= when absent
+3. Closes with =]\n=
+
+Keep these builders local to =main.zig= alongside =buildEventJson=, or factor the shared scalar/escaping logic into a tiny =src/json.zig= writer if the duplication grows. Start local; extract only if a third consumer appears.
+
+** stdout vs stderr (decision needed)
+
+The human list output currently uses =std.debug.print=, which writes to *stderr*. =status.printJson= does the same. The interface-design doc states data should go to stdout and only errors to stderr — important here because =ever hook list --json | jq= must work.
+
+Recommendation: write =--json= output to *stdout* via an explicit =std.Io.File.stdout()= writer, even though it diverges from the existing =std.debug.print= pattern. This makes piping correct and is the behaviour scripts expect. If we want to keep this change small and internally consistent with =status --json= for now, match =std.debug.print= and file a follow-up to move all machine output to stdout — but the cleaner fix is stdout from the start. Resolve before implementation.
+
+** Flag registration
+
+Add the =json= flag to four subcommand definitions in the =cli.App= command table (=topic.list=, =hook.list=, =hook.ps=, =timer.list=). No new parsing machinery is required; =ctx.flagBool("json")= already works (it's how =status= reads it).
+
+** Exit codes and errors
+
+Unchanged. Connection/server errors still print to stderr and exit non-zero. In JSON mode a successful-but-empty listing is =[]= with exit 0 — an error is an error, an empty list is not.
+
+* Testing
+- Unit/integration: register N hooks/timers/topics, run the list command with =--json=, parse stdout with a JSON parser, assert structure and values
+- Escaping: create a hook whose command contains a space, a double-quote, and a backslash; assert the JSON round-trips
+- Empty: with nothing registered, assert output is exactly =[]=
+- Regression: assert non-=--json= output is byte-identical to today
+
+* Future Work
+- =--json= on single-item commands: =ever timer info=, =ever hook logs= (object, not array)
+- Per-topic stats in =topic list --json= (event count, segment count) — schema already leaves room
+- Include =env= in =hook list --json= once there's a consumer
+- Consider a project-wide =src/json.zig= writer if more commands need structured output
+
+* History
+- 2026-06-25: Drafted. Specifies --json for hook list, timer list, topic list, and hook ps. Awaiting review before moving to ready.

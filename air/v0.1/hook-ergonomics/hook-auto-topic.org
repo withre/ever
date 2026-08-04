@@ -1,0 +1,103 @@
+#+title: Hook Auto-Topic
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:ergonomics:
+
+* Summary
+Allow =ever hook add= to auto-generate a private, short-lived topic for the
+hook when no pattern is supplied. The topic is created on registration and
+removed when the hook is removed (or, for =--once= hooks, when the hook
+fires). Callers post to the hook with =ever hook ping= (see sibling doc) or
+with =ever pub= against the topic name printed at registration.
+
+* Motivation
+Today, the canonical "create a private channel for one specific listener"
+pattern requires three coordinated names: a topic, a hook, and the agent
+that publishes to it. Users invariably have to:
+
+1. Invent a unique topic name (often encoding a session id).
+2. Run =ever topic create=.
+3. Run =ever hook add= against the same name.
+4. Remember to =ever topic delete= when done.
+
+For one-shot notifications (the dominant ACE-stack pattern) this is pure
+ceremony. The hook's *only* purpose is to listen on that topic; the topic's
+*only* purpose is to feed that hook. The two should be born and die
+together.
+
+** Goals
+- =ever hook add -- <cmd>= (no pattern) registers a hook on a freshly
+  generated private topic.
+- The generated topic name is printed on stdout (and returned in =--json=
+  form) so callers can publish to it explicitly if they prefer.
+- =ever hook add --once -- <cmd>= auto-removes both the hook *and* the
+  generated topic after the first matching event.
+- =ever hook rm <id>= removes the generated topic alongside the hook.
+- The generated-topic lifecycle is observable in =ever hook list= (a flag
+  or column indicating "auto-topic: yes").
+
+** Non-Goals
+- Replacing or changing the explicit =ever hook add <pattern> -- <cmd>=
+  form. Auto-topic is opt-in by *omission* of the pattern argument.
+- Sharing one auto-topic across multiple hooks.
+- Persisting auto-topic names across hook deletion (they are scratch).
+
+* Proposal
+
+** Surface
+#+begin_example
+$ ever hook add --once -- /tmp/notify.sh
+hook 42 registered on auto-topic 'ever.hook.42.auto'
+
+$ ever hook add --json -- /tmp/notify.sh
+{"id":43,"topic":"ever.hook.43.auto","auto_topic":true,"once":false}
+#+end_example
+
+** Naming
+=ever.hook.<id>.auto=. Predictable from the hook id, scoped under
+=ever.hook.= so it cannot collide with user-chosen topics.
+
+** Lifecycle
+| Event                          | Effect on auto-topic                |
+|--------------------------------+-------------------------------------|
+| =ever hook add= (no pattern)   | Topic created, marked auto.         |
+| =ever hook add --once= fires   | Hook auto-removes; topic deleted.   |
+| =ever hook rm <id>=            | Topic deleted.                      |
+| Store restart                  | Topic and hook re-loaded together.  |
+
+The "marked auto" bit lives on the hook record, not the topic record;
+topic deletion is driven by the hook lifecycle.
+
+** =hook list= output
+Add a column (or =--json= field) =auto_topic: bool= so users can see
+which topics are owned by hooks vs. user-managed.
+
+* Design Details
+- Hook record gains =auto_topic: bool= and (redundantly, for clarity)
+  =topic: []const u8= which is set whether the topic was supplied or
+  generated.
+- =ever hook add= argument parser: if exactly one positional after =--=,
+  treat as cmd-only and generate topic; if two, treat the first as
+  pattern as today.
+- Topic creation re-uses existing =ever topic create= path; deletion
+  re-uses =ever topic delete=. No new storage primitive.
+
+* Open Questions
+- Should the generated name include a random suffix (=ever.hook.42.a1b2c3=)
+  for opaqueness, or stay strictly id-derived for predictability?
+  Tentatively: id-derived.
+- For non-=--once= auto-topic hooks that get =ever hook rm='d, is there a
+  grace window where in-flight publishes can still deliver? Tentatively
+  no — removal is synchronous and any further pub is a "no such topic".
+
+* Acceptance Criteria
+- =ever hook add -- echo hi= prints a topic name and creates a runnable
+  hook on it.
+- =ever pub <printed-topic> '{}'= triggers the hook command.
+- =ever hook rm <id>= removes both hook and auto-topic; subsequent pub
+  fails with "no such topic".
+- =--once= variant: hook fires, hook record gone, topic gone, all in one
+  publish.
+- Existing explicit-pattern call sites unchanged.
+
+* History
+- 2026-04-28: Drafted by ever-supervisor.

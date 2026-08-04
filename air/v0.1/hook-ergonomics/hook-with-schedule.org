@@ -1,0 +1,104 @@
+#+title: Hook with Schedule (timer + hook sugar)
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:ergonomics:
+
+* Summary
+Add =--every=, =--cron=, and =--in= flags to =ever hook add= as sugar that
+internally wires a timer + topic + hook in one command. The result is
+indistinguishable at the storage layer from registering them separately,
+but takes one line instead of three.
+
+* Motivation
+The "scheduled side-effect" pattern (run a script every N seconds; send a
+nudge once after a delay) is currently:
+
+#+begin_example
+ever topic create my.tick
+ever hook add my.tick -- /path/to/script.sh
+ever timer add my-timer --every 30s my.tick '{}'
+#+end_example
+
+Three commands, three names, two cleanup steps if cancelled. Timers and
+hooks are independently useful, but their *combination* is the dominant
+shape — a recurring side-effect — and deserves a one-liner.
+
+** Goals
+- =ever hook add --every 30s -- /path/to/script.sh= registers a hook on
+  an auto-topic and a timer publishing to that topic every 30s.
+- =--cron <expr>=, =--in <duration>= mirror =ever timer add= flags.
+- =ever hook rm <id>= cancels the associated timer and removes the
+  auto-topic (no orphaned timers).
+- =ever hook list= shows scheduled hooks with their schedule, e.g.
+  =cmd=/path/script.sh= =schedule=every 30s=.
+
+** Non-Goals
+- Replacing =ever timer add=. Timers stand alone and remain useful for
+  topic-driven workflows where multiple consumers care.
+- Adding scheduling primitives (retry, jitter, drift correction) — those
+  belong in =timers= proper.
+- Multi-schedule hooks (one hook driven by both a timer and a pattern).
+
+* Proposal
+
+** Surface
+#+begin_example
+$ ever hook add --every 30s -- /home/me/heartbeat.sh
+hook 51 registered (schedule: every 30s, auto-topic: ever.hook.51.auto,
+timer: hook-51)
+
+$ ever hook list
+ID   NAME       PATTERN              SCHEDULE     CMD
+51   -          ever.hook.51.auto    every 30s    /home/me/heartbeat.sh
+
+$ ever hook rm 51
+removed hook 51, timer hook-51, topic ever.hook.51.auto
+#+end_example
+
+** Lifecycle
+- =add= path: create auto-topic → add hook on it → add timer publishing
+  =\{}= to it. All three records carry a back-reference to the hook id
+  so removal can find them.
+- =rm= path: cancel timer → remove hook → delete topic. Order matters:
+  cancel the timer first so no "trailing" tick fires after we've torn
+  down the hook.
+- Store restart: timer and hook records persist (existing behaviour);
+  on reload, the back-references re-bind.
+
+** Conflicts
+- =--every= et al. require *no* pattern argument. If the user supplies
+  both a pattern and a schedule, fail fast — the two compose oddly
+  (would the timer publish to the user's pattern? probably not what they
+  meant).
+- Combining =--every= with =--once= is rejected with a clear message;
+  =--in= + =--once= is the natural "fire once after a delay" pairing
+  and is allowed.
+
+* Design Details
+- New flags on =hook add=: =--every=, =--cron=, =--in= — same parser as
+  =timer add=.
+- Hook record gains optional =timer_id: ?u64= for the back-reference.
+- =hook list= renders the schedule by joining on the timer record.
+- Removal path consults =timer_id=; if non-null, calls the existing
+  =timer rm= logic before tearing down the hook.
+
+* Open Questions
+- Should the auto-generated timer be visible in =ever timer list=? Yes,
+  for transparency, but with a marker (=owned-by-hook=51=) so users
+  know not to manage it directly.
+- Should =ever timer rm= on a hook-owned timer be allowed? Recommend
+  no — error with "this timer is owned by hook 51; use =ever hook rm 51="
+  to keep the lifecycle coherent.
+- Should =--no-persist= timer-add semantics propagate? Yes, expose it as
+  =--no-persist= on =hook add= when a schedule flag is present.
+
+* Acceptance Criteria
+- One-liner registration produces a working recurring hook; verified by
+  observing the script run at the expected interval.
+- =ever hook rm <id>= leaves no orphaned timer and no orphaned topic
+  (verified via =ever timer list= and =ever topic list=).
+- =--in 5s= fires once and self-cleans; equivalent to a one-shot
+  scheduled hook.
+- Restart of the store resumes the schedule without manual re-arming.
+
+* History
+- 2026-04-28: Drafted by ever-supervisor.

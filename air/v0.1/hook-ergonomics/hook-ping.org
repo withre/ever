@@ -1,0 +1,96 @@
+#+title: Hook Ping
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:ergonomics:
+
+* Summary
+Add =ever hook ping <hook> [PAYLOAD]= as a publish convenience. It posts
+=PAYLOAD= (or =null=) to the topic the named hook listens on, without the
+caller having to know or repeat the topic name.
+
+* Motivation
+Once auto-topics exist (see =hook-auto-topic.org=), users have a private
+listener channel but no equally short way to publish to it. Today:
+#+begin_example
+ever hook add -- /tmp/notify.sh         # prints: ever.hook.42.auto
+# ... user must remember the topic ...
+ever pub ever.hook.42.auto '{"ok":1}'
+#+end_example
+The topic name is unstable across reruns and ugly to type. The whole point
+of the auto-topic flow is that users reason in *hooks*, not topics. A
+=ping= verb completes that abstraction.
+
+It is also useful for hooks the user *did* name explicitly: addressing a
+hook by id or a stable label is shorter than the full topic, especially
+under pattern hooks where the publish target is unambiguous.
+
+** Goals
+- =ever hook ping <id>= publishes empty payload to the hook's topic.
+- =ever hook ping <id> '<json>'= publishes a payload.
+- =ever hook ping <name>= works when the hook was registered with
+  =--name <name>= (out of scope here whether to add =--name=; if not,
+  id-only is fine for 0.1).
+- =--key <key>= flag mirrors =ever pub --key=.
+- Stdin-pipe form: =cat data.json | ever hook ping <id> -=.
+
+** Non-Goals
+- Discovering or naming hooks beyond what =ever hook list= already shows.
+- Routing a publish to multiple hooks; one ping = one publish to one topic.
+- Substituting for =ever pub= when a topic might have multiple subscribers
+  beyond the hook (use =ever pub= explicitly in that case).
+
+* Proposal
+
+** Surface
+#+begin_example
+$ ever hook ping 42
+published to ever.hook.42.auto (offset 17)
+
+$ ever hook ping 42 '{"status":"done"}'
+published to ever.hook.42.auto (offset 18)
+
+$ ever hook ping 42 --json
+{"hook_id":42,"topic":"ever.hook.42.auto","offset":19}
+#+end_example
+
+** Resolution
+=<hook>= is resolved by =ever hook list= lookup:
+- Numeric → hook id.
+- Non-numeric → hook name (if names land in a future doc) or error.
+
+If the hook has a wildcard / prefix pattern (i.e. there is no single
+canonical topic to publish to), =ping= fails:
+#+begin_example
+error: hook 7 listens on prefix 'ever.work.' — ping requires a single
+       concrete topic; use 'ever pub <topic>' explicitly.
+#+end_example
+
+** Failure modes
+| Case                                  | Behaviour                              |
+|---------------------------------------+----------------------------------------|
+| Hook id not found                     | Exit 1, "no such hook"                 |
+| Hook is a pattern (prefix/wildcard)   | Exit 1, suggest =ever pub=             |
+| Topic missing (auto-topic deleted)    | Exit 1, "hook topic gone (stale hook)" |
+| Payload not valid JSON                | Same diagnostic as =ever pub=          |
+
+* Design Details
+- New CLI subcommand =hook ping= dispatching to the same publish path as
+  =ever pub=, after resolving =<hook>= to its topic.
+- No new wire-protocol verb; the server still receives a normal publish.
+- Help text cross-references =hook-auto-topic= so the relationship is
+  discoverable.
+
+* Open Questions
+- Should =ping= with no payload publish =null=, =""=, or =\{}=?
+  Tentatively =null= — it's the canonical "no value" JSON.
+- Worth a =--quiet= flag for scripts? Probably yes; align with =ever pub=.
+
+* Acceptance Criteria
+- =ever hook add -- /tmp/x.sh= → =ever hook ping <id> '{"k":1}'= triggers
+  =/tmp/x.sh= with the payload.
+- =ever hook ping <pattern-hook-id>= fails fast with the suggested
+  remedy.
+- =ever hook ping= integrates with stdin (=-=) and =--key= the same way
+  =ever pub= does.
+
+* History
+- 2026-04-28: Drafted by ever-supervisor.

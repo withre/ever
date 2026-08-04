@@ -1,0 +1,52 @@
+#+title: Hook Ergonomics — Overview
+#+state: draft
+#+FILETAGS: :subscriber:orchestrator:ergonomics:
+
+* Summary
+A cluster of small, independent ergonomic improvements to =ever hook=. Each
+sub-document is independently implementable; this overview only sketches the
+shared motivation and links the pieces together so a reader can see the whole
+picture.
+
+* Motivation
+Hooks are powerful but fiddly. The current "happy path" for a one-shot
+notification or a recurring scheduled job is:
+
+#+begin_example
+ever topic create my.work.session.done
+ever hook add --once my.work.session.done -- /path/to/notify.sh
+# … later …
+ever pub my.work.session.done '{"...":"..."}'
+#+end_example
+
+Every step has friction the user shouldn't have to absorb:
+- Inventing and remembering a topic name.
+- Cleaning up the topic after the hook fires.
+- Wiring a separate timer + topic + hook for "every N seconds".
+- Posting to a hook's topic without re-typing the topic string.
+
+The supervisor / agent-orchestration use case in particular hits all four in
+short succession.
+
+* Sub-documents (each independently implementable)
+| Doc | Concept |
+|-----+---------|
+| =hook-auto-topic.org=    | =ever hook add= optionally auto-generates and lifecycle-manages a private topic for the hook. |
+| =hook-ping.org=          | =ever hook ping <hook>= publishes to a hook's topic by hook id/name (no topic re-typing). |
+| =hook-with-schedule.org= | =ever hook add --every 30s -- cmd= wires timer + topic + hook in one command. |
+
+A separate, performance-oriented document =../timer-tick-resolution.org=
+covers configurable tick precision for the timer subsystem; it is *not*
+ergonomic and is not part of this cluster.
+
+* Non-Goals (for the cluster)
+- Re-architecting hook delivery semantics.
+- Changing the existing =ever hook add <pattern> -- <cmd>= shape (these are
+  additive sugar; the explicit form stays).
+- Adding hook scheduling beyond what =timers= already supports.
+
+* History
+- 2026-04-28: Cluster drafted by ever-supervisor in response to user-described
+  ergonomics gaps surfaced while orchestrating sub-agents (gate-watcher
+  workflow). Split into per-feature docs per Air "small + self-contained"
+  guidance.

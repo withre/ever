@@ -1,0 +1,111 @@
+#+title: Timer Tick Resolution (configurable)
+#+state: draft
+#+FILETAGS: :store:orchestrator:performance:
+
+* Summary
+Make the timer subsystem's internal tick resolution configurable at store
+startup, instead of running an always-on high-frequency tick loop. Coarser
+resolution trades fire-time precision for lower steady-state CPU load and
+fewer wakeups; finer resolution recovers precision when the workload
+demands it.
+
+* Motivation
+Timers currently fire at sub-second precision regardless of registered
+schedules. For a deployment whose smallest registered interval is =every
+30s=, polling at e.g. 100 ms wastes wakeups and spends CPU on a scheduler
+that has nothing to do 299 out of every 300 ticks. Conversely, a
+deployment driving sub-second event loops needs that precision and would
+be hurt by coarsening.
+
+This is *not* an ergonomic question (covered by sibling docs in
+=hook-ergonomics/=). It is a per-deployment performance knob.
+
+** Goals
+- A startup-time configuration value (CLI flag and config file) sets the
+  timer-loop tick resolution.
+- Default chosen to be safe for typical workloads (e.g. 100 ms or 250 ms;
+  to be measured, not guessed).
+- Coarser resolutions reduce wakeups proportionally and are observable
+  via existing store status / metrics.
+- Fired timers respect their registered schedule modulo the chosen
+  resolution; a timer scheduled =every 30s= with 250 ms resolution fires
+  within 250 ms of its target time, never earlier.
+
+** Non-Goals
+- Per-timer resolution (would complicate the scheduler with no clear
+  gain).
+- Sub-tick interpolation. If a user picks 1 s resolution, sub-second
+  schedules become quantised; that's the trade-off.
+- Dynamic resolution that adapts to workload at runtime.
+
+* Proposal
+
+** Surface
+#+begin_example
+$ ever start --timer-tick 250ms
+$ ever start --timer-tick 1s
+#+end_example
+Config-file equivalent: =timer.tick = "250ms"= under the existing
+store-config schema (location TBD by config schema doc; not in scope here).
+
+Validation:
+- Minimum: a small floor (e.g. 10 ms) to avoid pathological busy-loops.
+- Maximum: bounded by the smallest registered timer interval at startup;
+  refuse to start with a tick coarser than the finest schedule (or warn
+  and round up the schedule — pick one and document).
+
+** Semantics
+- Tick loop sleeps for =tick= each iteration, examines the timer wheel,
+  fires anything due.
+- "Due" is =next_fire <= now=. With coarser tick, fires lag by up to
+  =tick= but never lead.
+- Timers registered *after* startup with intervals finer than =tick= are
+  rejected (consistent with the startup check) or rounded up with a
+  warning.
+
+** Defaults
+Default value to be set after measuring:
+1. Steady-state wakeups/sec on an idle store with 0 timers.
+2. Same with N small timers (e.g. =every 1m= × 50).
+3. Latency of fires under load.
+
+Choose the coarsest resolution where (3) stays under a target threshold
+(e.g. 100 ms tail latency). Document the chosen value and its rationale
+in =History=.
+
+* Design Details
+- Existing tick interval is currently a constant in the timer-loop module.
+  Promote it to a runtime field on the timer subsystem, populated from
+  config at startup.
+- No on-the-fly reconfiguration; restart required to change it (matches
+  other store-startup knobs).
+- Tests:
+  - Unit: timer wheel fires at expected times under each of a few
+    representative ticks (10 ms, 250 ms, 1 s).
+  - Integration: with =--timer-tick 1s=, a =every 30s= timer fires within
+    [30s, 31s] of registration; verified across N cycles.
+  - Negative: rejecting a sub-tick interval at registration.
+
+* Open Questions
+- Does the existing config infrastructure already accept duration values?
+  If not, this depends on or co-evolves with whatever config-schema doc
+  owns those types.
+- Should we expose the *effective* tick in =ever status= so operators
+  can verify their config took? Probably yes.
+- What's the right behaviour when an existing persisted timer has an
+  interval finer than the configured tick on startup — refuse to start,
+  round up, or run with a runtime warning? Tentatively: round up, warn
+  loudly, log per-affected timer.
+
+* Acceptance Criteria
+- Default tick chosen, measured, and documented.
+- =--timer-tick= flag and config-file knob both work and are validated.
+- Wakeup count on an idle store scales inversely with tick value (verified
+  by sampling).
+- Existing timer tests still pass at default tick.
+- Coarsening does not cause early fires; only late fires bounded by tick.
+
+* History
+- 2026-04-28: Drafted by ever-supervisor — split out from the
+  hook-ergonomics cluster after user clarified this is a performance
+  concern, not ergonomic, and belongs in its own doc.
