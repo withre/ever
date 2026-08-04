@@ -11,7 +11,7 @@ Ever is a lightweight, high-performance event storage system written in Zig. Ins
 - *Composable Processes*: Distinct roles (store, publisher, subscriber, orchestrator, transformer) communicate via well-defined protocols
 
 ** Technology Stack
-- *Language*: Zig v0.16 (latest release candidate)
+- *Language*: Zig 0.17 development line. The exact snapshot the project is verified against is pinned in =nix/zig.nix= (currently =0.17.0-dev.607+456b2ec07=) and declared as =minimum_zig_version= in =build.zig.zon=. Zig 0.16.0 is retired — the source uses std APIs it lacks — but the toolchain path remains reachable via =channel = "0.16.0"= so behaviour can be compared against a tagged release when the dev line shifts.
 - *Build System*: Zig build system (=build.zig=)
 - *Dependencies*: Minimal — prefer Zig standard library
 - *Testing*: Zig's built-in testing framework

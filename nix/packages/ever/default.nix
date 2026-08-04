@@ -1,7 +1,9 @@
 { pkgs, inputs, ... }:
 
 let
-  zig = inputs.zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}.master;
+  system = pkgs.stdenv.hostPlatform.system;
+  zig = import ../../zig.nix { inherit inputs system; };
+  zigCliKit = import ../../zig-cli-kit-vendor.nix { inherit pkgs; };
 in
 pkgs.stdenv.mkDerivation {
   pname = "ever";
@@ -18,6 +20,9 @@ pkgs.stdenv.mkDerivation {
 
     export XDG_CACHE_HOME="$TMPDIR/cache"
     mkdir -p "$XDG_CACHE_HOME"
+    mkdir -p zig-pkg
+    cp -R ${zigCliKit} zig-pkg/zig_cli_kit-0.1.0-oM7g3lgnAgAXGQvWuOvyLUdQG8PfMmQ5_3Apb5AY6f6l
+    chmod -R u+w zig-pkg
 
     zig build \
       --cache-dir "$TMPDIR/zig-cache" \

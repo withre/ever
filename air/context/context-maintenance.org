@@ -11,7 +11,7 @@ Triggers:
 - A pattern emerged that applies beyond this one task
 - An existing context entry was misleading or caused a wrong approach
 - A new module was added that needs its own patterns documented
-- A Zig v0.16 API difference was discovered the hard way
+- A Zig 0.16/0.17 API difference was discovered the hard way
 
 Skip updating when the work was routine and followed existing patterns without friction.
 
@@ -38,7 +38,7 @@ The good examples state what to do and why. The bad examples reference specific 
 
 | Learning type                              | Destination                 |
 |--------------------------------------------+-----------------------------|
-| Zig v0.16 API differences and idioms       | =implementation-guide.org=  |
+| Zig 0.16/0.17 API differences and idioms    | =implementation-guide.org=  |
 | Architectural decisions and their rationale | =architecture.org=          |
 | Storage, protocol, recovery patterns        | =architecture.org=          |
 | Air document format, states, tags           | =air-conventions.org=       |
@@ -58,6 +58,6 @@ The good examples state what to do and why. The bad examples reference specific 
 
 When spawning agents via Chronoa for implementation or review:
 - Capture reviewer findings in the relevant context file, not just in the review output
-- If an agent hits a Zig v0.16 API issue, add it to the "Zig v0.16 API Notes" in =implementation-guide.org=
+- If an agent hits a Zig 0.16/0.17 API issue, add it to the "Zig 0.16/0.17 API Notes" in =implementation-guide.org=
 - If an agent discovers a race condition or safety issue, add the fix pattern to "Architectural Learnings"
 - Security findings (injection, escaping, TOCTOU) should be captured as concrete rules, not just "be careful"

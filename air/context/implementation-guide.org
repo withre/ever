@@ -3,14 +3,14 @@
 ** Development Environment
 
 *** Language Configuration
-- *Language*: Zig v0.16 (latest release candidate)
+- *Language*: Zig v0.17 development target; keep Zig 0.16.0 green for deployment until the 0.17 release is cut
 - *Build System*: Zig build system (=build.zig=)
-- *Documentation*: https://ziglang.org/documentation/0.14.1/ (use as reference, adapt for v0.16 changes)
+- *Documentation*: use https://ziglang.org/documentation/master/ for the 0.17 target and https://ziglang.org/documentation/0.16.0/ when checking the deployment baseline
 - *Project Structure*: Multi-module with shared types
 
 *** Build Environment
 - *Nix flake*: Reproducible development environment with Zig toolchain
-- *Required*: Zig compiler v0.16.x
+- *Required*: Zig 0.17 development for target work; Zig 0.16.0 must continue to pass deployment builds/tests
 - *Development shell*: =nix develop= or =direnv allow=
 
 *** Dependency Management
@@ -61,7 +61,7 @@
 - Export module API through a root file that re-exports public symbols
 - Co-locate tests with the code they test (inline =test= blocks)
 
-*** File I/O Patterns (v0.16)
+*** File I/O Patterns (Zig 0.16+)
 - Use =std.Io.Dir= and =std.Io.File= for all file operations — all take =io= parameter
 - =file.writePositionalAll(io, bytes, offset)= / =file.readPositionalAll(io, buf, offset)= for positional I/O
 - =dir.createFile(io, name, .{ .read = true, .truncate = false })= for creating files
@@ -70,7 +70,7 @@
 - Use =defer file.close(io)= immediately after opening
 - For raw syscalls (flock, temp files): =std.os.linux.open=, =.close=, =.write=, =.read=, =.flock=, =.unlink=
 
-*** Networking Patterns (v0.16)
+*** Networking Patterns (Zig 0.16+)
 - Use =std.Io.net.IpAddress.listen(io, .{})= for server binding
 - Use =std.Io.net.IpAddress.connect(io, .{ .mode = .stream })= for client connections
 - Extract =.socket.handle= from =net.Stream= for raw posix fd operations
@@ -87,7 +87,7 @@
 
 *** Process Spawning Patterns
 - =std.os.linux.fork()= / =.execve()= / =.waitpid()= for running external commands
-- Pass environ from =init.minimal.environ.block.slice.ptr= to child =execve=
+- Pass environ from =init.minimal.environ.block= to child =execve= through a small compatibility helper: 0.16.0 exposes =block.slice.ptr= while newer 0.16-dev/0.17 builds may expose =block.ptr=
 - For stdin: write to temp file with =O_CREAT|O_EXCL|O_NOFOLLOW=, redirect via shell =<= (current approach; pipe2() preferred, see =stdin-pipe.org=)
 - PID-based temp file paths (=/tmp/.ever-hook-stdin-{pid}=) to avoid collisions
 - Validate env var keys (alphanumeric + underscore only) before shell interpolation
@@ -167,7 +167,7 @@ zig build test -Doptimize=ReleaseSafe
 - Test passes before every commit
 - Reference Air document when implementing a specification
 
-*** Zig v0.16 API Notes (Learnings)
+*** Zig 0.16/0.17 API Notes (Learnings)
 - *Io parameter*: All file, directory, and network operations require an =std.Io= parameter. In tests use =std.testing.io=. In =main=, accept =std.process.Init= and use =init.io=.
 - *ArrayList is unmanaged*: =std.ArrayList(T)= is now the unmanaged variant. Use =.empty= to initialize, pass allocator per-call: =list.append(allocator, item)=, =list.deinit(allocator)=, =list.toOwnedSlice(allocator)=.
 - *Dir operations*: =Dir.openDir=, =Dir.createFile=, =Dir.openFile=, =Dir.iterate= all require =io= parameter. For iteration, the dir must be opened with =.iterate = true=.
@@ -183,8 +183,8 @@ zig build test -Doptimize=ReleaseSafe
 - *Args iteration*: Use =std.process.Args.Iterator.init(init.minimal.args)= then =.next()=.
 
 - *Mutex*: =std.Thread.Mutex= is gone. Use =std.atomic.Mutex= (spinlock enum with =.tryLock()= and =.unlock()=, no blocking =.lock()=).
-- *StringArrayHashMap*: Still managed (stores allocator). =getOrPut= takes only key, not allocator.
-- *Unmanaged allocator pattern*: Zig v0.16 deprecated Managed containers. Pass allocator per-call rather than storing in structs. Handler functions should accept allocator as an explicit parameter. This is the direction Zig is going — adopt it for long-term relevance.
+- *StringArrayHashMap*: 0.16.0 only exposes the unmanaged-style =StringArrayHashMapUnmanaged= / =std.array_hash_map.String= API (allocator per call). Some 0.16-dev snapshots exposed a managed =std.StringArrayHashMap=. Prefer compatibility aliases that use unmanaged calls.
+- *Unmanaged allocator pattern*: Zig 0.16+ continues moving containers toward allocator-per-call APIs. Pass allocator per-call rather than storing in structs when possible. Handler functions should accept allocator as an explicit parameter.
 - *std.debug.print format widths*: Format widths are comptime-only. For runtime-width padding, use manual loops.
 
 *** Event Memory Ownership

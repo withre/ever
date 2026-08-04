@@ -1,6 +1,7 @@
 .{
     .name = .ever,
     .version = "0.1.0",
+    .minimum_zig_version = "0.17.0-dev.607+456b2ec07",
     .fingerprint = 0xdb41433d9d4ef7d3,
 
     .dependencies = .{
