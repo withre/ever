@@ -5,6 +5,11 @@
 //! and checks lock status.
 
 const std = @import("std");
+
+fn StringArrayHashMap(comptime V: type) type {
+    if (@hasDecl(std, "StringArrayHashMapUnmanaged")) return std.StringArrayHashMapUnmanaged(V);
+    return std.array_hash_map.String(V);
+}
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -145,10 +150,10 @@ fn getStatusFromDirWithPath(alloc: Allocator, io_: Io, dir: Dir, data_dir_path: 
     }
 
     // 2. Scan shared log — read headers only to count events and discover topics
-    var topic_counts = std.StringArrayHashMap(u64).init(alloc);
+    var topic_counts: StringArrayHashMap(u64) = .empty;
     defer {
         for (topic_counts.keys()) |k| alloc.free(k);
-        topic_counts.deinit();
+        topic_counts.deinit(alloc);
     }
     // Track which topics have been soft-deleted (tombstone marker)
     var deleted_set = std.StringHashMap(void).init(alloc);
@@ -201,7 +206,7 @@ fn getStatusFromDirWithPath(alloc: Allocator, io_: Io, dir: Dir, data_dir_path: 
                     if (tn == topic_len) {
                         const topic_name = topic_buf[0..topic_len];
                         // Only count as user event if value is non-empty
-                        const gop = try topic_counts.getOrPut(topic_name);
+                        const gop = try topic_counts.getOrPut(alloc, topic_name);
                         if (!gop.found_existing) {
                             gop.key_ptr.* = try alloc.dupe(u8, topic_name);
                             gop.value_ptr.* = 0;

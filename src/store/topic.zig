@@ -12,6 +12,11 @@ const store = @import("store.zig");
 const Log = store.Log;
 const Event = store.Event;
 
+fn StringArrayHashMap(comptime V: type) type {
+    if (@hasDecl(std, "StringArrayHashMapUnmanaged")) return std.StringArrayHashMapUnmanaged(V);
+    return std.array_hash_map.String(V);
+}
+
 pub const TopicError = error{
     AlreadyExists,
     NotFound,
@@ -53,7 +58,7 @@ const TopicIndex = struct {
 pub const TopicManager = struct {
     allocator: Allocator,
     log: Log,
-    topics: std.StringArrayHashMap(TopicIndex),
+    topics: StringArrayHashMap(TopicIndex),
     deleted_topics: std.StringHashMap(void),
     mutex: std.atomic.Mutex ,
     /// Test-only fault injection: when true, `createTopicLocked` fails just
@@ -70,7 +75,7 @@ pub const TopicManager = struct {
         var manager = TopicManager{
             .allocator = allocator,
             .log = log,
-            .topics = std.StringArrayHashMap(TopicIndex).init(allocator),
+            .topics = .empty,
             .deleted_topics = std.StringHashMap(void).init(allocator),
             .mutex = .unlocked,
         };
@@ -88,7 +93,7 @@ pub const TopicManager = struct {
             entry.value_ptr.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
-        self.topics.deinit();
+        self.topics.deinit(self.allocator);
         self.log.deinit();
     }
 
@@ -177,7 +182,7 @@ pub const TopicManager = struct {
         errdefer self.allocator.free(owned);
         var idx: TopicIndex = .{};
         try idx.offsets.append(self.allocator, offset);
-        try self.topics.put(owned, idx);
+        try self.topics.put(self.allocator, owned, idx);
     }
 
     /// Soft-delete a topic. The topic stays in the index but is marked as
@@ -527,7 +532,7 @@ pub const TopicManager = struct {
             defer store.freeEvent(self.allocator, event);
 
             // Ensure topic exists in index
-            const gop = try self.topics.getOrPut(event.topic);
+            const gop = try self.topics.getOrPut(self.allocator, event.topic);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try self.allocator.dupe(u8, event.topic);
                 gop.value_ptr.* = .{};

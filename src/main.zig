@@ -405,9 +405,9 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             writeAllFd(pipe_fds[1], json);
             _ = std.os.linux.close(pipe_fds[1]);
 
-            var status: u32 = 0;
+            var status: i32 = 0;
             _ = std.os.linux.waitpid(@intCast(pid), &status, 0);
-            const exit_code = (status >> 8) & 0xFF;
+            const exit_code = (@as(u32, @bitCast(status)) >> 8) & 0xFF;
             if (exit_code != 0) {
                 diag(ctx, "Command exited with status {d} for event on '{s}'\n", .{ exit_code, if (event.topic) |t| t else pattern });
             }
@@ -1843,7 +1843,7 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(allocator, arg);
     }
 
-    const env_block = init.minimal.environ.block.slice.ptr;
+    const env_block = environBlockPtr(init.minimal.environ.block);
 
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
@@ -1905,6 +1905,20 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         }
     };
+}
+
+fn environBlockPtr(block: anytype) [*:null]const ?[*:0]const u8 {
+    const T = @TypeOf(block);
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice) return block.ptr;
+        },
+        .@"struct" => {
+            if (@hasField(T, "slice")) return block.slice.ptr;
+        },
+        else => {},
+    }
+    return block.ptr;
 }
 
 test "main module compiles" {

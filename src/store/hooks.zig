@@ -644,11 +644,13 @@ pub const ProcessTable = struct {
     mutex: std.atomic.Mutex,
 
     pub fn init() ProcessTable {
-        return .{
-            .entries = [_]?ProcessEntry{null} ** MAX_CONCURRENT_HOOKS,
+        var table: ProcessTable = .{
+            .entries = undefined,
             .count = 0,
             .mutex = .unlocked,
         };
+        for (&table.entries) |*slot| slot.* = null;
+        return table;
     }
 
     fn lock(self: *ProcessTable) void {
@@ -858,7 +860,9 @@ pub const HookDaemon = struct {
     /// Reap any terminated children with WNOHANG. Updates process table.
     fn reapChildren(self: *HookDaemon) void {
         while (true) {
-            var status: u32 = 0;
+            const StatusPtr = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn".params[1].type.?;
+            const Status = @typeInfo(StatusPtr).pointer.child;
+            var status: Status = 0;
             const WNOHANG: u32 = 1;
             const pid_raw = std.os.linux.waitpid(-1, &status, WNOHANG);
             const pid_i: isize = @bitCast(pid_raw);
@@ -867,17 +871,23 @@ pub const HookDaemon = struct {
             const pid: i32 = @intCast(pid_i);
             if (self.process_table.removeByPid(pid)) |entry| {
                 const W = std.os.linux.W;
-                if (W.IFEXITED(status)) {
-                    const exit_code = W.EXITSTATUS(status);
+                // `Status` is derived from waitpid's signature so it tracks
+                // whatever the toolchain declares, but the W.* decoders take
+                // u32. Reinterpret the same bits rather than converting the
+                // value -- a signed-to-unsigned @intCast would trap on the
+                // high-bit statuses that encode core dumps.
+                const status_bits: u32 = @bitCast(status);
+                if (W.IFEXITED(status_bits)) {
+                    const exit_code = W.EXITSTATUS(status_bits);
                     if (exit_code != 0) {
                         logTimestampedFmt("Hook #{d} (pid {d}) exited with status {d}", .{ entry.hook_id, pid, exit_code });
                     }
                     self.hook_table.recordExit(entry.hook_id, exit_code, entry.offset);
-                } else if (W.IFSIGNALED(status)) {
+                } else if (W.IFSIGNALED(status_bits)) {
                     // Shell convention: signal death reads as 128 + signum.
                     // This includes daemon-timeout SIGKILLs, which previously
                     // decoded as exit 0 under the raw (status >> 8) & 0xFF.
-                    const signum: u8 = @intCast(@intFromEnum(W.TERMSIG(status)));
+                    const signum: u8 = @intCast(@intFromEnum(W.TERMSIG(status_bits)));
                     logTimestampedFmt("Hook #{d} (pid {d}) killed by signal {d}", .{ entry.hook_id, pid, signum });
                     self.hook_table.recordExit(entry.hook_id, 128 + signum, entry.offset);
                 }
@@ -1742,11 +1752,11 @@ test "failure visibility: ConcurrentLimitReached increments nothing" {
             .pgid = -1,
             .offset = 0,
             .start_time = getMilliTimestamp(),
-            .log_path = [_]u8{0} ** 256,
+            .log_path = @splat(0),
             .log_path_len = 0,
-            .pattern = [_]u8{0} ** 128,
+            .pattern = @splat(0),
             .pattern_len = 0,
-            .command_display = [_]u8{0} ** 128,
+            .command_display = @splat(0),
             .command_display_len = 0,
         }));
     }
