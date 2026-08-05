@@ -121,7 +121,27 @@ The CLI's =store start= keeps its =flock= and selects =single_process=, preservi
 =ever.lock= currently means "a server process owns this directory", and =status= probes it to report whether a server is running. If several processes may legitimately share a directory, that flock can no longer be exclusive in =shared= mode, and the =status= semantics need restating — probably "how many attached" rather than "held / not held". This is the part most likely to surface follow-on work.
 
 ** Interaction with hooks and timers
-=HookTable= and =TimerTable= persist to =hooks.json= and =timers.json= with their own in-memory state, and have the same staleness property as the index. Hook *execution* in two processes would double-fire every hook. This document does not solve that; a =shared= store should for now assume a single process runs the hook and timer daemons. Worth stating explicitly in the contract so it is a documented restriction rather than a surprise.
+
+=HookTable= and =TimerTable= persist to =hooks.json= and =timers.json= with their own in-memory state, and have the same staleness property as the index. Two processes both running the hook daemon would double-fire every hook, so a =shared= store must assume a single hook/timer daemon.
+
+*** The case that will actually happen: hooks on an embedded store
+
+The double-fire is the obvious hazard and it is not the likely one. An embedded consumer has good reason *not* to run the hook daemon at all — =HookDaemon= forks and execves =/bin/sh=, which a TUI process holding the terminal in raw mode should not do. So the realistic topology is: one process embeds the store and writes events but runs no hooks, and a user who wants hooks reaches for the obvious remedy — =ever start --data-dir <the embedded store's directory>=.
+
+*Today that silently does nothing, and reports success at every step.*
+
+1. =ever start= takes =flock(LOCK_EX|LOCK_NB)= and *succeeds*, because the embedded store took no lock — the flock lives in =startServer=, above the library. There is no contention and therefore no warning.
+2. The daemon builds its index once at init and never refreshes.
+3. =HookDaemon= discovers events through =self.topic_manager.fetchPatternByOffset= / =fetch= — the in-memory index, not the log.
+4. The embedding process appends. The daemon's index never advances, so those events do not exist as far as it is concerned.
+5. No hook ever fires. =ever hook list= shows the hooks, =ever hook ps= shows no failures, the server logs look healthy.
+
+The user gets a clean start, a correct-looking hook registry, and a hook system that never fires — with no error at any stage. This is the same shape as the other silent failures in this project: a success receipt for something that did not happen.
+
+It is also the strongest argument for Piece 1. Incremental refresh is not a nicety for readers; it is the difference between hooks working and hooks silently not working, in the topology an embedded consumer will actually adopt.
+
+*** What the contract must therefore say
+Until Piece 1 lands, =ever start= against a directory that another process is writing is *not supported* and must not be presented as the way to add hooks to an embedded store. Once Piece 1 lands it becomes the supported answer, provided exactly one process runs the hook and timer daemons. Stating both halves matters, because the unsupported version is the one a user reaches for first.
 
 ** What this deliberately does not attempt
 Fan-in with two or three writers is served by Piece 2. Genuine multi-writer scaling, ordering guarantees across processes beyond "offsets are unique and monotonic", and transactions are all out of scope. If the process count grows past a handful, the honest answer is that this design stops being appropriate rather than being tuned.
