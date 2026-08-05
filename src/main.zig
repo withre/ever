@@ -55,16 +55,174 @@ fn connectToStore(allocator: std.mem.Allocator, ctx: *const cli.Context, addr: [
     };
 }
 
+// --- pub payload resolution (air/v0.1/pub-stdin.org) ------------------------
+
+/// Cap on a stdin payload: the protocol's own message ceiling. Reading
+/// past it can only produce a frame the wire will reject, so the CLI
+/// stops there and says so in bytes the caller recognises.
+const max_stdin_payload: usize = ever.protocol.MAX_MESSAGE_SIZE;
+
+/// Where `ever pub` takes its payload from, decided before any socket is
+/// opened. The two terminal cases are separate variants because they are
+/// separate mistakes: `.missing` is "you gave me no payload at all",
+/// `.dash_on_tty` is "you asked for stdin and stdin is a keyboard".
+const PayloadSource = union(enum) {
+    argv: []const u8,
+    stdin,
+    missing,
+    dash_on_tty,
+};
+
+/// Resolution table from air/v0.1/pub-stdin.org. `data_arg` is null only
+/// when the positional was absent — an explicit empty argument is a
+/// payload, not an absence, so it resolves to `.argv`.
+fn resolvePayloadSource(data_arg: ?[]const u8, stdin_is_tty: bool) PayloadSource {
+    const arg = data_arg orelse return if (stdin_is_tty) .missing else .stdin;
+    if (!std.mem.eql(u8, arg, "-")) return .{ .argv = arg };
+    return if (stdin_is_tty) .dash_on_tty else .stdin;
+}
+
+const StdinPayload = union(enum) {
+    /// Whole payload, newline already stripped; caller owns the slice.
+    ok: []u8,
+    /// Nothing left to publish. Kept separate from a zero-length `.ok`
+    /// because it is a refusal, not a payload.
+    empty,
+    /// Input exceeded the cap. Carries the *actual* total size, which is
+    /// what makes the diagnostic actionable.
+    too_large: u64,
+};
+
+/// Read `r` to EOF, holding at most `limit` bytes, and apply the stdin
+/// path's newline rule.
+///
+/// Past the cap it keeps counting but stops storing: the caller needs the
+/// real size for the error message, but not the real bytes — and a
+/// truncated payload must never reach the log, since an append-only store
+/// cannot take it back.
+fn readStdinPayload(allocator: std.mem.Allocator, r: *std.Io.Reader, limit: usize) !StdinPayload {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var chunk: [64 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = try r.readSliceShort(&chunk);
+        total += n;
+        if (total <= limit) try buf.appendSlice(allocator, chunk[0..n]);
+        // A short read happens if and only if the stream ended.
+        if (n < chunk.len) break;
+    }
+
+    if (total > limit) {
+        buf.deinit(allocator);
+        return .{ .too_large = total };
+    }
+
+    // Shrink rather than return a subslice: the caller frees what it owns,
+    // and a prefix of an allocation is not a freeable slice.
+    buf.shrinkRetainingCapacity(stripOneTrailingNewline(buf.items).len);
+    if (buf.items.len == 0) {
+        buf.deinit(allocator);
+        return .empty;
+    }
+    return .{ .ok = try buf.toOwnedSlice(allocator) };
+}
+
+/// Drop exactly one trailing newline, never more and never other
+/// whitespace, so `echo x | ever pub t` and `ever pub t x` publish the
+/// same bytes while a payload that deliberately ends in blank lines keeps
+/// all but the last. Stdin path only; argv is passed through untouched.
+fn stripOneTrailingNewline(data: []const u8) []const u8 {
+    if (data.len > 0 and data[data.len - 1] == '\n') return data[0 .. data.len - 1];
+    return data;
+}
+
+/// Render a byte count in MB (2^20, the unit the 16 MB wire ceiling is
+/// stated in) with one decimal, eliding a trailing `.0` so the limit
+/// reads "16 MB" rather than "16.0 MB". Diagnostics only.
+fn formatMegabytes(buf: []u8, bytes: u64) []const u8 {
+    const mb = 1024 * 1024;
+    const whole = bytes / mb;
+    const tenths = (bytes % mb) * 10 / mb;
+    if (tenths == 0) return std.fmt.bufPrint(buf, "{d} MB", .{whole}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}.{d} MB", .{ whole, tenths }) catch "?";
+}
+
 fn handlePub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     const topic = ctx.arg("topic");
-    const data = ctx.arg("data");
-
     if (topic.len == 0) {
         fatal(ctx, "error: topic is required\n", .{});
     }
-    if (data.len == 0) {
-        fatal(ctx, "error: data is required\n", .{});
-    }
+
+    // Straight to the map rather than `ctx.arg`: that helper collapses an
+    // absent positional and an explicitly empty one to "", and the
+    // resolution table needs to tell them apart.
+    const data_arg = ctx.positional.get("data");
+
+    const stdin_file = std.Io.File.stdin();
+    // A failed isatty means "not a terminal" — the fallback that reads
+    // rather than the one that refuses to.
+    const stdin_is_tty = stdin_file.isTty(ctx.io) catch false;
+
+    // Resolve the payload *before* connecting: a payload error should not
+    // cost a connection the store is about to see abandoned.
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| allocator.free(o);
+
+    const data: []const u8 = switch (resolvePayloadSource(data_arg, stdin_is_tty)) {
+        .argv => |value| blk: {
+            // Pre-existing behaviour, deliberately untouched: `ever pub t ''`
+            // has the same invisibility problem as an empty stdin payload,
+            // but it is a decision for the argv path and its own document.
+            if (value.len == 0) fatal(ctx, "error: data is required\n", .{});
+            break :blk value;
+        },
+        .stdin => blk: {
+            var stdin_buf: [64 * 1024]u8 = undefined;
+            var stdin_reader = stdin_file.readerStreaming(ctx.io, &stdin_buf);
+            const result = readStdinPayload(allocator, &stdin_reader.interface, max_stdin_payload) catch {
+                fatal(ctx, "error: cannot read payload from stdin\n", .{});
+            };
+            switch (result) {
+                .too_large => |size| {
+                    var size_buf: [32]u8 = undefined;
+                    var limit_buf: [32]u8 = undefined;
+                    fatal(ctx, "error: payload is {s}, which exceeds the {s} maximum message size\n", .{
+                        formatMegabytes(&size_buf, size),
+                        formatMegabytes(&limit_buf, max_stdin_payload),
+                    });
+                },
+                // Not a degenerate payload: empty-valued records are the
+                // store's own markers, and every read path filters them
+                // out. Publishing one returns an offset for an event no
+                // consumer can ever see.
+                .empty => fatal(ctx,
+                    \\error: stdin produced an empty payload; nothing was published.
+                    \\       Empty-valued events are skipped by every read path in the
+                    \\       store, so publishing one succeeds and is then invisible.
+                    \\
+                , .{}),
+                .ok => |bytes| {
+                    owned = bytes;
+                    break :blk bytes;
+                },
+            }
+        },
+        .missing => fatal(ctx,
+            \\error: no payload given. Pass it as an argument, or pipe it on stdin:
+            \\         ever pub {s} '{{"key":"value"}}'
+            \\         echo '{{"key":"value"}}' | ever pub {s}
+            \\
+        , .{ topic, topic }),
+        .dash_on_tty => fatal(ctx,
+            \\error: '-' reads the payload from stdin, but stdin is a terminal.
+            \\       Pipe the payload in, or pass it as an argument:
+            \\         echo '{{"key":"value"}}' | ever pub {s} -
+            \\         ever pub {s} '{{"key":"value"}}'
+            \\
+        , .{ topic, topic }),
+    };
 
     const addr_info = parseStoreAddress(ctx);
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
@@ -1640,7 +1798,7 @@ const app = cli.App{
             .description = "Publish an event",
             .args = &.{
                 .{ .name = "topic", .required = true, .description = "Topic name" },
-                .{ .name = "data", .required = true, .description = "Event data" },
+                .{ .name = "data", .required = false, .description = "Event data ('-' or omitted reads stdin)" },
             },
             .run = handlePub,
         },
@@ -2218,4 +2376,125 @@ test "hook logs --json emit: invalid payload line degrades" {
     try std.testing.expect(rec.get("hook_id").? == .null);
     try std.testing.expect(rec.get("payload").? == .null);
     try std.testing.expectEqualStrings(content, rec.get("output").?.string);
+}
+
+// --- pub payload from stdin (air/v0.1/pub-stdin.org) ------------------------
+
+/// Read a whole payload out of a fixed byte slice, exactly as `handlePub`
+/// would read it off stdin: cap, strip one trailing newline, classify.
+fn readStdinPayloadForTest(input: []const u8, limit: usize) !StdinPayload {
+    var r = std.Io.Reader.fixed(input);
+    return readStdinPayload(std.testing.allocator, &r, limit);
+}
+
+test "pub payload: a DATA argument is published as-is and never treated as stdin" {
+    // Regression guard for the argv form, and for the near-miss spellings
+    // that must *not* be mistaken for the stdin sentinel. The empty string
+    // is here too: it is *present*, so it resolves to argv and keeps its
+    // pre-existing "data is required" rejection rather than reading stdin.
+    const cases = [_][]const u8{ "{\"a\":1}", "literal-dash-is-data", "--", "-x", " -", "" };
+    for (cases) |data| {
+        // The verdict must not depend on what stdin happens to be.
+        for ([_]bool{ false, true }) |is_tty| {
+            switch (resolvePayloadSource(data, is_tty)) {
+                .argv => |value| try std.testing.expectEqualStrings(data, value),
+                else => return error.TestExpectedArgvPayload,
+            }
+        }
+    }
+}
+
+test "pub payload: absent DATA or '-' reads stdin when stdin is not a terminal" {
+    try std.testing.expectEqual(PayloadSource.stdin, resolvePayloadSource(null, false));
+    try std.testing.expectEqual(PayloadSource.stdin, resolvePayloadSource("-", false));
+}
+
+test "pub payload: a terminal stdin is refused, not read" {
+    // The whole point: without this branch both cases block on a read the
+    // caller never knew they asked for, and look like a hang.
+    try std.testing.expectEqual(PayloadSource.missing, resolvePayloadSource(null, true));
+    try std.testing.expectEqual(PayloadSource.dash_on_tty, resolvePayloadSource("-", true));
+}
+
+test "pub payload: exactly one trailing newline is stripped" {
+    // `echo` and heredocs append a newline the caller did not mean; two
+    // spellings of the same command must publish the same bytes.
+    try std.testing.expectEqualStrings("{\"a\":1}", stripOneTrailingNewline("{\"a\":1}\n"));
+    // No newline to strip: byte-identical passthrough.
+    try std.testing.expectEqualStrings("{\"a\":1}", stripOneTrailingNewline("{\"a\":1}"));
+    // Never more than one, so deliberate blank lines survive.
+    try std.testing.expectEqualStrings("a\n\n", stripOneTrailingNewline("a\n\n\n"));
+    try std.testing.expectEqualStrings("", stripOneTrailingNewline("\n"));
+    try std.testing.expectEqualStrings("", stripOneTrailingNewline(""));
+    // Never other whitespace: the CR of a CRLF payload is payload.
+    try std.testing.expectEqualStrings("a\r", stripOneTrailingNewline("a\r\n"));
+    try std.testing.expectEqualStrings("a\t ", stripOneTrailingNewline("a\t "));
+}
+
+test "pub payload: stdin is read to EOF, embedded NULs and newlines intact" {
+    const input = "{\"a\":\"line1\nline2\",\"b\":\"quote ' \\\" back \\\\\"}\x00tail\n";
+    const result = try readStdinPayloadForTest(input, max_stdin_payload);
+    const bytes = result.ok;
+    defer std.testing.allocator.free(bytes);
+
+    // Everything but the one trailing newline survives byte-for-byte.
+    try std.testing.expectEqualStrings(input[0 .. input.len - 1], bytes);
+}
+
+test "pub payload: empty stdin is refused, never published" {
+    // An empty value is how the store marks creation markers and
+    // tombstones, and every read path filters those out — so an empty
+    // publish would be acknowledged with an offset and then invisible to
+    // every consumer, in an append-only log that cannot take it back.
+    try std.testing.expectEqual(StdinPayload.empty, try readStdinPayloadForTest("", max_stdin_payload));
+
+    // A lone newline is the same black hole once the newline rule has
+    // run: `echo "" | ever pub t` must not slip past the check.
+    try std.testing.expectEqual(StdinPayload.empty, try readStdinPayloadForTest("\n", max_stdin_payload));
+
+    // One byte of payload is a payload, newline or not.
+    const one = try readStdinPayloadForTest(" \n", max_stdin_payload);
+    defer std.testing.allocator.free(one.ok);
+    try std.testing.expectEqualStrings(" ", one.ok);
+}
+
+test "pub payload: input larger than the cap reports its real size, not a truncated payload" {
+    // Small cap: the arithmetic is the same, the test is cheap.
+    const result = try readStdinPayloadForTest("0123456789", 4);
+    try std.testing.expectEqual(@as(u64, 10), result.too_large);
+
+    // At the cap exactly is still fine — the boundary is `>`, not `>=`.
+    const at_limit = try readStdinPayloadForTest("0123", 4);
+    defer std.testing.allocator.free(at_limit.ok);
+    try std.testing.expectEqualStrings("0123", at_limit.ok);
+
+    // Oversize is reported from the byte count, not from what was kept:
+    // a payload that is all newline still exceeds a cap it exceeds.
+    try std.testing.expectEqual(@as(u64, 5), (try readStdinPayloadForTest("\n\n\n\n\n", 4)).too_large);
+}
+
+test "pub payload: the cap is the wire maximum, and one byte over trips it" {
+    try std.testing.expectEqual(@as(usize, ever.protocol.MAX_MESSAGE_SIZE), max_stdin_payload);
+
+    // Crossing mid-chunk, over the real limit, with a payload far larger
+    // than the read buffer — the case that would truncate if the cap were
+    // applied per-read instead of to the running total.
+    const oversize = try std.testing.allocator.alloc(u8, max_stdin_payload + 1);
+    defer std.testing.allocator.free(oversize);
+    @memset(oversize, 'x');
+
+    const result = try readStdinPayloadForTest(oversize, max_stdin_payload);
+    try std.testing.expectEqual(@as(u64, max_stdin_payload + 1), result.too_large);
+}
+
+test "pub payload: oversize diagnostic names the size and the limit" {
+    var size_buf: [32]u8 = undefined;
+    var limit_buf: [32]u8 = undefined;
+    // 21.3 MB, the worked example in the spec.
+    try std.testing.expectEqualStrings("21.3 MB", formatMegabytes(&size_buf, 22_335_000));
+    // Truncated, never rounded up: the reported size never overstates.
+    try std.testing.expectEqualStrings("21.2 MB", formatMegabytes(&size_buf, 22_334_259));
+    // The limit prints without a pointless ".0".
+    try std.testing.expectEqualStrings("16 MB", formatMegabytes(&limit_buf, max_stdin_payload));
+    try std.testing.expectEqualStrings("0 MB", formatMegabytes(&size_buf, 0));
 }
