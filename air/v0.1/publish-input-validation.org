@@ -1,5 +1,5 @@
 #+title: Reject Reserved Keys and Empty Values from Client Publishes
-#+state: ready
+#+state: complete
 #+FILETAGS: :store:protocol:
 
 * Summary
@@ -128,3 +128,6 @@ The empty-value guard alone would close the reported exploit, since a tombstone 
 
 * History
 - 2026-08-05: Drafted and promoted to ready. Reported by reverie from committed-source reading; confirmed here by live reproduction on an isolated store (accepted, invisible, then permanently deleted at restart). The live fleet store was checked by simulating a restart on a copy of its data directory — it reports the same four deleted topics as the running store, so no tombstone has been planted there.
+- 2026-08-05: Marked complete. Landed as three commits — the guard in =TopicManager.publish=, unit tests (including that the guard runs before the topic-state checks, and that internal marker writes are unaffected), and a restart regression asserting both that an injected tombstone cannot delete a topic across a rebuild and that a real =deleteTopic= still does. Verified independently of the tests: the injection is refused 400 on both the HTTP and TCP paths, nothing is appended, the topic survives a restart, and legitimate deletion is unaffected.
+
+  Two notes for anyone reading this later. The implementer built a deliberately un-guarded copy of the tree first, to confirm the exploit still reproduced pre-fix — without that, a passing post-fix check cannot distinguish "the guard works" from "the exploit never ran". And the end-to-end test deliberately uses no sockets: the guard sits at a single choke point both edges call, so a rebuild-based test proves the regression while a server-based one only added the server-lifecycle problem now specified in =testable-server-lifecycle.org=.
