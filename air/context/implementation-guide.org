@@ -216,3 +216,26 @@ zig build test -Doptimize=ReleaseSafe
 - Enable safety checks in debug mode — they catch real bugs
 - Use =@breakpoint()= for debugger integration
 - Compile with =-Doptimize=Debug= for full safety checks and stack traces
+
+** Repository Traps
+
+Behaviours that cost an implementer real time and are not discoverable by reading the code you are changing. Each was found the expensive way; add to this list rather than rediscovering.
+
+*** Testing
+
+- =zig build test= *prints nothing on success.* Silence means pass — and equally means you ran the wrong step, or everything was cached. Always pass =--summary all=, which gives per-binary counts and distinguishes "ran" from "cached".
+- *Tests live in three separate binaries*: =root.zig= (via =refAllDecls=), =main.zig=, and =src/tests/integration.zig=. A test added to a file not reachable from =root.zig= *silently never runs*. You will not see a failure; you will see success. Confirm new tests actually execute.
+- *Build a negative control before trusting a new test.* Copy the tree to =/tmp= (=src=, =build.zig=, =build.zig.zon=, =zig-pkg= build standalone), remove the fix, and run the suite. A test that does not fail without the fix is decoration. This is the difference between "the guard works" and "the exploit never ran".
+- *The correct server shutdown sequence appears exactly once*, in the first test of =src/tests/integration.zig= — which is named for status probing, so grepping for shutdown-related words will not find it. The order is: set =shutdown_requested=, call =probeServer= to wake the blocked =accept()=, *then* join, *then* =shutdown()=. Do not stand up =Server= and =HttpServer= in one test; that combination deadlocks holding both listeners at 0% CPU. See =air/v0.1/testable-server-lifecycle.org=.
+
+*** Client and CLI
+
+- =ever pub= *never sets a key* — =main.zig= calls =c.publish(topic, null, data)= unconditionally. Anything requiring a keyed publish is not reproducible with the shipped CLI; use the HTTP endpoint (where =key= is a JSON field) or raw frames. Frame layout: byte 0 = version (1), byte 1 = message type, =u32= little-endian body length, then the JSON body.
+- =client.Client= *cannot observe a specific server error.* It collapses every =error_response= into =error.ServerError= and prints the message to stderr via =std.debug.print=. Asserting on a particular failure code requires raw frames.
+
+*** Store internals
+
+- =TopicManager.mutex= is a *non-reentrant spinlock*. Any public method that locks deadlocks if called from inside a locked section — which is why the =*Locked= entry-point variants exist. Validation that needs manager state must either take a =*Locked= path or be pure and run before the lock.
+- *Empty-valued events are internal markers* and are filtered from every read path. This was documented before it was ever filed as a defect: see the doc comment on =TopicIndex.non_marker_count=, which names user publishes with empty values as a historical quirk. Reading that comment is faster than rediscovering the behaviour.
+- *Input guards are not retroactive.* =publish= now rejects reserved keys and empty values, but events already on disk are unchanged and =rebuildIndex= still reads them exactly as before. Guards stop new writes; they do not clean up or reinterpret old ones, and no migration exists.
+
