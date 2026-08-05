@@ -1,0 +1,118 @@
+#+title: Multi-Process Access to a Single Store
+#+state: draft
+#+FILETAGS: :store:core:
+
+* Summary
+Allow two or three processes to share one data directory safely — a shell running an embedded Ever, plus a UI or terminal attached to the same store. Three separable changes: refresh the in-memory index from disk so readers stop going stale, span the append critical section across processes so writers stop destroying each other, and make the library's concurrency guarantee explicit rather than accidental.
+
+* Motivation
+
+** Answering the question directly: why is the index not written back?
+
+Because it is not state. =TopicIndex= is =\{ offsets: ArrayList(u64), non_marker_count: u64 \}= per topic — a map from topic name to the global offsets belonging to it, plus a count. Every byte of it is reconstructible from the log, and the log is already the durable, shared, on-disk source of truth. The data directory contains only =*.log=, =ever.lock=, =hooks.json= and =timers.json=; there is no index file because the index is a cache.
+
+*Persisting it would not fix the problem it appears to fix.* The stale-reader defect is not that a process loses its index — it is that a running process never *notices* another process's appends. Writing the index to disk leaves that untouched: process A still holds its own in-memory copy and still never re-reads. It would convert one coherence problem into two, because the log and the index would then both have to agree across processes, and the index is the derivable one.
+
+So the direction here is the opposite: keep the index derived, and make it *catch up* cheaply.
+
+** What is actually broken today
+
+*** Readers go stale, silently and permanently
+=TopicManager.rebuildIndex= runs once at init. Appends update the index in memory. A second process's appends are therefore invisible to the first *forever*. Nothing crashes and nothing warns — a reader simply returns a truthful-looking answer computed from a snapshot that stopped advancing. That silence is what makes it worse than a crash.
+
+*** Writers destroy each other
+=Log.append= reads =self.next_offset= from process-local memory, encodes, and writes positionally at =seg.size= — all under a =std.atomic.Mutex=, which is in-process only. Two writers assign identical offsets and write at identical file positions; the later write destroys the earlier. This is not an edge case, it is what two writers do on their first concurrent append.
+
+*** The only thing preventing both is a lock in the wrong layer
+=flock(LOCK_EX|LOCK_NB)= is taken in =main.zig= =startServer=. There is no locking anywhere in =src/store/= or =src/net/=. So the guard sits *above* the library boundary: a consumer that imports Ever and writes gets no protection at all — not loosened, absent. Embedding is already the unsafe case, before any change contemplated here.
+
+This reframes the work. It is not "relax a guard so multiple processes can share". It is "put a guard where none exists, and let the two entrypoints choose different ones".
+
+** Scale target
+Two or three processes: one shell running an embedded Ever, another UI or terminal attached to the same directory. Explicitly *not* N processes.
+
+** Goals
+- A reader in one process observes another process's appends within a bounded, cheap check
+- Two or three concurrent writers cannot assign the same offset or overwrite each other's records
+- The library and CLI entrypoints may choose different concurrency guarantees, deliberately
+- Each of the three changes can land independently and be useful alone
+
+** Non-Goals
+- Distributed consensus, leader election, or N-writer scaling. The 2–3 process target is what makes the cheap mechanisms below sufficient; none of them generalise, and that is deliberate.
+- Transactions across multiple publishes. Named as a longer-term direction, out of scope here.
+- Changing the offset model (global monotonic u64) or the on-disk record format.
+- Removing =sync_on_append=, or the swallowed-fsync defect it interacts with. Tracked separately.
+
+* Proposal
+
+Three pieces, in dependency order.
+
+** Piece 1 — Incremental index refresh (fixes stale readers)
+
+The catch-up loop already exists. =rebuildIndex= walks =offset = 0= to =log.nextOffset()=, reading each event and folding it into the index. *The same loop started at the last-indexed offset instead of zero is an incremental tail scan.* Nothing new needs inventing; it is currently only ever invoked with a start of zero.
+
+Two details decide whether it is correct:
+
+*** The trigger must come from disk, not memory
+=Log.nextOffset()= returns =self.next_offset=, which is in-memory and set at init. Process A's =nextOffset()= is therefore exactly as stale as its index — using it to detect growth would compare a stale value against itself and always conclude "nothing new". Growth must be detected by =stat=-ing the segment files. Nothing re-stats after init today.
+
+*** New segment files must be discovered, not just growth in known ones
+If the other process rolls over =max_segment_size=, it creates a *new* segment file that this process has never opened. =Log.init= already contains the routine for this: scan the directory for =*.log=, sort, open, =stat= for size, build the position index. A refresh is that routine re-run against the current directory, plus a re-=stat= of segments already open.
+
+*** One choke point, not nine
+There are nine public reader entry points on =TopicManager=: =tipForPattern=, =tipForPatternLocked=, =hasTopic=, =hasTopicLocked=, =listTopics=, =fetch=, =fetchAfterOffset=, =fetchPatternByOffset=, =fetchPattern=. Sprinkling a freshness check across all nine guarantees that the tenth, added later, forgets it.
+
+Put the check in one place — at lock acquisition — so every reader inherits it by construction rather than by discipline. This mirrors the shape the hook table already uses (one locked entry point per verb).
+
+*** Cost
+When idle: one =stat= per segment per read. When behind: a scan proportional to the number of *new* events, not to the log. Both acceptable at this scale, and the refresh can be rate-limited (at most once per N milliseconds) if the =stat= turns out to matter.
+
+** Piece 2 — Cross-process append lock (fixes write collisions)
+
+The critical section is precisely: read =next_offset= → encode → write at =seg.size= → advance =next_offset= and =seg.size=. Today a process-local mutex spans it. Widen the same section to an OS-level lock so it spans processes.
+
+*** Why this is affordable
+The append path already pays an fsync per publish (=sync_on_append= defaults true), measured at roughly 42 ms and independent of payload size. Acquiring and releasing a file lock is microseconds. The lock is *noise* against a cost the design already accepts — which is what makes a cross-process critical section viable here without consensus, and why the 2–3 process target does not need anything cleverer.
+
+*** It depends on Piece 1
+After acquiring the cross-process lock, a writer's in-memory =next_offset= and =seg.size= may be stale, because another process appended while it was waiting. It must refresh from disk *inside* the lock before assigning an offset. That is Piece 1's machinery, so Piece 1 lands first. Piece 2 without Piece 1 would take a lock and then write at a stale position — the same corruption, now with a lock held.
+
+*** Lock file
+Use a dedicated lock file rather than reusing =ever.lock=, whose current meaning is "a server owns this directory". Overloading it would conflate "a server is running" with "an append is in flight" and break the existing =status= probe.
+
+** Piece 3 — Explicit library entrypoint contract
+
+Today the difference between the CLI and the library is accidental: the CLI happens to take an flock in =startServer=, and the library happens to take nothing. Make it a choice.
+
+Expose the concurrency mode in =TopicManager= config, so an embedded consumer opts in to cross-process safety and a single-process CLI can skip the cost:
+
+#+begin_src zig
+pub const Concurrency = enum {
+    /// One process owns this directory. No cross-process locking.
+    single_process,
+    /// Several processes may share it. Refresh-on-read and a
+    /// cross-process append lock.
+    shared,
+};
+#+end_src
+
+The CLI's =store start= keeps its =flock= and selects =single_process=, preserving today's behaviour and cost exactly. An embedded consumer selects =shared=. What each guarantees is documented, rather than being an emergent property of which entrypoint you happened to use.
+
+* Design Details
+
+** Interaction with the existing =ever.lock=
+=ever.lock= currently means "a server process owns this directory", and =status= probes it to report whether a server is running. If several processes may legitimately share a directory, that flock can no longer be exclusive in =shared= mode, and the =status= semantics need restating — probably "how many attached" rather than "held / not held". This is the part most likely to surface follow-on work.
+
+** Interaction with hooks and timers
+=HookTable= and =TimerTable= persist to =hooks.json= and =timers.json= with their own in-memory state, and have the same staleness property as the index. Hook *execution* in two processes would double-fire every hook. This document does not solve that; a =shared= store should for now assume a single process runs the hook and timer daemons. Worth stating explicitly in the contract so it is a documented restriction rather than a surprise.
+
+** What this deliberately does not attempt
+Fan-in with two or three writers is served by Piece 2. Genuine multi-writer scaling, ordering guarantees across processes beyond "offsets are unique and monotonic", and transactions are all out of scope. If the process count grows past a handful, the honest answer is that this design stops being appropriate rather than being tuned.
+
+* Open Questions
+- Refresh trigger granularity: per read, or rate-limited? Measure the =stat= cost against the 100 ms poll the subscription path already performs before optimising.
+- Should =shared= mode also cover =HookTable= / =TimerTable=, or is single-daemon a permanent restriction?
+- Does =fetchPattern= over a refreshed index need any ordering guarantee it does not have today?
+
+* History
+- 2026-08-05: Drafted. Direction set by the owner: loosen or make the locking configurable, allow multiple readers and writers where the topology is clear, and let library and CLI entrypoints differ. Answers the "why not persist the index" question in the Motivation. Kept as draft because the refresh trigger and the =ever.lock= semantics are unresolved; the three pieces are separable and Piece 1 is well-defined enough to implement first.
