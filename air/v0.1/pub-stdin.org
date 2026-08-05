@@ -114,6 +114,8 @@ That is intolerable specifically on the stdin path. With the argv form, publishi
 
 Why not publish it anyway and let consumers deal: they cannot. The filtering is in the store's read paths, not in any consumer's control, and the log is append-only, so a mistakenly-published empty event can be neither seen nor removed.
 
+The consequence generalises past this command, and is worth stating because it is the thing someone reaches for next: *an empty value cannot serve as a signal anywhere in Ever.* Not a heartbeat, not a tick, not a presence marker, not a "still alive" ping. The zero-byte payload is the natural encoding for all of those — it is the cheapest thing to send — and every one of them would be filtered out of every read path while reporting success to the sender. Any signal needs a non-empty body, even if the body is only ={}=.
+
 Note this does *not* make the event a topic tombstone. A tombstone requires the reserved key =__ever_tombstone__= *and* an empty value (=topic.zig=), and =ever pub= always publishes with a null key (=main.zig=). Accidental topic deletion is not the hazard here; silent invisibility is.
 
 The argv form's own empty case (=ever pub t ''=) has the same invisibility problem and is *not* changed by this document — it is pre-existing behaviour on a path this spec leaves alone. It deserves its own decision; flagging it rather than smuggling a behaviour change in here.
