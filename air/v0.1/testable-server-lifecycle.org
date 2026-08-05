@@ -1,0 +1,123 @@
+#+title: Deterministic Server Startup and Shutdown for Tests
+#+state: ready
+#+FILETAGS: :testing:core:
+
+* Summary
+Make a =Server= startable and stoppable deterministically by any caller: unblock =accept()= from =shutdown()= rather than only from the signal handler, support an ephemeral port and report the bound one, and give integration tests a single harness that starts, waits, stops and joins. Today a test that stops a server correctly hangs forever holding its ports.
+
+* Motivation
+
+** This already cost a hung test and it is not a test-only bug
+
+An implementation agent writing an end-to-end test stood up in-process servers and the test hung. Observed from outside: the test binary sat at *0.0% CPU for over three minutes* while still holding both listeners. From inside the test there is no way to tell that state from a slow test, so it looked like progress.
+
+The cause is in the library, not the test:
+
+- =Server.run()= loops on a *blocking* =accept()=, checking =shutdown_requested= only between iterations. Once it is inside =accept()= it stays there until a connection arrives.
+- =Server.shutdown()= sets the flag, closes the listener and waits for connections to drain. *It never wakes the blocked =accept()=.* Closing a listening socket out from under a thread blocked in =accept()= does not reliably return on Linux.
+- The thing that actually unblocks it is a *dummy self-connection*, and that lives in =signalHandler= — installed only by =installSignalHandlers()= and reached only via SIGINT/SIGTERM.
+
+So the CLI stops cleanly because it is stopped by a signal. *Any other caller that calls =shutdown()= and joins the server thread hangs.* That includes every test, and it includes an embedded consumer hosting a store in-process — which is a supported direction elsewhere in this project. The defect is that the only correct shutdown path is reachable only from a signal.
+
+** The existing test pattern papers over it
+
+=src/tests/integration.zig= currently does:
+
+#+begin_src zig
+const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+const port: u16 = 30000 + pid_part;
+const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+// then poll probeServer up to 50 times at 20ms
+#+end_src
+
+Three separate fragilities, each of which fails rarely enough to look fine:
+
+1. *The port is derived from the pid.* =zig build test= runs three test binaries, and any two whose pids are 20000 apart collide. A leftover process from a previous hung run holds the port outright, and =listen= uses =reuse_address = false=.
+2. *Readiness is an ad-hoc poll* re-written per test, with a one-second ceiling and no failure message distinguishing "not ready yet" from "will never be ready".
+3. *The thread is never joined.* =defer server.deinit()= closes the listener and leaves =run()= blocked in =accept()=. The test passes, the thread leaks, and the port stays held until the process exits.
+
+The pattern survives because tests are short and the process exits soon after. It stops surviving the moment a test tries to stop a server and continue — which is exactly what an end-to-end regression must do.
+
+** Goals
+- =Server.shutdown()= reliably returns a blocked =accept()=, for every caller and not only via a signal
+- A server can bind an ephemeral port and report the port it actually got
+- One test harness: start, wait until genuinely accepting, stop, join — with no per-test polling
+- A test that stops a server can continue and cannot leak the port
+- Existing tests move to the harness
+
+** Non-Goals
+- Changing the wire protocol, the accept model, or the threading model. This makes the current design stoppable; it does not redesign it.
+- Graceful-shutdown semantics for in-flight connections. The 5s drain stays as it is.
+- Removing =installSignalHandlers()=. The CLI keeps it; it should simply stop being the only route to a correct stop.
+
+* Proposal
+
+** 1. Move the unblock into =shutdown()=
+
+The self-connect currently in =signalHandler= is the mechanism that works. Lift it into a private helper and call it from =shutdown()=, so the ordering is:
+
+1. set =shutdown_requested=
+2. *self-connect to the listener and close* — wakes =accept()=, which sees the flag and breaks
+3. close the listener
+4. drain in-flight connections as today
+
+Note the order matters and the current =shutdown()= has it wrong for this purpose: it closes the listener *first*, so a self-connect afterwards has nothing to connect to. The listener must stay open until =accept()= has been woken.
+
+=signalHandler= then reduces to setting the flag and doing the same self-connect, or calls the shared helper directly if that is async-signal-safe in context. Keep the existing comment's reasoning about =connect()=/=close()= being safe from a handler.
+
+** 2. Ephemeral port
+
+Allow =Config.port = 0= to mean "any free port", and expose the port actually bound:
+
+#+begin_src zig
+/// The port this server is listening on. Equals `config.port` unless that
+/// was 0, in which case it is the port the OS assigned. Valid only after
+/// `run()` has bound; 0 before that.
+pub fn boundPort(self: *const Server) u16
+#+end_src
+
+Read it with =getsockname= on the listener socket after =listen= succeeds. This is what removes the pid-derived port entirely — a test never picks a number, so two tests cannot pick the same one.
+
+** 3. The harness
+
+One helper in the test module, used by every integration test that needs a server:
+
+#+begin_src zig
+const TestServer = struct {
+    server: ever.net.Server,
+    thread: std.Thread,
+    port: u16,
+
+    /// Bind an ephemeral port, start accepting, and return once the server
+    /// is genuinely reachable. Fails the test rather than hanging if it
+    /// does not come up.
+    fn start(tm: *TopicManager) !TestServer
+
+    /// Stop, join, and release. Safe to call once; `defer` it.
+    fn stop(self: *TestServer) void
+};
+#+end_src
+
+=start= must *wait for genuine readiness* rather than sleeping a fixed interval, and must give up with a clear failure rather than looping forever. =stop= must join the thread — that is the assertion that shutdown actually worked, and it is what turns a silent leak into a visible failure.
+
+* Design Details
+
+** Joining is the point
+It is tempting to have =stop()= not join, which would make the hang disappear. That hides the defect rather than fixing it: an unjoined thread may still hold the port when the next test binds. The harness joins deliberately, so that a regression in =shutdown()= surfaces as a hanging test in *this* project's suite rather than in a consumer's.
+
+** Timeouts belong in the harness, not the test
+=start= and =stop= should each have a bounded wait and fail with a message naming which phase timed out. A test author should never write a polling loop; every such loop is a place where the ceiling is chosen badly and the failure mode is a hang.
+
+** Why not test the server through a subprocess
+Spawning =ever start= would sidestep the library defect entirely. It also makes tests slow, makes failures hard to attribute, and leaves the defect in place for embedded consumers — who are the population that hits it in production rather than in CI. Fixing =shutdown()= serves both.
+
+* Testing
+- start and stop a server, twice in one test — the second =start= must succeed, which fails today if the port leaked
+- =boundPort()= returns a usable port when =config.port = 0=, and two servers started concurrently get different ones
+- =stop()= returns promptly with a client connected but idle, and with no client at all
+- a test that calls =stop()= and then continues does not hang — this is the regression for the reported failure
+- the CLI's signal path still shuts down cleanly (no regression in =installSignalHandlers=)
+- existing integration tests pass unchanged in behaviour after moving to the harness
+
+* History
+- 2026-08-05: Drafted and promoted to ready. Prompted by an end-to-end test that hung at 0% CPU holding both its listeners; diagnosis showed the only working unblock path was reachable exclusively from the signal handler, making correct shutdown impossible for tests and for embedded consumers alike.
