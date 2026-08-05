@@ -39,6 +39,7 @@ Two or three processes: one shell running an embedded Ever, another UI or termin
 
 ** Non-Goals
 - Distributed consensus, leader election, or N-writer scaling. The 2–3 process target is what makes the cheap mechanisms below sufficient; none of them generalise, and that is deliberate.
+- Persisting the index to disk. Argued against in the Motivation as the multi-process mechanism. It remains legitimate as a *startup-time* optimisation — =rebuildIndex= is a full scan of every event, and the live store is already past 119,000 — but that is a performance feature to be argued on its own terms, in its own document, and it trades an append-only recoverable structure for a mutable corruptible one.
 - Transactions across multiple publishes. Named as a longer-term direction, out of scope here.
 - Changing the offset model (global monotonic u64) or the on-disk record format.
 - Removing =sync_on_append=, or the swallowed-fsync defect it interacts with. Tracked separately.
@@ -58,6 +59,22 @@ Two details decide whether it is correct:
 
 *** New segment files must be discovered, not just growth in known ones
 If the other process rolls over =max_segment_size=, it creates a *new* segment file that this process has never opened. =Log.init= already contains the routine for this: scan the directory for =*.log=, sort, open, =stat= for size, build the position index. A refresh is that routine re-run against the current directory, plus a re-=stat= of segments already open.
+
+*** The refresh has two layers, and both are required
+
+There are two independent derived structures, each with its own rebuild loop, and a refresh that updates only one is silently wrong:
+
+| Layer          | Structure                                   | Existing loop                                    | Resume from                |
+|----------------+---------------------------------------------+--------------------------------------------------+----------------------------|
+| =Log=          | per-segment byte positions, =next_offset=   | =buildPositionIndex= — =while (pos < seg.size)=   | last indexed byte position |
+| =TopicManager= | topic → offsets, =non_marker_count=, deletions | =rebuildIndex= — walks =0..log.nextOffset()=      | last folded global offset  |
+
+Both are already resumable walks that happen to start at zero; neither needs new traversal logic.
+
+The consequence of missing the second layer is concrete: *tombstone detection lives in the =TopicManager= loop.* A =Log=-only refresh would pick up another process's new records but never notice that one of them deleted a topic, so this process would keep serving a topic the other has destroyed.
+
+*** The two layers must refresh atomically with respect to readers
+If =Log= advances =next_offset= before =TopicManager= has folded those events, a reader can observe a tip that the topic index does not yet cover — a fetch for an offset the index has no entry for. Both layers must advance under the same lock acquisition, so no reader observes the intermediate state.
 
 *** One choke point, not nine
 There are nine public reader entry points on =TopicManager=: =tipForPattern=, =tipForPatternLocked=, =hasTopic=, =hasTopicLocked=, =listTopics=, =fetch=, =fetchAfterOffset=, =fetchPatternByOffset=, =fetchPattern=. Sprinkling a freshness check across all nine guarantees that the tenth, added later, forgets it.
