@@ -115,7 +115,8 @@ Spawning =ever start= would sidestep the library defect entirely. It also makes 
 - start and stop a server, twice in one test — the second =start= must succeed, which fails today if the port leaked
 - =boundPort()= returns a usable port when =config.port = 0=, and two servers started concurrently get different ones
 - =stop()= returns promptly with a client connected but idle, and with no client at all
-- a test that calls =stop()= and then continues does not hang — this is the regression for the reported failure
+- a test that calls =stop()= and then continues does not hang — this is the regression for the reported failure.
+  *This test must first force =accept()= to be genuinely blocked*, or it is worthless. The hang is racy: if =stop()= is called before the accept loop has actually entered =accept()=, the wake-up connection races ahead of the block and the test passes whether or not the fix is present. Confirmed empirically — against a deliberately unfixed copy, =shutdown()= + =join()= hangs at 0.0% CPU for 45s+ once blocking is genuine, and passes by luck without a settling step. A regression test that does not establish the blocked state is asserting nothing.
 - the CLI's signal path still shuts down cleanly (no regression in =installSignalHandlers=)
 - existing integration tests pass unchanged in behaviour after moving to the harness
 
