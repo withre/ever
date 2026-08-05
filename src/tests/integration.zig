@@ -1300,3 +1300,91 @@ test "integration: backlog while the daemon is stopped grows for both cursor kin
     const capped = try tm.countPatternByOffset(allocator, "t.legib.", 0, 2);
     try testing.expectEqual(@as(u64, 2), capped);
 }
+
+// ── Publish Input Validation ────────────────────────────────────────────────
+//
+// From air/v0.1/publish-input-validation.org: a client publish of the
+// reserved tombstone key with an empty value used to be accepted, returned
+// an offset, was invisible to every reader, and then deleted the topic at
+// the next restart — the damage separated from its cause by a restart.
+//
+// The regression is written against `TopicManager.publish` rather than
+// through live sockets: both wire protocols call that one function, and it
+// is the restart, not the transport, that the original bug hid behind.
+
+test "integration: injected tombstone cannot delete a topic across a rebuild" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    {
+        var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+
+        try tm.createTopic("victim");
+        _ = try tm.publish("victim", null, "before");
+        const before = tm.log.nextOffset();
+
+        // The exploit, as reported: the exact key/value pair `deleteTopic`
+        // writes, from a client publish.
+        try testing.expectError(error.ReservedKey, tm.publish("victim", "__ever_tombstone__", ""));
+        // And the empty value on its own, which is what made it silent.
+        try testing.expectError(error.EmptyValue, tm.publish("victim", null, ""));
+
+        // Nothing was appended. If a refused publish still reached the log,
+        // the tombstone would be on disk and the rebuild below would find it.
+        try testing.expectEqual(before, tm.log.nextOffset());
+        try testing.expect(!tm.isTopicDeleted("victim"));
+    }
+
+    // The rebuild is the whole point: this is where the injected tombstone
+    // used to take effect.
+    {
+        var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+
+        try testing.expect(tm.hasTopic("victim"));
+        try testing.expect(!tm.isTopicDeleted("victim"));
+
+        // Alive *and* writable — the original bug left the topic readable but
+        // permanently unpublishable, so existence alone is not enough.
+        _ = try tm.publish("victim", null, "after-restart");
+        try testing.expectError(error.AlreadyExists, tm.createTopic("victim"));
+
+        const events = try tm.fetch(allocator, "victim", 0, 10);
+        defer freeEvents(events);
+        try testing.expectEqual(@as(usize, 2), events.len);
+        try testing.expectEqualStrings("before", events[0].value);
+        try testing.expectEqualStrings("after-restart", events[1].value);
+    }
+}
+
+test "integration: a real deleteTopic still deletes across the same rebuild" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The control for the test above: the guard must refuse the client's
+    // tombstone without disarming the store's own. Same rebuild, opposite
+    // expected outcome — so "topic survived" cannot pass by the tombstone
+    // mechanism having quietly stopped working.
+    {
+        var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+
+        try tm.createTopic("doomed");
+        _ = try tm.publish("doomed", null, "data");
+        try tm.deleteTopic("doomed");
+    }
+    {
+        var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+
+        try testing.expect(tm.hasTopic("doomed"));
+        try testing.expect(tm.isTopicDeleted("doomed"));
+        try testing.expectError(error.TopicDeleted, tm.publish("doomed", null, "nope"));
+
+        // Historical events stay readable — soft delete, as before.
+        const events = try tm.fetch(allocator, "doomed", 0, 10);
+        defer freeEvents(events);
+        try testing.expectEqual(@as(usize, 1), events.len);
+    }
+}
