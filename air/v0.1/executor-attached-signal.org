@@ -4,9 +4,11 @@
 
 * HOLD — do not implement
 
-*Demoted from ready on 2026-08-05.* The spec is complete; what is in doubt is whether it should be built at all.
+*Demoted from ready on 2026-08-05. The external consumer is now confirmed gone.* The spec is complete; what is absent is anyone who needs it.
 
 The case for this field was a *proxy*: a process that accepts a hook registration and forwards it to the store that owns the registry, and therefore cannot answer whether the thing it forwarded to will execute. The project that argued for it has since dropped the topology that made it a proxy, and is checking whether any proxy remains under its replacement. If registrations go directly to the owning daemon, nothing forwards and this field has no consumer.
+
+*And the state it would report is one we have since concluded is invalid.* Ever's own =store start= always constructs both the table and the daemon, so the CLI never enters this state; the only way in is a library caller that owns =hooks.json= without executing, which =multi-process-access.org= establishes is broken on both its read and write sides. A field reporting a configuration that should not exist is the weaker of two fixes — the stronger one is to make it unconstructible, so that =setHookTable= without an executor is refused rather than described. That would be a different change with a different argument, and it is the one worth writing if this comes back.
 
 Left as a document rather than deleted because the reasoning is sound and the decomposition in it is reusable. But =ready= is an instruction to implement, and implementing this now would build a field whose only known consumer is being removed. Restore to =ready= only when a consumer is confirmed — and note that a consumer inside Ever itself would be a *different* argument from the one written here, since a client talking straight to the store can already infer the answer from the connection it is holding.
 

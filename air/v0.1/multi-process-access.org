@@ -133,8 +133,10 @@ When idle: one =stat= per segment per read. When behind: a scan proportional to 
 
 The critical section is precisely: read =next_offset= → encode → write at =seg.size= → advance =next_offset= and =seg.size=. Today a process-local mutex spans it. Widen the same section to an OS-level lock so it spans processes.
 
-*** Why this is affordable
+*** Why this is affordable — and what that argument depends on
 The append path already pays an fsync per publish (=sync_on_append= defaults true), measured at roughly 42 ms and independent of payload size. Acquiring and releasing a file lock is microseconds. The lock is *noise* against a cost the design already accepts — which is what makes a cross-process critical section viable here without consensus, and why the 2–3 process target does not need anything cleverer.
+
+*This argument is conditional and should be re-checked, not inherited.* It holds only while =sync_on_append= remains a per-append fsync. If that cost is ever batched or group-committed — a reasonable thing to want — the lock stops being noise and becomes a real fraction of the append path, and Piece 2 needs re-costing rather than re-quoting. Recorded because a performance argument built on a cost that is currently present will always favour whichever design does not pay it, which is not the same as favouring the better design; the argument expires when the cost does.
 
 *** It depends on Piece 1
 After acquiring the cross-process lock, a writer's in-memory =next_offset= and =seg.size= may be stale, because another process appended while it was waiting. It must refresh from disk *inside* the lock before assigning an offset. That is Piece 1's machinery, so Piece 1 lands first. Piece 2 without Piece 1 would take a lock and then write at a stale position — the same corruption, now with a lock held.
