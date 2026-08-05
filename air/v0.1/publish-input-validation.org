@@ -131,3 +131,19 @@ The empty-value guard alone would close the reported exploit, since a tombstone 
 - 2026-08-05: Marked complete. Landed as three commits — the guard in =TopicManager.publish=, unit tests (including that the guard runs before the topic-state checks, and that internal marker writes are unaffected), and a restart regression asserting both that an injected tombstone cannot delete a topic across a rebuild and that a real =deleteTopic= still does. Verified independently of the tests: the injection is refused 400 on both the HTTP and TCP paths, nothing is appended, the topic survives a restart, and legitimate deletion is unaffected.
 
   Two notes for anyone reading this later. The implementer built a deliberately un-guarded copy of the tree first, to confirm the exploit still reproduced pre-fix — without that, a passing post-fix check cannot distinguish "the guard works" from "the exploit never ran". And the end-to-end test deliberately uses no sockets: the guard sits at a single choke point both edges call, so a rebuild-based test proves the regression while a server-based one only added the server-lifecycle problem now specified in =testable-server-lifecycle.org=.
+
+** Design Divergence
+
+*The end-to-end regression ships socket-free, and the spec pulled two ways on this.*
+
+Testing above asks for the injection "over both the TCP and HTTP paths", which reads as driving real sockets. Proposal > Guard placement argues the opposite: both wires funnel through =TopicManager.publish=, and that is precisely why no bypass mechanism was needed. Those cannot both be the reason. If one choke point serves both edges, exercising two sockets adds transport coverage and *no guard coverage*.
+
+What shipped: the guard cases and the ordering are unit-tested at the choke point, the =bad_request= mapping is asserted at each edge as a value rather than driven through a socket, and the regression that matters — injection attempted, nothing appended, topic still alive and writable after a rebuild, real =deleteTopic= still deleting across that same rebuild — runs with no listener at all.
+
+The first attempt did use live servers on 7995/8995 and *deadlocked*: =Server.run()= blocks in =accept()= and =shutdown()= never wakes it, so the test sat at 0% CPU holding both ports. That defect is real and is specced separately in =testable-server-lifecycle.org=; it is not a property of this change, and importing it into this test bought nothing.
+
+Two details worth keeping:
+
+- The reserved-key guard is tested with a *non-empty* value. Testing it only with an empty value would let the empty-value guard satisfy the assertion, and neither guard would be shown to work independently.
+- The HTTP handler's =value= field is non-optional, so =\{"key":"__ever_tombstone__"\}= with no value was already rejected as invalid JSON before this change. The injection always required the explicit empty string, which is how it is written in the reproduction above.
+
