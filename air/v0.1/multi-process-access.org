@@ -2,6 +2,14 @@
 #+state: draft
 #+FILETAGS: :store:core:
 
+* Status — read before planning against this
+
+*This is a draft. It has no owner and no date, and nothing here is scheduled.*
+
+Recorded prominently because a downstream project planned against it and recorded the dependency as "pending schedule" rather than "undecided". The reason is worth knowing: *a named upstream piece looks more solid than an unnamed gap*, so naming the work made it read as committed — which is backwards when the named thing is a draft nobody owns. An unwritten spec at least advertises its absence; a written one has to say so.
+
+Two of the three pieces below are well-defined enough to implement and one is not, and even that is conditional ordering rather than a plan. Treat any dependency on this document as blocked on a decision that has not been taken.
+
 * Summary
 Allow two or three processes to share one data directory safely — a shell running an embedded Ever, plus a UI or terminal attached to the same store. Three separable changes: refresh the in-memory index from disk so readers stop going stale, span the append critical section across processes so writers stop destroying each other, and make the library's concurrency guarantee explicit rather than accidental.
 
