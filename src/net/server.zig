@@ -184,6 +184,8 @@ pub const Server = struct {
         const offset = self.topic_manager.publish(req.topic, req.key, req.value) catch |err| return switch (err) {
             error.NotFound => sendError(self.allocator, fd, protocol.ErrorCode.not_found, "topic not found"),
             error.TopicDeleted => sendError(self.allocator, fd, protocol.ErrorCode.conflict, "topic is deleted"),
+            error.ReservedKey => sendError(self.allocator, fd, protocol.ErrorCode.bad_request, topic_mod.reserved_key_message),
+            error.EmptyValue => sendError(self.allocator, fd, protocol.ErrorCode.bad_request, topic_mod.empty_value_message),
             else => sendError(self.allocator, fd, protocol.ErrorCode.internal, "publish failed"),
         };
 

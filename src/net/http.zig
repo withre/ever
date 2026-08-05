@@ -274,6 +274,8 @@ pub const HttpServer = struct {
         const offset = self.topic_manager.publish(topic_name, parsed.value.key, parsed.value.value) catch |err| return switch (err) {
             error.NotFound => self.respondError(request, .not_found, "topic not found"),
             error.TopicDeleted => self.respondError(request, .conflict, "topic is deleted"),
+            error.ReservedKey => self.respondError(request, .bad_request, topic_mod.reserved_key_message),
+            error.EmptyValue => self.respondError(request, .bad_request, topic_mod.empty_value_message),
             else => self.respondError(request, .internal_server_error, "publish failed"),
         };
 

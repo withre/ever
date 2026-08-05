@@ -22,10 +22,48 @@ pub const TopicError = error{
     NotFound,
     InvalidName,
     TopicDeleted,
+    /// A client publish carried the reserved tombstone key. Distinct from
+    /// the topic-state errors above: this is an argument defect, and a
+    /// caller should be able to tell the two apart.
+    ReservedKey,
+    /// A client publish carried an empty value. Empty values mark the
+    /// store's own internal records and are skipped by every read path,
+    /// so accepting one would return an offset for an event no consumer
+    /// can ever see.
+    EmptyValue,
 };
 
 /// Sentinel key written to the log to mark a topic as soft-deleted.
+///
+/// Reserved against client publishes: `deleteTopic` writes this key with an
+/// empty value and `rebuildIndex` reads the pair back as "topic deleted", so
+/// a client able to write it could destroy any topic — invisibly, until the
+/// next restart. `validatePublishInput` is the guard; internal writers call
+/// `log.append` directly and are deliberately not subject to it.
 const deletion_marker_key = "__ever_tombstone__";
+
+/// Client-facing explanation for `TopicError.ReservedKey`. Lives here rather
+/// than at each protocol edge so the TCP and HTTP paths cannot drift apart.
+pub const reserved_key_message =
+    "\"" ++ deletion_marker_key ++ "\" is a reserved key and cannot be published";
+
+/// Client-facing explanation for `TopicError.EmptyValue`. Names the remedy,
+/// because the caller most likely to hit this is building a heartbeat or tick
+/// and reaching for the cheapest possible payload.
+pub const empty_value_message =
+    "empty values are reserved for internal markers and are not readable; " ++
+    "publish a non-empty payload (use \"{}\" if you need a contentless signal)";
+
+/// Reject a client publish that no client may make, whatever the topic's
+/// state. Pure and cheap, so `publish` runs it before taking the lock and
+/// before the topic checks: a publish that would be refused on its own terms
+/// should not first be told the topic does not exist.
+fn validatePublishInput(key: ?[]const u8, value: []const u8) TopicError!void {
+    if (key) |k| {
+        if (std.mem.eql(u8, k, deletion_marker_key)) return TopicError.ReservedKey;
+    }
+    if (value.len == 0) return TopicError.EmptyValue;
+}
 
 pub const Config = struct {
     max_segment_size: u64 = 64 * 1024 * 1024,
@@ -260,7 +298,14 @@ pub const TopicManager = struct {
 
     /// Publish an event to a topic. Returns the global offset.
     /// Returns TopicDeleted if the topic has been soft-deleted.
+    ///
+    /// This is the choke point for *client* publishes — both the TCP and the
+    /// HTTP handler funnel through here, while the store's own marker writes
+    /// (`createTopic`, `deleteTopic`) call `self.log.append` directly. So the
+    /// input guard belongs here and needs no bypass mechanism.
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
+        // Phase 0: reject inputs reserved for the store itself. Lock-free.
+        try validatePublishInput(key, value);
         // Phase 1: validate under lock
         {
             self.lock();
