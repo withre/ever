@@ -54,6 +54,8 @@ Stated explicitly because the failure mode is a later reader treating a bool nam
 ** Non-Goals
 - Reporting *why* no executor is attached. The three-valued distinction belongs to whichever component has the configuration; only the one bit it cannot derive needs to cross the wire.
 - Refusing registration when no executor is attached. A hook carries a cursor, so registering before an executor exists is meaningful — an executor attaching later fires the backlog. Refusal is correct only where an executor can *never* attach, which the store cannot know about its own future.
+
+  Note this is a statement about *this* store and not a general rule. A process that would have to *own* =hooks.json= in order to accept a registration should refuse, and for an unrelated reason: accepting is owning, and the file cannot have two owners (see =multi-process-access.org=). Same operation, opposite answers, because the questions differ — one is about an unknowable future, the other about a knowable ownership constraint. Recorded so a reader meeting only one half does not conclude the other is wrong.
 - Adding the field to =StatusResponse=. It would let a client ask *before* registering rather than learning after, which is a real improvement and a separate change.
 
 * Proposal
@@ -92,8 +94,20 @@ The =hook list= banner goes *above* the table, not in a column: it is a property
 
 * Design Details
 
-** Default-true is the compatible direction
+** Default-true is the compatible direction, and it makes the bit asymmetric
 A new client against an old server sees =executor_attached: true= by field default and behaves exactly as today. The alternative default would make every pre-existing server appear broken, which is a false alarm in the overwhelmingly common case where the CLI's own =store start= runs both the table and the daemon.
+
+The cost is that *=true= and "this server does not know" decode identically*. So the bit is not symmetric and consumers must not treat it as though it were:
+
+- =false= is *trustworthy*. Only a server that implements the field sends it, and it only sends it when no executor is attached.
+- =true= is *provisional*. It means "attached, or answered by something that does not know".
+
+Anything reporting this to a user must preserve that asymmetry rather than flattening it — confident about absence, hedged about presence. This is a constraint on the consumer, not a free hand, and it is easy to miss precisely because a boolean looks symmetric.
+
+*** The existing version byte cannot fix this
+The obvious remedy is to let a client distinguish "did not answer" from "answered true" by version. It does not work here. =PROTOCOL_VERSION= is written into every frame header, but decode is strict equality — a mismatched version is rejected as =UnsupportedVersion=. It is a *compatibility gate*, not a capability marker: bumping it does not advertise a new field, it stops the two ends talking at all.
+
+So the asymmetry is not resolvable with what exists today, and papering over it with a second field ("executor_attached_known") repeats the problem one level up. If Ever ever needs a client to tell answered-false from did-not-answer, the shape is a real capability or feature-set exchange, decided once and separately — not for this bit, which does not justify it, but that is the point at which it should be decided rather than the point at which a third optional field is added.
 
 ** The value is read, not cached
 Derive it per response from =hook_daemon=. It is a pointer check, and caching it would introduce a second thing that can be stale — in a document whose whole subject is stale derived state.
