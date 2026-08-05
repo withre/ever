@@ -1073,6 +1073,103 @@ test "TopicManager tip survives restart via rebuildIndex" {
     }
 }
 
+test "TopicManager publish rejects the reserved tombstone key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("victim");
+    const before = tm.log.nextOffset();
+
+    // The reported exploit: the exact pair `deleteTopic` writes.
+    try std.testing.expectError(TopicError.ReservedKey, tm.publish("victim", deletion_marker_key, ""));
+    // And with a non-empty value, so the reserved-key guard is shown to stand
+    // on its own rather than being masked by the empty-value guard.
+    try std.testing.expectError(TopicError.ReservedKey, tm.publish("victim", deletion_marker_key, "x"));
+
+    // Nothing was appended: a rejected publish must not reach the log.
+    try std.testing.expectEqual(before, tm.log.nextOffset());
+    try std.testing.expect(!tm.isTopicDeleted("victim"));
+
+    // The topic is still writable, and an ordinary key is untouched by the
+    // guard (confirming the check is on the reserved value, not on keys).
+    _ = try tm.publish("victim", "ordinary", "v");
+    try std.testing.expectEqual(before + 1, tm.log.nextOffset());
+}
+
+test "TopicManager publish rejects empty values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("t");
+    const before = tm.log.nextOffset();
+
+    try std.testing.expectError(TopicError.EmptyValue, tm.publish("t", null, ""));
+    try std.testing.expectError(TopicError.EmptyValue, tm.publish("t", "ordinary", ""));
+    try std.testing.expectEqual(before, tm.log.nextOffset());
+
+    // Regression: the normal case still works, including the contentless
+    // signal the error message points callers at.
+    _ = try tm.publish("t", null, "{}");
+    _ = try tm.publish("t", "k", "v");
+    try std.testing.expectEqual(before + 2, tm.log.nextOffset());
+
+    const events = try tm.fetch(std.testing.allocator, "t", 0, 10);
+    defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+}
+
+test "TopicManager publish guard runs before the topic-state checks" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // A malformed publish is rejected on its own terms rather than reporting
+    // NotFound for a topic the caller was never allowed to write that to.
+    try std.testing.expectError(TopicError.ReservedKey, tm.publish("no-such-topic", deletion_marker_key, "x"));
+    try std.testing.expectError(TopicError.EmptyValue, tm.publish("no-such-topic", null, ""));
+    // Control: without the reserved input, the same call does report NotFound,
+    // so the assertions above could have failed the other way.
+    try std.testing.expectError(TopicError.NotFound, tm.publish("no-such-topic", null, "v"));
+}
+
+test "internal marker writes are unaffected by the publish guard" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // createTopic and deleteTopic write exactly the key/value pairs the guard
+    // rejects, but call log.append directly. If the guard ever grew a path
+    // into them, the state below would not survive a rebuild.
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try tm.createTopic("gone");
+        try tm.createTopic("stays");
+        _ = try tm.publish("gone", null, "data");
+        try tm.deleteTopic("gone");
+    }
+    {
+        var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        // The creation marker still registers a topic with no events...
+        try std.testing.expect(tm.hasTopic("stays"));
+        try std.testing.expect(!tm.isTopicDeleted("stays"));
+        // ...and the tombstone still deletes, permanently.
+        try std.testing.expect(tm.hasTopic("gone"));
+        try std.testing.expect(tm.isTopicDeleted("gone"));
+        try std.testing.expectError(TopicError.TopicDeleted, tm.publish("gone", null, "nope"));
+        try std.testing.expectError(TopicError.AlreadyExists, tm.createTopic("gone"));
+    }
+}
+
 test "TopicManager listTopics shows deleted flag" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
