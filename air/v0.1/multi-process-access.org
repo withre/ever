@@ -72,6 +72,14 @@ There are two independent derived structures, each with its own rebuild loop, an
 
 The first two are already resumable walks that happen to start at zero; neither needs new traversal logic.
 
+*** The refresh must fold, not merely append — mandatory
+
+=rebuildIndex= does two things in one loop: it appends each offset to the topic's list, *and* it inspects the record's key for the deletion marker. An incremental refresh written as "append the new offsets" produces a correct-looking happy path and silently drops deletion handling — the process would pick up another's records and never notice that one of them deleted a topic.
+
+This is stated as a requirement rather than a note because it is the shape of bug that ships: the omission is invisible in every test that does not delete a topic from a second process.
+
+It also means tombstone invisibility stacks two independent mechanisms — invisible *by value*, since empty-valued records are skipped by every read path, and invisible *by staleness*, until this refresh folds them. Both must be defeated for a cross-process deletion to be observable at all.
+
 The third is a different shape and is easy to overlook because it is not part of "the index" — but it has the identical defect. =HookTable.load()= is called once from =init= and never again; =TimerTable= likewise. So *hook and timer registrations are as stale as the event index.* A hook registered by one process is invisible to an already-running daemon in another, and the =cursor= each side believes a hook holds diverges immediately. Any =shared= mode that does not refresh this layer supports reading each other's events but not each other's hooks.
 
 The consequence of missing the second layer is concrete: *tombstone detection lives in the =TopicManager= loop.* A =Log=-only refresh would pick up another process's new records but never notice that one of them deleted a topic, so this process would keep serving a topic the other has destroyed.
