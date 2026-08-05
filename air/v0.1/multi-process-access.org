@@ -80,7 +80,17 @@ This is stated as a requirement rather than a note because it is the shape of bu
 
 It also means tombstone invisibility stacks two independent mechanisms — invisible *by value*, since empty-valued records are skipped by every read path, and invisible *by staleness*, until this refresh folds them. Both must be defeated for a cross-process deletion to be observable at all.
 
-The third is a different shape and is easy to overlook because it is not part of "the index" — but it has the identical defect. =HookTable.load()= is called once from =init= and never again; =TimerTable= likewise. So *hook and timer registrations are as stale as the event index.* A hook registered by one process is invisible to an already-running daemon in another, and the =cursor= each side believes a hook holds diverges immediately. Any =shared= mode that does not refresh this layer supports reading each other's events but not each other's hooks.
+The third is a *different kind of problem*, and Piece 1's technique does not transfer to it.
+
+Layers 1 and 2 are staleness over an append-only structure. A resumable walk is a complete answer there precisely because nothing is ever overwritten — catching up can only add.
+
+=hooks.json= is a whole-file document. =saveLocked= serialises the entire in-memory hook list into one =HookFileJson= and rename-swaps it; =load()= reads the whole file, once, at =init=; and the surrounding lock is =std.atomic.Mutex=, which is process-local. The rename gives *atomicity without isolation*: a reader never sees a torn file, so the mechanism looks safe, but two processes each holding the document in memory and writing it back is *last-writer-wins over the whole registry*.
+
+So the failure here is a *lost update*, not a stale read. Process A registers a hook; process B saves its own older table over the top; A's hook is gone, with no error, no partial state, and nothing in the file indicating a write was discarded. Refreshing more often narrows the window and cannot close it, because the defect is concurrent writeback rather than out-of-date reading. The severity is already on record elsewhere in this project: a single malformed row takes the whole registry with it.
+
+*Therefore exactly one process may own =hooks.json=, and it must be the executor.* A registry has no meaning without the process that acts on it, and splitting ownership of a rewritable file across processes is strictly worse than the log problem Piece 1 solves — worse precisely because the log's append-only property is what makes Piece 1 tractable at all.
+
+This also disposes of a design that looks attractive: owning the table without an executor fails on *both* sides. Writes give a false receipt (registered, persisted, never fires) and reads answer from a startup snapshot, since =load()= never runs again. Refusing the hook opcodes outright is the honest alternative, and the refusal should name where the capability *does* live rather than merely reporting its absence.
 
 The consequence of missing the second layer is concrete: *tombstone detection lives in the =TopicManager= loop.* A =Log=-only refresh would pick up another process's new records but never notice that one of them deleted a topic, so this process would keep serving a topic the other has destroyed.
 
