@@ -173,6 +173,15 @@ Until Piece 1 lands, =ever start= against a directory that another process is wr
 ** What this deliberately does not attempt
 Fan-in with two or three writers is served by Piece 2. Genuine multi-writer scaling, ordering guarantees across processes beyond "offsets are unique and monotonic", and transactions are all out of scope. If the process count grows past a handful, the honest answer is that this design stops being appropriate rather than being tuned.
 
+* Parked
+
+** Reporting executor state to a forwarder
+If a process ever *accepts* hook registration without owning =hooks.json= — forwarding it to the daemon that does — that forwarder needs to distinguish *no executor configured* from *executor configured but unreachable*. The store cannot express that difference: a store-side boolean answers only "is an executor attached here", and only the forwarder knows one was meant to exist.
+
+So the state belongs to the forwarder, with any store-side signal as at most one input to it. Recorded because the idea was raised, withdrawn for a different design, and has a consumer that outlives the design it was withdrawn from — which is exactly the kind of thing that gets lost in conversation and re-derived later.
+
+This is only reachable *after* Piece 1. Before it, a hook registered against a store whose events no executor can see can never fire, so refusing registration is correct and there is nothing to forward.
+
 * Open Questions
 - Refresh trigger granularity: per read, or rate-limited? Measure the =stat= cost against the 100 ms poll the subscription path already performs before optimising.
 - Should =shared= mode also cover =HookTable= / =TimerTable=, or is single-daemon a permanent restriction?
