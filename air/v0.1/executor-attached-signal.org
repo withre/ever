@@ -1,6 +1,14 @@
 #+title: Report Whether a Hook Executor Is Attached
-#+state: ready
+#+state: draft
 #+FILETAGS: :protocol:subscriber:
+
+* HOLD — do not implement
+
+*Demoted from ready on 2026-08-05.* The spec is complete; what is in doubt is whether it should be built at all.
+
+The case for this field was a *proxy*: a process that accepts a hook registration and forwards it to the store that owns the registry, and therefore cannot answer whether the thing it forwarded to will execute. The project that argued for it has since dropped the topology that made it a proxy, and is checking whether any proxy remains under its replacement. If registrations go directly to the owning daemon, nothing forwards and this field has no consumer.
+
+Left as a document rather than deleted because the reasoning is sound and the decomposition in it is reusable. But =ready= is an instruction to implement, and implementing this now would build a field whose only known consumer is being removed. Restore to =ready= only when a consumer is confirmed — and note that a consumer inside Ever itself would be a *different* argument from the one written here, since a client talking straight to the store can already infer the answer from the connection it is holding.
 
 * Summary
 Add =executor_attached: bool= to =RegisterHookResponse= and =ListHooksResponse=. The store already knows the answer and never tells anyone, which makes a registered-but-never-firing hook indistinguishable from a working one.
