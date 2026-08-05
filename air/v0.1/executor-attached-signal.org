@@ -1,0 +1,93 @@
+#+title: Report Whether a Hook Executor Is Attached
+#+state: ready
+#+FILETAGS: :protocol:subscriber:
+
+* Summary
+Add =executor_attached: bool= to =RegisterHookResponse= and =ListHooksResponse=. The store already knows the answer and never tells anyone, which makes a registered-but-never-firing hook indistinguishable from a working one.
+
+* Motivation
+
+=Server= holds =hook_table= and =hook_daemon= as independent optionals and consults =hook_daemon= in three handlers, so "is an executor attached" is a question the store can answer today with no new state. It is not on the wire anywhere. =StatusResponse= carries =data_dir=, segment and event counts, topics, a hook list, =timer_count= and =uptime_ms= — hook *data*, but nothing about whether the daemon that would run them exists.
+
+A store can therefore accept a hook registration, persist it, list it back correctly, and never fire it, while every response it sends says things are fine. That is the shape this project has hit repeatedly: an operation that succeeds and a receipt that omits the condition under which it means anything.
+
+** Why a bit on the wire rather than a local check
+
+For a client talking straight to the store, this is a convenience — the user is already connected to the process that would execute, so the information was reachable in principle.
+
+It stops being a convenience the moment anything *proxies* registration. A process that accepts a hook and forwards it to the store that owns the registry can answer two questions from its own state:
+
+- *no executor configured* — from its own configuration
+- *executor configured but unreachable* — from the forward failing
+
+It cannot answer the third: *the forward succeeded, but does the thing I forwarded to actually execute?* A store holding a hook table without running the daemon is a legal configuration, so this is a real state and not a hypothetical. An intermediary cannot report a fact that never crosses the wire.
+
+That is the whole argument for the field: exactly one of the three states requires the store's cooperation, so exactly one bit needs to travel.
+
+** Where the signal matters most
+
+Registration-time reporting is the obvious half and the weaker one — a warning at registration is seen once and then gone.
+
+The durable half is =hook list=. That is what someone checks *later*, when they are already wondering why nothing fired, which is precisely the moment the current design reassures them that all their hooks are registered and healthy. Under a proxy topology, =hook list= is forwarded too, and without this field it is the one place the truthful answer cannot be produced at the moment of diagnosis.
+
+** Goals
+- =RegisterHookResponse= and =ListHooksResponse= carry =executor_attached=
+- The CLI surfaces it, prominently in =hook list=
+- No new state: the value is derived from the server's existing =hook_daemon= optional
+
+** Non-Goals
+- Reporting *why* no executor is attached. The three-valued distinction belongs to whichever component has the configuration; only the one bit it cannot derive needs to cross the wire.
+- Refusing registration when no executor is attached. A hook carries a cursor, so registering before an executor exists is meaningful — an executor attaching later fires the backlog. Refusal is correct only where an executor can *never* attach, which the store cannot know about its own future.
+- Adding the field to =StatusResponse=. It would let a client ask *before* registering rather than learning after, which is a real improvement and a separate change.
+
+* Proposal
+
+Two response types gain one field:
+
+#+begin_src zig
+pub const RegisterHookResponse = struct {
+    id: u64,
+    executor_attached: bool = true,
+};
+
+pub const ListHooksResponse = struct {
+    hooks: []const HookInfo,
+    executor_attached: bool = true,
+};
+#+end_src
+
+Both default =true= so an older server's response decodes against a newer client as "attached", which is the status quo for every deployment that has one. The store populates it from =self.hook_daemon != null=.
+
+** CLI presentation
+
+#+begin_src
+$ ever hook add deploy.trigger -- ./deploy.sh
+Hook #7 registered: deploy.trigger → ./deploy.sh
+warning: no executor is attached to this store — this hook will not fire
+
+$ ever hook list
+warning: no executor is attached to this store — none of these hooks are firing
+
+ID   NAME          Pattern           Command
+#7   deploy-prod   deploy.trigger    ./deploy.sh
+#+end_src
+
+The =hook list= banner goes *above* the table, not in a column: it is a property of the store, not of any row, and a user scanning for why nothing fired should meet it before the data that looks fine.
+
+* Design Details
+
+** Default-true is the compatible direction
+A new client against an old server sees =executor_attached: true= by field default and behaves exactly as today. The alternative default would make every pre-existing server appear broken, which is a false alarm in the overwhelmingly common case where the CLI's own =store start= runs both the table and the daemon.
+
+** The value is read, not cached
+Derive it per response from =hook_daemon=. It is a pointer check, and caching it would introduce a second thing that can be stale — in a document whose whole subject is stale derived state.
+
+* Testing
+- register a hook against a server with a daemon → =executor_attached= true, no warning
+- register against a server with a hook table and no daemon → true value is false, warning printed, *and the registration still succeeds*
+- =hook list= against a daemon-less server → banner above the table, hooks still listed
+- decoding a response that omits the field → defaults to true
+- the warning goes to stderr, the hook data to stdout, so piping =hook list= is unaffected
+
+* History
+- 2026-08-05: Drafted and promoted to ready. Proposed, then withdrawn when the design it was proposed for turned out to be broken on both its read and write sides, then re-argued by reverie for a proxy topology where the defect that justified the withdrawal is absent. Kept to one bit deliberately: the three-valued distinction is derivable by the proxy, and only the state it cannot derive needs the wire.
