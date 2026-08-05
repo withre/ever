@@ -61,7 +61,7 @@ Precedence is unambiguous and checked in this order:
 | =-=             | TTY          | Error: refuse to hang waiting on a terminal.         |
 | absent        | pipe or file | Read stdin to EOF, publish it.                       |
 | absent        | TTY          | Error: usage — no payload given.                     |
-| =-= or absent   | empty stream | Error: refuse to publish an unreadable empty event.  |
+| =-= or absent   | empty payload | Error: refuse to publish an unreadable empty event. |
 
 The TTY cases are the important ones. If DATA is absent and stdin is a terminal, the naive implementation blocks forever on a =read= the user did not know they had requested, looking like a hang. Detect it and fail fast with a message naming both remedies.
 
@@ -104,7 +104,9 @@ Read incrementally with a cap equal to the protocol's maximum message size (16 M
 
 ** Empty input is an error
 
-Empty stdin (immediate EOF) must *error*, not publish.
+Empty stdin must *error*, not publish.
+
+*Emptiness is evaluated after the trailing-newline strip, not on the raw stream.* This is the operative definition and the table above means it in that sense. =printf '\n' | ever pub t= is a one-byte stream — not empty on the wire — that becomes an empty payload once the newline is removed. Checking the raw stream would let it through, strip it to nothing, and publish exactly the invisible event this rule exists to prevent. The rule is about what gets published, so it must be applied to what gets published. Consequently =echo '' | ever pub t= errors.
 
 The reason is not the obvious one. An empty value is not merely a degenerate payload in Ever — it is how the store marks its own internal events. =TopicManager= writes empty-valued records as topic-creation markers and deletion tombstones, and every read path filters them out: =topic.zig= skips =event.value.len == 0= in fetch, pattern-fetch, and scan, each commented "Skip marker events (creation markers and tombstones)".
 
