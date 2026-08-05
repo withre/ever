@@ -96,6 +96,14 @@ Secondary, and worth its own look: =updateCursor= discards the result of that wr
 
 *Therefore exactly one process may own =hooks.json=, and it must be the executor.* A registry has no meaning without the process that acts on it, and splitting ownership of a rewritable file across processes is strictly worse than the log problem Piece 1 solves — worse precisely because the log's append-only property is what makes Piece 1 tractable at all.
 
+*** Constructing a =HookTable= is the ownership claim
+
+The rule above is only useful if it is checkable, and it is: =HookTable.init= calls =load()=, and every mutation — registration, removal, and every cursor advance — goes through =saveLocked=, which rewrites the whole document. There is no read-only construction. *So constructing a =HookTable= is not reading the registry; it is claiming the right to rewrite it.*
+
+That makes the single-owner rule actionable rather than aspirational: a process that does not own =hooks.json= must not construct one. And because =Server.handleRegisterHook= requires =hook_table= to be set, *accepting the hook opcodes through ever's own =Server= is itself an ownership claim* — there is no configuration in which a process serves those opcodes without owning the file.
+
+The consequence for anything that wants to relay registration elsewhere: it cannot do so through ever's =Server=. A relay that forwards the opcode and returns the owner's response owns nothing and is safe; a process that accepts the opcode locally in order to forward it has already become a second owner, which is the failure it was trying to avoid. The distinction is invisible at the level of "we forward registrations" and it is the entire safety property.
+
 This also disposes of a design that looks attractive: owning the table without an executor fails on *both* sides. Writes give a false receipt (registered, persisted, never fires) and reads answer from a startup snapshot, since =load()= never runs again. Refusing the hook opcodes outright is the honest alternative, and the refusal should name where the capability *does* live rather than merely reporting its absence.
 
 The consequence of missing the second layer is concrete: *tombstone detection lives in the =TopicManager= loop.* A =Log=-only refresh would pick up another process's new records but never notice that one of them deleted a topic, so this process would keep serving a topic the other has destroyed.
