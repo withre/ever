@@ -1,0 +1,130 @@
+#+title: Reject Reserved Keys and Empty Values from Client Publishes
+#+state: ready
+#+FILETAGS: :store:protocol:
+
+* Summary
+Validate client publishes at =TopicManager.publish=: reject the reserved tombstone key, and reject empty values. Today any process that can reach a served store can permanently destroy any topic with a single =curl=, and the destruction is invisible until the next restart.
+
+* Motivation
+
+** The vulnerability, confirmed by live reproduction
+
+=deleteTopic= records a deletion by appending a marker event with the reserved key =__ever_tombstone__= and an empty value. =rebuildIndex= reads that pair back on startup and puts the topic into =deleted_topics=. Nothing anywhere validates that a *client* may not write that same pair itself.
+
+The path is unguarded end to end:
+
+- =PublishRequest.key= is =?[]const u8 = null= (=message.zig=). The null is a *default*, not an enforcement — the wire accepts any key.
+- =handlePublish= passes =req.key= straight through to =topic_manager.publish= (=server.zig=). The HTTP handler does the same with =parsed.value.key= (=http.zig=).
+- =TopicManager.publish= validates only that the topic exists and is not already deleted, then appends whatever key it was handed.
+- =deletion_marker_key= has exactly three sites in =topic.zig=: the constant, =deleteTopic= writing it, =rebuildIndex= reading it. *There is no validation site.*
+
+Reproduced live against a throwaway store:
+
+#+begin_src bash
+curl -X POST http://127.0.0.1:8999/topics/victim/events \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"__ever_tombstone__","value":""}'
+# -> {"offset":2}     accepted, success, offset returned
+#    invisible to every reader (sub shows offsets 1 and 3 only)
+#    topic keeps working normally afterwards
+
+# ... restart the store ...
+
+# -> ever pub victim '{}'      error: topic is deleted
+# -> ever topic create victim  error: topic already exists
+# -> ever topic list           victim (deleted)
+#    prior data still readable; the topic is permanently unusable
+#+end_src
+
+** Why this is worse than the =delete_topic= hazard
+
+- *No destructive opcode is involved.* Capability gating scoped to =delete_topic= would not catch it, because the deletion path is =publish=.
+- *It is latent.* Nothing observable happens until a restart, so the damage and its cause are separated in time and an operator has no reason to connect them.
+- *It is permanent.* =createTopic= then returns =AlreadyExists= and =publish= returns =TopicDeleted= for the life of the data directory.
+- *The precondition is already met.* The dispatch switch gates nothing; any process that can connect gets =publish=.
+
+** The second defect: empty values are invisible
+
+Separately, empty-valued events are how the store marks its own internal records, and every read path filters them (=topic.zig= skips =value.len == 0= in fetch, pattern-fetch and scan). A client publishing an empty value is therefore assigned an offset, told it succeeded, and written durably — and then skipped by every consumer. A black hole with a success receipt.
+
+The consequence generalises: *an empty value cannot serve as a signal anywhere in Ever* — not a heartbeat, tick, or presence marker — even though a zero-byte payload is the natural and cheapest encoding for exactly those. See =pub-stdin.org=, which handles this at the CLI layer for the stdin path and explicitly defers the store-level decision to this document.
+
+** Goals
+- =TopicManager.publish= rejects a client publish whose key equals the reserved tombstone key
+- =TopicManager.publish= rejects a client publish with an empty value
+- Both the TCP and HTTP publish paths are covered by the same guard
+- Internal marker writes (topic creation, topic deletion) are unaffected
+- The rejection is a clear client error, not a silent drop
+
+** Non-Goals
+- Authentication, authorisation, or capability gating on the dispatch switch. That is the broader trust-boundary problem and wants its own document; this change is a specific input-validation fix that is worth having regardless of how gating lands.
+- Making =delete_topic= reversible or non-permanent.
+- Making empty-valued events visible to readers. The filtering is deliberate; the fix is to stop clients from creating them.
+- Reserving a general key namespace (e.g. all =__ever_*= keys). Tempting, but it would break any existing client using such a key and there is exactly one reserved key today. Revisit if a second appears.
+
+* Proposal
+
+** Guard placement
+
+Both client paths funnel through =TopicManager.publish=, and both internal marker writes call =self.log.append= directly, bypassing it:
+
+| Caller                      | Path                              | Guarded? |
+|-----------------------------+-----------------------------------+----------|
+| TCP =handlePublish=         | → =topic_manager.publish=         | yes      |
+| HTTP publish handler        | → =topic_manager.publish=         | yes      |
+| =createTopic= marker        | → =log.append(name, null, "")=    | no       |
+| =deleteTopic= tombstone     | → =log.append(name, key, "")=     | no       |
+
+So the choke point is already positioned correctly and *no bypass mechanism needs to be built*. A guard added to =publish= covers every client path and touches no internal path. This is the main reason the fix is small.
+
+** Behaviour
+
+#+begin_src
+$ curl -X POST .../topics/t/events -d '{"key":"__ever_tombstone__","value":"x"}'
+error: "__ever_tombstone__" is a reserved key and cannot be published
+
+$ curl -X POST .../topics/t/events -d '{"value":""}'
+error: empty values are reserved for internal markers and are not readable;
+       publish a non-empty payload (use "{}" if you need a contentless signal)
+#+end_src
+
+Both are client errors (=bad_request=, 400). The publish is refused; nothing is appended.
+
+The empty-value message names the remedy explicitly, because the caller most likely to hit it is someone building a heartbeat or tick and reaching for the cheapest possible payload — exactly the case that would otherwise fail silently.
+
+* Design Details
+
+** Ordering
+
+Validate *before* the existing topic checks, so a malformed publish is rejected on its own terms rather than reporting =NotFound= for a topic the caller was never allowed to write that key to. Validation is pure and cheap; do it before taking the lock.
+
+** Error type
+
+Add distinct =TopicError= variants rather than reusing an existing one. =NotFound= and =TopicDeleted= already describe topic state; a rejected key or empty value is an argument defect and a caller should be able to distinguish them. Map both to =bad_request= at the protocol edge.
+
+** Why reject empty values rather than accept and filter
+
+Accepting them is the status quo and it is what makes the tombstone injection silent. But the stronger reason is independent of security: an accepted-then-filtered event is indistinguishable, from the publisher's side, from a successful one. The store returns an offset. Any client-side assertion that "the publish worked" passes. There is no signal at any stage, and the log is append-only, so the mistake can neither be observed nor undone.
+
+Rejecting is also strictly compatible: because empty-valued events are already invisible to every reader, no consumer can be depending on one arriving.
+
+** Relationship to the tombstone guard
+
+The empty-value guard alone would close the reported exploit, since a tombstone requires both the reserved key *and* an empty value. Both are specified anyway:
+
+- They fix different defects — one is a trust-boundary bug, the other a silent-success bug — and either could be relaxed later for reasons that do not apply to the other.
+- Defence in depth is cheap here. If a future change makes empty values legal again (say, an explicit opt-in for contentless signals), the reserved-key guard must not silently disappear with it.
+
+* Testing
+- publish with key =__ever_tombstone__= and a non-empty value → rejected, nothing appended
+- publish with key =__ever_tombstone__= and an empty value → rejected, nothing appended
+- publish with an empty value and a null key → rejected
+- publish with an empty value and an ordinary key → rejected
+- publish with an ordinary key and non-empty value → still succeeds (regression)
+- =createTopic= still writes its creation marker and the topic survives a rebuild (internal path unaffected)
+- =deleteTopic= still writes its tombstone and the topic is still deleted after a rebuild (internal path unaffected)
+- *end-to-end regression for the reported exploit*: create a topic, attempt the injection over HTTP, restart the store, assert the topic is still alive and writable
+- the same attempt over the TCP path, since both must be covered by the one guard
+
+* History
+- 2026-08-05: Drafted and promoted to ready. Reported by reverie from committed-source reading; confirmed here by live reproduction on an isolated store (accepted, invisible, then permanently deleted at restart). The live fleet store was checked by simulating a restart on a copy of its data directory — it reports the same four deleted topics as the running store, so no tombstone has been planted there.
