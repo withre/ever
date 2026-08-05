@@ -35,6 +35,22 @@ The durable half is =hook list=. That is what someone checks *later*, when they 
 - The CLI surfaces it, prominently in =hook list=
 - No new state: the value is derived from the server's existing =hook_daemon= optional
 
+** This field is one input to an answer, not the answer
+
+Read in isolation, =executor_attached= looks like it reports whether hooks will run. It does not. It reports one fact about *this* store: whether a daemon is attached to the process answering the request.
+
+Anything that *forwards* registration elsewhere — and therefore has to tell a user whether their hook will fire — needs a three-state answer, and this bit is only one of its inputs:
+
+| Question                                | Answered by                          |
+|-----------------------------------------+--------------------------------------|
+| Is an executor meant to exist?          | the forwarder's own configuration    |
+| Is it reachable?                         | the forward succeeding or failing    |
+| Will the thing I reached actually run it? | *this field, and nothing else*      |
+
+The store cannot answer the first — it has no idea a forwarder exists or what it was configured with. It cannot answer the second, since a reachability question is answered by the attempt. It can answer the third, and it is the only component that can.
+
+Stated explicitly because the failure mode is a later reader treating a bool named =executor_attached= as a complete answer to "will my hook fire", wiring it straight through to a user, and reporting *no executor* when the truthful answer was *no executor configured on this relay*. The field is deliberately named for what it observes rather than for what a caller wants to conclude.
+
 ** Non-Goals
 - Reporting *why* no executor is attached. The three-valued distinction belongs to whichever component has the configuration; only the one bit it cannot derive needs to cross the wire.
 - Refusing registration when no executor is attached. A hook carries a cursor, so registering before an executor exists is meaningful — an executor attaching later fires the backlog. Refusal is correct only where an executor can *never* attach, which the store cannot know about its own future.
