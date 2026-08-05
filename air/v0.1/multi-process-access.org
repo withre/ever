@@ -68,8 +68,11 @@ There are two independent derived structures, each with its own rebuild loop, an
 |----------------+---------------------------------------------+--------------------------------------------------+----------------------------|
 | =Log=          | per-segment byte positions, =next_offset=   | =buildPositionIndex= — =while (pos < seg.size)=   | last indexed byte position |
 | =TopicManager= | topic → offsets, =non_marker_count=, deletions | =rebuildIndex= — walks =0..log.nextOffset()=      | last folded global offset  |
+| =HookTable= / =TimerTable= | registrations and cursors       | =load()= — reads the whole json                  | (re-read; not a walk)      |
 
-Both are already resumable walks that happen to start at zero; neither needs new traversal logic.
+The first two are already resumable walks that happen to start at zero; neither needs new traversal logic.
+
+The third is a different shape and is easy to overlook because it is not part of "the index" — but it has the identical defect. =HookTable.load()= is called once from =init= and never again; =TimerTable= likewise. So *hook and timer registrations are as stale as the event index.* A hook registered by one process is invisible to an already-running daemon in another, and the =cursor= each side believes a hook holds diverges immediately. Any =shared= mode that does not refresh this layer supports reading each other's events but not each other's hooks.
 
 The consequence of missing the second layer is concrete: *tombstone detection lives in the =TopicManager= loop.* A =Log=-only refresh would pick up another process's new records but never notice that one of them deleted a topic, so this process would keep serving a topic the other has destroyed.
 
