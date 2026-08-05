@@ -159,4 +159,4 @@ Unchanged. Connection/server errors still print to stderr and exit non-zero. In 
 - Consider a project-wide =src/json.zig= writer if more commands need structured output
 
 * History
-- 2026-06-25: Drafted. Specifies --json for hook list, timer list, topic list, and hook ps. Awaiting review before moving to ready.
+- 2026-08-05: Drafted. Specifies --json for hook list, timer list, topic list, and hook ps. Awaiting review before moving to ready.
