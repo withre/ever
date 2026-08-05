@@ -1,0 +1,135 @@
+#+title: Read Publish Payload from Stdin
+#+state: ready
+#+FILETAGS: :cli:publisher:
+
+* Summary
+Let =ever pub= take its payload on stdin — =ever pub <topic>= with no DATA argument, or the conventional =ever pub <topic> -= — instead of requiring the payload as an argv positional. The wire already carries an arbitrary byte string, so this is a CLI-layer change only.
+
+* Motivation
+Ever's consumer side is already stdin-shaped. =air/v0.1/stdin-pipe.org= (state =complete=) specified stdin delivery for hooks and triggers, and every hook script in this stack opens with =EVENT=$(cat)=. The producer side was never brought along: =main.zig= declares =data= as =.required = true= and =handlePub= reads =ctx.arg("data")= with no stdin path.
+
+The result is that every producer has to get a payload through the shell. That works until it doesn't:
+
+- *Quoting hazards.* Publishing JSON from a shell means nesting quotes inside quotes. Payloads containing single quotes, backslashes, or newlines require escaping that is easy to get subtly wrong — and a mangled payload is only discovered by whatever consumes the event later.
+- *=ARG_MAX=.* Multi-KB payloads pushed through argv approach the argument-length limit. The failure is abrupt and the error message does not point at payload size.
+- *No piping.* The natural shape — =generate | ever pub topic= — is simply unavailable, so callers resort to =$(cat <<EOF ...)= heredoc gymnastics.
+
+This was requested by the reverie project, which has been publishing multi-KB agent briefs via heredocs and hit all three. The asymmetry is the argument: making the producer match the consumer removes a whole class of shell-escaping bugs from anything that publishes structured payloads.
+
+** Goals
+- =ever pub <topic>= with no DATA reads the payload from stdin until EOF
+- =ever pub <topic> -= does the same, explicitly
+- =ever pub <topic> <data>= keeps working unchanged
+- A clear error when no DATA is given and stdin is an interactive terminal, rather than silently hanging
+- A clear error when the payload exceeds the wire limit, rather than truncating
+- A clear error when stdin is empty, rather than publishing an event no consumer can read
+
+** Non-Goals
+- Reading the *topic* from stdin — the topic stays an argv positional
+- Multi-event framing (one event per input line, NDJSON-style batch publish). One invocation publishes exactly one event. Batch publish is separate future work and would need its own flag, since it changes how the input is interpreted.
+- Payload validation. =ever pub= does not parse or verify JSON today and should not start; the store carries opaque bytes.
+- Changing the wire protocol. The bytes travel identically whichever way the CLI obtained them.
+
+* Proposal
+
+** Usage
+
+#+begin_src bash
+# Existing form — unchanged
+ever pub agent.tasks '{"task":"build"}'
+
+# New: implicit stdin when DATA is absent
+echo '{"task":"build"}' | ever pub agent.tasks
+
+# New: explicit stdin, conventional dash
+generate-payload | ever pub agent.tasks -
+
+# The shape that motivated this
+ever pub agent.brief - <<'EOF'
+{"brief":"…multi-KB payload with 'quotes' and \backslashes…"}
+EOF
+#+end_src
+
+** Resolution rules
+
+Precedence is unambiguous and checked in this order:
+
+| DATA argument | stdin        | Behaviour                                            |
+|---------------+--------------+------------------------------------------------------|
+| present, not =-= | (ignored)    | Publish the argument. Existing behaviour, unchanged. |
+| =-=             | pipe or file | Read stdin to EOF, publish it.                       |
+| =-=             | TTY          | Error: refuse to hang waiting on a terminal.         |
+| absent        | pipe or file | Read stdin to EOF, publish it.                       |
+| absent        | TTY          | Error: usage — no payload given.                     |
+| =-= or absent   | empty stream | Error: refuse to publish an unreadable empty event.  |
+
+The TTY cases are the important ones. If DATA is absent and stdin is a terminal, the naive implementation blocks forever on a =read= the user did not know they had requested, looking like a hang. Detect it and fail fast with a message naming both remedies.
+
+** Error messages
+
+#+begin_src
+$ ever pub agent.tasks
+error: no payload given. Pass it as an argument, or pipe it on stdin:
+         ever pub agent.tasks '{"key":"value"}'
+         echo '{"key":"value"}' | ever pub agent.tasks
+
+$ huge-file | ever pub agent.tasks
+error: payload is 21.3 MB, which exceeds the 16 MB maximum message size
+#+end_src
+
+* Design Details
+
+** Where the change lives
+
+=src/main.zig= only:
+
+1. The =pub= command definition currently declares =.{ .name = "data", .required = true, … }=. Make it =.required = false=.
+2. =handlePub= gains the resolution above before it connects to the store. Read stdin *first*, so a payload error costs nothing and the store never sees a connection that is about to be abandoned.
+
+No change to =src/net/client.zig=, the protocol, or the store.
+
+** Trailing newline
+
+Strip *exactly one* trailing newline from stdin input, if present.
+
+The rationale is that the dominant producer is =echo= and heredocs, both of which append a newline the caller did not intend as payload. Without stripping, =echo '{}' | ever pub t= publishes =}\n= where the argv form publishes =}=, so the two spellings of "the same" command produce different bytes in the log — a difference that would surface much later in a consumer doing an exact comparison.
+
+Why not preserve bytes exactly: it is the more principled default, and it is what a =--raw= flag should later restore. But it makes the common case wrong by default, and the asymmetry between the argv and stdin forms is a worse trap than the lost newline. Strip one and only one — never strip more, never strip other whitespace, so a payload that deliberately ends in blank lines keeps all but the last.
+
+This applies only to the stdin path. The argv path is untouched — which is also the escape hatch: a caller who genuinely wants a payload ending in a newline passes it as an argument, where bytes are preserved exactly. The asymmetry is deliberate, not an oversight, and that is precisely why it is safe to strip on the stdin side.
+
+** Size limit
+
+Read incrementally with a cap equal to the protocol's maximum message size (16 MB, per =air/v0.1/wire-protocol.org=). On exceeding it, error with the actual size and the limit — do not truncate and do not publish a partial payload. Truncation would put a silently-corrupt event in an append-only log, which is unrecoverable.
+
+** Empty input is an error
+
+Empty stdin (immediate EOF) must *error*, not publish.
+
+The reason is not the obvious one. An empty value is not merely a degenerate payload in Ever — it is how the store marks its own internal events. =TopicManager= writes empty-valued records as topic-creation markers and deletion tombstones, and every read path filters them out: =topic.zig= skips =event.value.len == 0= in fetch, pattern-fetch, and scan, each commented "Skip marker events (creation markers and tombstones)".
+
+So an empty publish does not produce a visible-but-empty event. It produces an event that is assigned an offset, reported to the publisher as a success, written durably to the log — and then silently skipped by every consumer. It is a black hole with a success receipt.
+
+That is intolerable specifically on the stdin path. With the argv form, publishing nothing is something you visibly typed. With stdin, it is something an upstream command did to you: a generator that failed and exited 0, a heredoc that expanded to nothing, a =< /dev/null= left in a script. The failure is silent at *every* stage — the producer succeeds, the store succeeds, the consumer sees nothing — and the log offers no evidence it happened.
+
+Why not publish it anyway and let consumers deal: they cannot. The filtering is in the store's read paths, not in any consumer's control, and the log is append-only, so a mistakenly-published empty event can be neither seen nor removed.
+
+Note this does *not* make the event a topic tombstone. A tombstone requires the reserved key =__ever_tombstone__= *and* an empty value (=topic.zig=), and =ever pub= always publishes with a null key (=main.zig=). Accidental topic deletion is not the hazard here; silent invisibility is.
+
+The argv form's own empty case (=ever pub t ''=) has the same invisibility problem and is *not* changed by this document — it is pre-existing behaviour on a path this spec leaves alone. It deserves its own decision; flagging it rather than smuggling a behaviour change in here.
+
+* Testing
+- =ever pub t '{"a":1}'= — argv form still publishes exactly those bytes (regression)
+- =echo '{"a":1}' | ever pub t= — publishes the same bytes as the argv form, newline stripped
+- =printf '{"a":1}' | ever pub t= — no trailing newline, published unchanged
+- =printf 'a\n\n\n' | ever pub t= — only the final newline is stripped
+- =ever pub t -= with piped input — explicit dash reads stdin
+- =ever pub t 'literal-dash-is-data'= — a DATA argument that is not =-= is never treated as stdin
+- =ever pub t= with stdin a TTY — errors, does not hang (drive with a pty or assert the isatty branch)
+- payload larger than the wire maximum — errors naming the size, publishes nothing
+- empty stdin (=< /dev/null=) — errors, publishes nothing, non-zero exit
+- round-trip: publish a payload containing single quotes, double quotes, backslashes and embedded newlines via stdin; =ever sub= returns it byte-identical
+
+* History
+- 2026-08-05: Drafted and promoted to ready. Requested by reverie with evidence from production use (quoting hazards, ARG_MAX, no piping) — see the Motivation section.
+- 2026-08-05: Amended before implementation completed. Empty stdin now errors instead of publishing an empty payload. Raised by reverie on the theory that an empty value is a deletion tombstone; re-derived at this tip, that specific mechanism does not apply (a tombstone needs the reserved key, and =ever pub= sends a null key), but the underlying concern is correct and the real defect is worse — empty-valued events are filtered from every read path, so the publish succeeds and is then invisible to all consumers. Also recorded the argv form as the deliberate escape hatch for the trailing-newline asymmetry.
