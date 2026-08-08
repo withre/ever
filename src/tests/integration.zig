@@ -1497,3 +1497,127 @@ test "integration: every opcode byte is answered, not fatal" {
     thread.join();
     server.shutdown();
 }
+
+// ── Fetch seeks to its cursor (air/v0.1/subscribe-fetch-seek.org) ───────────
+//
+// `fetch`/`fetchPattern` take a topic-local skip count over *non-marker*
+// events while the index stores *records*, so seeking to the cursor requires
+// knowing where the markers are. The risk of getting that translation wrong
+// is returning the wrong events, which is worse than being slow — hence a
+// differential test against a reference implementation over a deliberately
+// awkward marker layout, before any assertion about cost.
+
+/// Reference: every non-marker value of `topic`, in order, read the slow way.
+fn referenceNonMarkerValues(tm: *TopicManager, topic: []const u8) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |v| allocator.free(v);
+        out.deinit(allocator);
+    }
+    var offset: u64 = 0;
+    while (offset < tm.log.nextOffset()) : (offset += 1) {
+        const evt = (try tm.log.read(allocator, offset)) orelse continue;
+        defer store.freeEvent(allocator, evt);
+        if (evt.value.len == 0) continue;
+        if (!std.mem.eql(u8, evt.topic, topic)) continue;
+        try out.append(allocator, try allocator.dupe(u8, evt.value));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "integration: fetch seeks past markers and agrees with a full scan" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Build an awkward layout in the log directly, then let `rebuildIndex`
+    // construct the index from it on reopen. Markers leading, interior,
+    // adjacent, and trailing — the shapes a seek can get wrong.
+    {
+        var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+        defer tm.deinit();
+        try tm.createTopic("seek.topic"); // record 0: creation marker
+        _ = try tm.log.append("seek.topic", null, "a"); // 1
+        _ = try tm.log.append("seek.topic", null, ""); // 2  marker
+        _ = try tm.log.append("seek.topic", null, "b"); // 3
+        _ = try tm.log.append("seek.topic", null, ""); // 4  marker
+        _ = try tm.log.append("seek.topic", null, ""); // 5  marker, adjacent
+        _ = try tm.log.append("seek.topic", null, "c"); // 6
+        _ = try tm.log.append("seek.topic", null, "d"); // 7
+        _ = try tm.log.append("seek.topic", null, ""); // 8  trailing marker
+    }
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const expected = try referenceNonMarkerValues(&tm, "seek.topic");
+    defer {
+        for (expected) |v| allocator.free(v);
+        allocator.free(expected);
+    }
+    try testing.expectEqual(@as(usize, 4), expected.len);
+
+    // Every start position, including one past the end, against both an
+    // exact-topic fetch and a pattern fetch.
+    var start: u64 = 0;
+    while (start <= expected.len + 1) : (start += 1) {
+        for ([_]u32{ 1, 2, 100 }) |max_count| {
+            const want_len = @min(
+                @as(u64, max_count),
+                if (start >= expected.len) 0 else expected.len - start,
+            );
+
+            const got = try tm.fetch(allocator, "seek.topic", start, max_count);
+            defer freeEvents(got);
+            try testing.expectEqual(want_len, got.len);
+            for (got, 0..) |evt, i| try testing.expectEqualStrings(expected[@intCast(start + i)], evt.value);
+
+            const got_pat = try tm.fetchPattern(allocator, "seek.", start, max_count);
+            defer freeEvents(got_pat);
+            try testing.expectEqual(want_len, got_pat.len);
+            for (got_pat, 0..) |evt, i| try testing.expectEqualStrings(expected[@intCast(start + i)], evt.value);
+        }
+    }
+}
+
+test "integration: fetch at the tail does not re-read the topic" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("cost.topic");
+    const n: u64 = 2000;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) _ = try tm.publish("cost.topic", null, "x");
+
+    // The subscriber's steady state: parked at the tail, nothing to deliver.
+    // Before the seek this read all 2000 records off disk to discard them.
+    ever.store.Log.test_read_count = 0;
+    {
+        const events = try tm.fetch(allocator, "cost.topic", n, 10);
+        defer freeEvents(events);
+        try testing.expectEqual(@as(usize, 0), events.len);
+    }
+    const tail_reads = ever.store.Log.test_read_count;
+    try testing.expect(tail_reads <= 8);
+
+    // And one event behind the tail costs one read, not n.
+    ever.store.Log.test_read_count = 0;
+    {
+        const events = try tm.fetch(allocator, "cost.topic", n - 1, 10);
+        defer freeEvents(events);
+        try testing.expectEqual(@as(usize, 1), events.len);
+    }
+    try testing.expect(ever.store.Log.test_read_count <= 8);
+
+    // A full read still reads everything — the seek must not have turned
+    // into "skip some events".
+    ever.store.Log.test_read_count = 0;
+    {
+        const events = try tm.fetch(allocator, "cost.topic", 0, @intCast(n));
+        defer freeEvents(events);
+        try testing.expectEqual(@as(usize, n), events.len);
+    }
+    try testing.expect(ever.store.Log.test_read_count >= n);
+}

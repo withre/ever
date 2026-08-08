@@ -1,0 +1,157 @@
+#+title: Fetch Must Seek to the Cursor, Not Re-read the Topic
+#+state: complete
+#+FILETAGS: :store:subscriber:performance:bug:
+
+* Summary
+=TopicManager.fetch= and =fetchPattern= honour their topic-local skip count by reading every event from offset 0 off disk and throwing it away. One idle subscriber sitting at the tail of a 13,731-event topic costs *66% of a CPU core* delivering nothing, and the cost grows with the topic. =fetchAfterOffset=, added later for =--after-offset=, already does the right thing: binary-search the offset index and read forward. Give the other two the same treatment.
+
+* Motivation
+
+** Measured
+
+Store built from this tree, port 47620, one topic with 13,731 events, subscribers blocked at the tail receiving nothing:
+
+| Fetch shape                                | Idle subscribers | Server CPU        |
+|--------------------------------------------+------------------+-------------------|
+| exact topic, =offset= = tail (skip count)  |                1 | *66% of a core*   |
+| exact topic, =offset= = tail (skip count)  |                4 | *279% of a core*  |
+| exact topic, =after_offset= = tail         |                1 | 0.00%             |
+| exact topic, =after_offset= = tail         |                4 | 0.08%             |
+| pattern =perf.=, =offset= = tail           |                1 | *66% of a core*   |
+| pattern =perf.=, =after_offset= = tail     |                1 | 0.00%             |
+| exact topic, empty topic (control)         |                1 | 0.33%             |
+
+The empty-topic control isolates the poll loop's own overhead. Everything above it is the scan.
+
+** It is also returning the wrong events
+
+Found by writing the differential test *before* the fix, which is the only reason it was found at all. The skip loop is:
+
+#+begin_src zig
+if (event.value.len == 0) {
+    if (skipped < start) skipped += 1;      // <-- stops counting markers at `start`
+    store.freeEvent(allocator, event);
+    continue;
+}
+if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
+#+end_src
+
+=skipped= is meant to be "markers seen so far", so that =i - skipped= is the non-marker index. But it stops incrementing once it reaches =start=. On a topic whose markers are interleaved with events, the later markers are never counted, =i - skipped= runs ahead of the true non-marker index, and *the fetch returns events the caller asked to skip*.
+
+Demonstrated on a topic whose records are marker, =a=, marker, =b=, marker, marker, =c=, =d=, marker: =fetch(start = 3)= should return =d= and returns =c, d=. A subscriber that says "I have seen three events" is handed the third one again.
+
+How reachable is it? Markers are the creation marker at record 0, tombstones at deletion (after which the topic takes no more publishes), and — historically — user publishes with an empty value. So a *fresh* topic has exactly one marker, =skipped= saturates at 1 correctly, and the bug is invisible. It needs two or more markers interleaved with live events, which needs the historical empty-value publishes that =publish-input-validation.org= now rejects. That guard is documented as *not retroactive*: "events already on disk are unchanged... no migration exists". So the bug cannot be created with today's binary and can still be sitting in any store old enough to contain such an event.
+
+The seek fixes it as a side effect, because the seek asks the index where the markers are instead of trying to count them while reading. That makes this a correctness change as well as a performance one, and it is the more important half.
+
+** The code
+
+=fetch= copies =idx.offsets.items= under the lock, then:
+
+#+begin_src zig
+while (i < offsets_copy.len and events.items.len < max_count) : (i += 1) {
+    const event = (try self.log.read(allocator, offsets_copy[i])) orelse continue;
+    if (event.value.len == 0) { ... skipped += 1; store.freeEvent(...); continue; }
+    if (i - skipped < start) { store.freeEvent(allocator, event); continue; }   // <-- read, then discard
+    try events.append(allocator, event);
+}
+#+end_src
+
+Every event before =start= is read from disk — a =pread= for the header and another for the payload — decoded, allocated, and freed, to decide it is not wanted. At the tail of a 13.7k-event topic that is ~27k =pread= calls per fetch, ten times a second per subscriber, forever. =fetchPattern= does the same across every matching topic.
+
+** Why it has not been noticed
+
+Three things hid it:
+
+- The cost is invisible at small scale and invisible in tests. Every test topic has tens of events.
+- =fetchAfterOffset= — the newer path — is fast, so anyone measuring =--after-offset= sees nothing wrong. The slow path is the *default*: plain =ever sub <topic>= and =--from N=.
+- It only bites when combined with the poll loop. One fetch that reads a topic is a bad fetch. Ten a second forever is a core.
+
+** Relationship to the polling work
+
+This is not the polling defect and it is not fixed by fixing polling. But the two multiply: the poll interval is a *multiplier on an O(n) body*, which is why "just use a shorter sleep" is the one option the measurements rule out — halving the interval doubles a number that is already 66% of a core. Fixing this first also means the notification work can be judged on its own merits, against a fetch that costs what it should.
+
+* Goals
+- A fetch positioned at the tail of a topic costs the same whether the topic holds ten events or ten million.
+- =--from= keeps its exact present semantics: a topic-local skip count over non-marker events.
+- No change to any wire message, CLI flag, or stored state.
+
+* Non-Goals
+- Changing =--from= semantics or deprecating it in favour of =--after-offset=. =offset-coherence.org= settled that; this is a performance fix underneath unchanged behaviour.
+- The poll loop itself (=subscribe-notify-on-append.org=).
+- The lock held across =fetchPatternByOffset='s scan (=store-blocking-locks.org=).
+- Indexing marker events out of the offset list. Tempting — it would make the skip count a plain array index — but it changes what is stored and how =rebuildIndex= reconstructs it, and it is not needed to remove the disk reads.
+
+* Proposal
+
+Skip *without reading*. The obstacle is markers: =start= counts non-marker events, and marker-ness is a property of the record on disk (=value.len == 0=), not of the offset index. So a naive =offsets[start]= would be wrong for any topic that has ever had a creation marker or a tombstone.
+
+Two observations make it cheap anyway:
+
+1. *A topic's markers are few and their positions are known once.* =TopicIndex= already maintains =non_marker_count=, which means the marker offsets in a topic are already being distinguished at index time. Store the marker offsets — or equivalently, the count of markers at or before each segment boundary — so the mapping from "the Nth non-marker event" to "an index into =offsets=" is arithmetic rather than I/O.
+
+2. *The common case has markers only at the front.* A topic gets one creation marker; tombstones arrive at deletion, after which the topic takes no more publishes. So =markers_before(i)= is almost always a small constant.
+
+The concrete change: =TopicIndex= gains =marker_positions: std.ArrayList(u32)= — the *indices into =offsets=* that hold marker records, ascending. It is maintained at exactly the two places =non_marker_count= is already maintained, =publish= and =rebuildIndex=, so there is no third site to forget. It holds one entry for the creation marker plus one per tombstone: typically one, occasionally two.
+
+The Nth non-marker event then sits at =start= shifted right by however many markers fall at or before it — the standard insert-position shift, exact because the list is ascending:
+
+#+begin_src zig
+var i: usize = start;
+for (marker_positions.items) |mp| {
+    if (mp <= i) i += 1 else break;
+}
+#+end_src
+
+Read forward from =offsets[i]=. Nothing before it is touched.
+
+*The read loop keeps skipping markers it encounters, and keeps not counting them.* That is deliberate belt-and-braces: if the bookkeeping is ever stale or wrong — an index built by a path predating this field, a marker written by something that does not maintain it — the seek starts slightly early or late and the loop still returns the right events. A wrong assumption degrades to slow, never to incorrect.
+
+No extra memory worth counting: =offsets= already stores a =u64= per record; =marker_positions= adds a =u32= per *marker*.
+
+** Alternative considered: reuse fetchAfterOffset
+
+=fetch(topic, start, n)= could be expressed as =fetchAfterOffset(topic, offsets[start-1], n)=, which already binary-searches. It is not equivalent: =start= counts non-markers, =offsets= indexes all records, and the whole difficulty is the mapping between them. The mapping is the work; once it exists, either read path is fine.
+
+* Design Details
+
+** Files expected to change
+- =src/store/topic.zig= — =TopicIndex= marker bookkeeping; =fetch= and =fetchPattern= seek.
+- =src/tests/integration.zig= — correctness across markers, plus a cost regression.
+
+** Correctness cases the tests must cover
+The risk here is not performance, it is *silently returning the wrong events*, which is worse than being slow. Every case below must hold identically before and after:
+
+- Topic with a creation marker only (the normal case), =--from 0=, =--from 1=, =--from tail=.
+- Topic with a tombstone in the middle of its history (soft delete, then read historical events — the case =publish-input-validation.org= exercises).
+- Topic with markers adjacent to each other and at the very end.
+- =--from= beyond the end: still empty, still exit 0, still the beyond-end warning.
+- Pattern fetch across topics whose marker counts differ.
+- A topic restored by =rebuildIndex= after restart, so the bookkeeping is reconstructed rather than accumulated.
+
+The cheapest way to be sure is a differential test: for a topic seeded with a deliberately awkward marker layout, assert =fetch(start, n)= returns exactly what the old read-and-discard loop returned, for every =start= from 0 to =len=.
+
+** Cost regression
+A test that fails if the scan comes back: seed a topic with enough events that the difference is unambiguous, fetch at the tail, and assert on a counter of =log.read= calls rather than on wall-clock time — timing assertions are flaky and this one does not need to be. Instrumenting =Log= with a read counter under =builtin.is_test= is the least invasive way.
+
+* History
+- 2026-08-08: Drafted. Found while establishing the cost of the polling subscriber (=subscribe-notify-on-append.org=): the poll interval turned out to be the multiplier, not the cost. Measurements above taken on a store built from this tree.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.
+- 2026-08-08: Shipped. =TopicIndex.marker_positions= plus =firstIndexForSkip=; =fetch= and =fetchPattern= dupe and read only the tail from the seek point. Marker bookkeeping is maintained at all four sites that append to =offsets= — =publish=, =rebuildIndex=, =createTopicLocked= and =deleteTopic= — not just the two that maintain =non_marker_count=, because the two marker-writing paths bypass =publish= entirely. Missing either would have made the seek silently wrong on exactly the topics that have markers.
+
+  Measured on the same 13,731-event store, same script, before and after:
+
+  | Idle subscribers, default =--from= cursor | Before | After |
+  |-------------------------------------------+--------+-------|
+  | 1                                         | 66%    | 0.00% |
+  | 4                                         | 279%   | 0.00% |
+  | 1, pattern                                | 66%    | 0.00% |
+
+  Negative control, per the repository trap: the tree copied to =/tmp= with =topic.zig= reverted to its parent revision and both new tests kept. The cost test fails there — =tail_reads <= 8= against 2000 records read — and *so does the differential test*, on =start = 3= of the awkward layout: expected =d=, found =c=. That second failure is the correctness bug documented above, and it is the reason the differential test was written before the fix rather than after.
+
+  Verified through the CLI against a live store: =--from 13728= on the 13,731-event topic returns the last three events and =--from 0= returns the first three, both unchanged from before. 131/131 tests pass in Debug, ReleaseSafe and ReleaseFast.
+
+  The read counter (=Log.test_read_count=, =builtin.is_test= only) exists so the cost assertion is on reads rather than on wall-clock time. It is a global, so it is only sound while tests in a binary run sequentially; that is true today and the assertion would become flaky, not wrong, if it ever stopped being true.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.

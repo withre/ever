@@ -79,6 +79,17 @@ pub const TopicListEntry = struct {
 /// Per-topic index: tracks which global offsets belong to this topic.
 const TopicIndex = struct {
     offsets: std.ArrayList(u64) = .empty,
+    /// Indices into `offsets` that hold marker records (empty value),
+    /// ascending. One entry for the creation marker, one per tombstone, plus
+    /// any historical empty-value user publish — so typically one, and never
+    /// large. Maintained at exactly the two sites that maintain
+    /// `non_marker_count`: `publish` and `rebuildIndex`.
+    ///
+    /// Its only purpose is to let `fetch`/`fetchPattern` translate a
+    /// topic-local skip count (which counts non-markers) into an index into
+    /// `offsets` (which counts records) without reading anything off disk.
+    /// See `firstIndexForSkip` and air/v0.1/subscribe-fetch-seek.org.
+    marker_positions: std.ArrayList(u32) = .empty,
     /// Count of non-marker events in this topic. A "marker" is any event
     /// whose value is empty (creation markers from createTopic, tombstones
     /// from deleteTopic, and — by historical quirk — user publishes with an
@@ -89,6 +100,33 @@ const TopicIndex = struct {
 
     fn deinit(self: *TopicIndex, allocator: Allocator) void {
         self.offsets.deinit(allocator);
+        self.marker_positions.deinit(allocator);
+    }
+
+    /// Record that the entry just appended to `offsets` is a marker.
+    fn noteMarker(self: *TopicIndex, allocator: Allocator) !void {
+        try self.marker_positions.append(allocator, @intCast(self.offsets.items.len - 1));
+    }
+
+    /// Index into `offsets` of the `skip`-th non-marker event.
+    ///
+    /// `skip` counts only non-marker events, `offsets` counts every record,
+    /// so the answer is `skip` shifted right by the number of markers at or
+    /// before it — the standard insert-position shift, exact because
+    /// `marker_positions` is ascending.
+    ///
+    /// Callers must still skip markers they encounter while reading forward
+    /// and must still not count them. That is deliberate: if this bookkeeping
+    /// is ever stale, the seek lands slightly early or late and the read loop
+    /// still returns the right events. A wrong assumption degrades to slow,
+    /// never to incorrect.
+    fn firstIndexForSkip(self: *const TopicIndex, skip: u64) usize {
+        if (skip == 0) return 0;
+        var i: u64 = skip;
+        for (self.marker_positions.items) |mp| {
+            if (mp <= i) i += 1 else break;
+        }
+        return @intCast(@min(i, self.offsets.items.len));
     }
 };
 
@@ -220,6 +258,7 @@ pub const TopicManager = struct {
         errdefer self.allocator.free(owned);
         var idx: TopicIndex = .{};
         try idx.offsets.append(self.allocator, offset);
+        try idx.noteMarker(self.allocator);
         try self.topics.put(self.allocator, owned, idx);
     }
 
@@ -236,6 +275,7 @@ pub const TopicManager = struct {
         const idx = self.topics.getPtr(name).?;
         const offset = try self.log.append(name, deletion_marker_key, "");
         try idx.offsets.append(self.allocator, offset);
+        try idx.noteMarker(self.allocator);
 
         // Mark as deleted (key points to the owned string inside `topics`).
         const owned_key = self.topics.getKey(name).?;
@@ -321,7 +361,7 @@ pub const TopicManager = struct {
             defer self.mutex.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             try idx.offsets.append(self.allocator, offset);
-            if (value.len != 0) idx.non_marker_count += 1;
+            if (value.len != 0) idx.non_marker_count += 1 else try idx.noteMarker(self.allocator);
         }
         return offset;
     }
@@ -329,12 +369,18 @@ pub const TopicManager = struct {
     /// Fetch events for a single topic by topic-local offset range.
     /// Skips internal marker events (empty value from createTopic).
     pub fn fetch(self: *TopicManager, allocator: Allocator, topic_name: []const u8, start: u64, max_count: u32) ![]Event {
-        // Phase 1: copy offset data under lock
+        // Phase 1: seek to the cursor and copy only the tail we will read.
+        //
+        // `start` counts non-marker events; `offsets` counts records. The
+        // index knows where its markers are, so the translation is arithmetic
+        // rather than I/O — we do NOT read the skipped events off disk to
+        // discover they are skipped. See air/v0.1/subscribe-fetch-seek.org.
         const offsets_copy = blk: {
             self.lock();
             defer self.mutex.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
-            break :blk try allocator.dupe(u64, idx.offsets.items);
+            const from = idx.firstIndexForSkip(start);
+            break :blk try allocator.dupe(u64, idx.offsets.items[from..]);
         };
         defer allocator.free(offsets_copy);
 
@@ -342,17 +388,16 @@ pub const TopicManager = struct {
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
-        var skipped: u64 = 0;
         var i: usize = 0;
         while (i < offsets_copy.len and events.items.len < max_count) : (i += 1) {
             const event = (try self.log.read(allocator, offsets_copy[i])) orelse continue;
-            // Skip marker events (creation markers and tombstones)
+            // Skip marker events (creation markers and tombstones). Still done
+            // here, and still not counted, so a stale seek cannot return the
+            // wrong events — only a few too many reads.
             if (event.value.len == 0) {
-                if (skipped < start) skipped += 1;
                 store.freeEvent(allocator, event);
                 continue;
             }
-            if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
             errdefer store.freeEvent(allocator, event);
             try events.append(allocator, event);
         }
@@ -538,7 +583,11 @@ pub const TopicManager = struct {
             var topic_iter = self.topics.iterator();
             while (topic_iter.next()) |entry| {
                 if (!matchTopic(pattern, entry.key_ptr.*)) continue;
-                const duped = try allocator.dupe(u64, entry.value_ptr.offsets.items);
+                // Same seek as `fetch`, per matching topic: `start` is applied
+                // to each topic independently, which is the behaviour this
+                // function already had.
+                const from = entry.value_ptr.firstIndexForSkip(start);
+                const duped = try allocator.dupe(u64, entry.value_ptr.offsets.items[from..]);
                 try batches.append(allocator, .{ .offsets = duped });
             }
         }
@@ -549,17 +598,14 @@ pub const TopicManager = struct {
 
         for (batches.items) |batch| {
             const offsets = batch.offsets;
-            var skipped: u64 = 0;
             var i: usize = 0;
             while (i < offsets.len and events.items.len < max_count) : (i += 1) {
                 const event = (try self.log.read(allocator, offsets[i])) orelse continue;
-                // Skip marker events (creation markers and tombstones)
+                // Markers are skipped and not counted; see `fetch`.
                 if (event.value.len == 0) {
-                    if (skipped < start) skipped += 1;
                     store.freeEvent(allocator, event);
                     continue;
                 }
-                if (i - skipped < start) { store.freeEvent(allocator, event); continue; }
                 errdefer store.freeEvent(allocator, event);
                 try events.append(allocator, event);
             }
@@ -583,7 +629,7 @@ pub const TopicManager = struct {
                 gop.value_ptr.* = .{};
             }
             try gop.value_ptr.offsets.append(self.allocator, offset);
-            if (event.value.len != 0) gop.value_ptr.non_marker_count += 1;
+            if (event.value.len != 0) gop.value_ptr.non_marker_count += 1 else try gop.value_ptr.noteMarker(self.allocator);
 
             // Detect deletion tombstone markers
             if (event.key) |key| {

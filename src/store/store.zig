@@ -7,6 +7,7 @@
 //! Thread-safe: a mutex serializes all writes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -176,10 +177,22 @@ pub const Log = struct {
         return offset;
     }
 
+    /// Test-only counter of records actually read off disk, incremented by
+    /// `read` and `readBatch`. Exists so a test can assert that a fetch
+    /// *seeks* rather than reading and discarding everything before its
+    /// cursor (air/v0.1/subscribe-fetch-seek.org). Asserting on a read count
+    /// is stable; asserting on wall-clock time is not.
+    pub var test_read_count: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
+    inline fn countRead(n: usize) void {
+        if (builtin.is_test) test_read_count += n;
+    }
+
     /// Read a single event by global offset. Returns null if not found.
     /// NOT thread-safe on its own — caller must serialize with appends
     /// (e.g., via TopicManager's mutex).
     pub fn read(self: *Log, allocator: Allocator, offset: u64) !?Event {
+        countRead(1);
         if (offset >= self.next_offset) return null;
         const seg = self.findSegmentForOffset(offset) orelse return null;
         const local_idx = offset - seg.base_offset;
@@ -205,6 +218,7 @@ pub const Log = struct {
             const available = seg.eventCount() - local_start;
             const to_read: u64 = @min(available, remaining);
 
+            countRead(@intCast(to_read));
             for (0..to_read) |i| {
                 const event = try self.readEventAt(allocator, seg, seg.positions.items[@intCast(local_start + i)]);
                 errdefer freeEvent(allocator, event);
