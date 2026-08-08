@@ -1,6 +1,7 @@
 //! TCP server for the Ever store.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const net = Io.net;
@@ -25,6 +26,15 @@ pub const Config = struct {
 
 /// Global server pointer for signal handler access.
 var global_server: ?*Server = null;
+
+/// Test-only count of times a blocking fetch has looked for events. One look
+/// per request means the waiter was woken; N looks per second means it was
+/// polling. Counting looks rather than CPU keeps the assertion deterministic
+/// — a CPU-time threshold cannot separate a cheap poll from a parked wait
+/// without a topic big enough to make each poll expensive.
+/// See air/v0.1/subscribe-notify-on-append.org.
+pub var test_fetch_attempts: if (builtin.is_test) std.atomic.Value(u64) else void =
+    if (builtin.is_test) .init(0) else {};
 
 pub const Server = struct {
     allocator: Allocator,
@@ -124,6 +134,11 @@ pub const Server = struct {
     /// and wait for in-flight connections to drain (up to 5 seconds).
     pub fn shutdown(self: *Server) void {
         self.shutdown_requested.store(true, .release);
+        // Blocking fetches are parked on the publication epoch, not on a
+        // 100ms timer, so nothing will notice the flag unless we say so.
+        // Without this every subscriber waits out its full block_ms and the
+        // drain below gives up on it.
+        self.topic_manager.wakeAllWaiters();
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
 
         // Wait for in-flight connections to finish (max 5 seconds)
@@ -199,12 +214,17 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
-        // Blocking fetch: retry until events found or timeout
+        // Blocking fetch: wait for an append, not for a timer.
+        //
+        // The epoch is read *before* each look for events, so an append that
+        // lands between the look and the wait is not slept through -- see
+        // TopicManager.waitForAppend and air/v0.1/subscribe-notify-on-append.org.
         const block_ms = req.block_ms;
-        var elapsed_ms: u32 = 0;
-        const sleep_interval_ms: u32 = 100; // 100ms poll interval
+        const deadline_ms = monotonicMillis() + @as(i64, block_ms);
+        var epoch = self.topic_manager.appendEpoch();
 
         while (true) {
+            if (builtin.is_test) _ = test_fetch_attempts.fetchAdd(1, .monotonic);
             // Resolve events — either by pattern or single topic. When
             // `after_offset` is set it takes precedence over `offset`
             // (global-offset cursor vs. topic-local skip count).
@@ -226,7 +246,8 @@ pub const Server = struct {
                 return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "missing topic or pattern");
 
             // If we have events or not blocking, send response
-            if (events.len > 0 or block_ms == 0 or elapsed_ms >= block_ms or self.shutdown_requested.load(.acquire)) {
+            const now_ms = monotonicMillis();
+            if (events.len > 0 or block_ms == 0 or now_ms >= deadline_ms or self.shutdown_requested.load(.acquire)) {
                 defer {
                     for (events) |evt| store.freeEvent(self.allocator, evt);
                     self.allocator.free(events);
@@ -258,16 +279,12 @@ pub const Server = struct {
                 return;
             }
 
-            // No events yet, free and sleep
+            // No events yet. Park until something is published or the
+            // client's block window runs out. Costs nothing while waiting.
             self.allocator.free(events); // empty slice
 
-            // Sleep using linux nanosleep
-            const ts = std.os.linux.timespec{
-                .sec = 0,
-                .nsec = @as(i64, sleep_interval_ms) * 1_000_000,
-            };
-            _ = std.os.linux.nanosleep(&ts, null);
-            elapsed_ms += sleep_interval_ms;
+            const remaining_ms: u32 = @intCast(@max(0, deadline_ms - now_ms));
+            epoch = self.topic_manager.waitForAppend(epoch, remaining_ms);
         }
     }
 
@@ -886,6 +903,17 @@ fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
             _ = std.os.linux.close(@intCast(fd));
         }
     }
+}
+
+/// Milliseconds on a clock that cannot jump. Used for the blocking-fetch
+/// deadline: the old loop accumulated a fixed sleep interval, which stops
+/// being a measure of elapsed time once the waits are variable, and
+/// `getMilliTimestamp` is wall-clock and can be stepped by NTP mid-wait.
+fn monotonicMillis() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.BOOTTIME, &ts);
+    if (rc != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 fn getMilliTimestamp() i64 {

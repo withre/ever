@@ -1,0 +1,154 @@
+#+title: Subscribers Should Be Woken by the Append, Not by a Timer
+#+state: complete
+#+FILETAGS: :subscriber:protocol:store:performance:
+
+* Summary
+=ever sub= is a poller. A blocking fetch loops on =nanosleep(100ms)= until events appear, so an append at T reaches a subscriber at T+0..100ms and an idle subscriber costs a timer, a wakeup and a fetch ten times a second forever. Ever is thread-per-connection, which is exactly the shape a condition variable fits: the thread that sleeps today waits instead, and the append that already holds a lock signals it. No event loop, no epoll, no eventfd, no change to the threading model.
+
+* Motivation
+
+** What is there now
+
+=handleFetch= (=src/net/server.zig=):
+
+#+begin_src zig
+const sleep_interval_ms: u32 = 100; // 100ms poll interval
+while (true) {
+    const events = ...fetch...;
+    if (events.len > 0 or block_ms == 0 or elapsed_ms >= block_ms or shutting_down) { ...respond...; return; }
+    self.allocator.free(events);
+    _ = std.os.linux.nanosleep(&ts, null);
+    elapsed_ms += sleep_interval_ms;
+}
+#+end_src
+
+There is no notification anywhere in the tree. =publish= appends and returns; nothing is told.
+
+** Measured, on a store built from this tree
+
+- Publish to delivery: *median 93 ms*, samples tightly clustered on the 100 ms grid.
+- Publish round-trip (with =sync_on_append=): 41.6 ms. *The subscriber waits more than twice as long for the timer as the store took to durably write the event it is waiting for.*
+- Idle subscriber overhead with a cheap fetch: ~1.3 ms/s each; 200 idle subscribers cost 17% of a core and 200 OS threads to deliver nothing.
+- Idle subscriber with the *default* cursor on a 13,731-event topic: *66% of a core each* — but that is the O(n) fetch, specified separately in =subscribe-fetch-seek.org=, and it must be fixed first or it will dominate every measurement taken here.
+- A *disconnected* subscriber keeps scanning: after the client closed its socket the server burned 50–64% of a core for the full remaining 20 s block window, because nothing notices the peer is gone until the write at the end.
+
+** Why a shorter sleep is not the answer
+
+It is the obvious cheap alternative and the measurements rule it out. The sleep interval is a multiplier on the body of the loop, and the body is a fetch. Halving the interval halves the latency and doubles the CPU, against a per-subscriber cost that is 66% of a core before you start. Even after =subscribe-fetch-seek.org= makes the body cheap, a 10 ms sleep still costs 100 wakeups per second per idle subscriber to achieve a latency a futex delivers in microseconds for nothing. Shortening the sleep trades one resource for another; notification stops spending either.
+
+** Why the primitive is available
+
+Validated before specifying it, because the question was never whether =std.Io.Condition= compiles but whether it works from the thread shape Ever has — raw =std.Thread.spawn=, not =io.async=. Standalone program, pinned toolchain, eight threads parked in =Io.Condition.waitTimeout= over an =Io.Mutex=, then one broadcast:
+
+#+begin_example
+cpu used by 8 parked waiters over 1s:  10 microseconds
+broadcast -> all 8 woken and joined:   287,531 ns
+#+end_example
+
+Ten microseconds is the measuring thread's own overhead. On Linux =io.futexWait= is the plain =futex(2)= syscall and the cancelation check returns early when the calling thread is not an =Io= thread, so a =std.Thread= parks correctly.
+
+** What this is for
+
+The owner's stated direction is a system that replaces NATS JetStream. A JetStream-class system does not poll; push consumers are woken by the write. This is the gap between what Ever's vocabulary claims — =sub=, =subscribe=, =--follow= — and what it does. It is not an accommodation for any one consumer.
+
+* Goals
+- An append wakes a waiting subscriber directly. Delivery latency becomes a scheduler hop, not a timer tick.
+- An idle subscriber costs no CPU and no wakeups.
+- A subscriber whose client has gone away costs no CPU while it waits out its block window.
+- =block_ms= keeps its present meaning: the maximum time the server will hold the request before answering, empty if need be.
+- No wire-protocol change, no CLI change, no change to what a fetch returns.
+
+* Non-Goals
+- Server-initiated streaming — the server pushing frames the client did not ask for. That is a protocol change and a client change, it interacts with request/reply framing, and the whole latency win is available without it. Long-poll answered promptly is the same thing from the client's point of view.
+- An event loop, epoll, or eventfd. Those are the answer for a single-threaded event loop; Ever is thread-per-connection, and in that shape a condition variable is both smaller and faster than an event loop would be.
+- Detecting client disconnect during the wait. Once the waiter is parked, a dead client costs one idle thread until =block_ms= expires — bounded, no CPU. Detecting it earlier means putting the socket in the wait set, which is where epoll would genuinely be needed; the cost no longer justifies it.
+- Timer daemon changes. Its 1 s tick is a scheduler tick, not a poll for data, and no append can tell it anything. It already has a document — =timer-tick-resolution.org=, still =draft= — and belongs there.
+- Per-subscriber filtering at wake time. See "Wake precision" below.
+
+* Proposal
+
+** The signal
+
+=TopicManager= gains a condition variable and a monotonically increasing publication counter, both guarded by the manager mutex it already has:
+
+#+begin_src zig
+append_cond: std.Io.Condition = .init,
+append_epoch: u64 = 0,   // bumped on every published event
+#+end_src
+
+=publish= already takes the manager lock in its phase 3 to update the index. That same critical section increments =append_epoch=; the broadcast follows the unlock. Nothing new is locked and no new ordering is introduced — the counter changes exactly where the index changes, so a subscriber that observes the counter also observes the index entry.
+
+** The wait
+
+=handleFetch= replaces its sleep with a wait bounded by whatever remains of =block_ms=:
+
+#+begin_src
+loop:
+  fetch
+  if events or block_ms == 0 or deadline passed or shutting down: respond; return
+  wait on append_cond until signalled or the deadline, whichever first
+#+end_src
+
+The re-fetch after waking is not optional and is not a fallback: a condition variable is an invitation to re-check a predicate, never a delivery mechanism. Spurious wakeups, wakeups for other topics, and events consumed by another reader all resolve the same way, by looking again.
+
+** Wake precision
+
+The first version broadcasts to every waiter on any append. That is correct, and it is imprecise: a subscriber on =a.b= is woken by a publish to =x.y=, re-fetches, finds nothing, and parks again. The cost of a spurious wake is one futex wake plus one fetch — which is exactly what a poll tick costs today, except it happens on publishes rather than on a timer. On any store where publishes are rarer than 10/s, that is already strictly better than the status quo; on a much busier store with many topics it is worse than per-topic wakeups and better than polling.
+
+Per-topic wait queues are the obvious refinement and are deliberately deferred: they need a map from topic to condition, a policy for prefix and wildcard subscribers (which match topics that do not exist yet — see =hook-registration-cursor.org= B1 for how that has bitten before), and lifetime rules for the queues. Ship the correct simple thing, measure, and refine with a number in hand.
+
+** Shutdown
+
+=shutdown()= must broadcast after setting =shutdown_requested=, or every parked subscriber waits out its full =block_ms= and the 5-second drain gives up on them. Today the sleep loop notices within 100 ms. This is the one place where replacing a poll with a wait *removes* a property, and it has to be given back explicitly.
+
+** The hook daemon
+
+The same signal serves =HookDaemon.daemonLoop=, which polls at 500 ms. It is a genuine second poller and it scans per hook. Converting it is the same shape — wait on the condition with a timeout instead of sleeping — but it also has to keep a periodic wake for =reapChildren= and =checkTimeouts=, which are not driven by appends. So: wait with a 500 ms timeout rather than an unbounded wait, and the tick keeps working while event dispatch becomes immediate. Its separate rescan defect is =hook-scan-cursor-and-lag.org= and is not addressed here.
+
+* Design Details
+
+** Dependencies
+- =store-blocking-locks.org= is a *blocker*. A broadcast wakes every waiter at once and they all immediately contend for the manager lock. On today's spinlock every loser burns a core, so notification would make CPU worse at exactly the moment an event arrives.
+- =subscribe-fetch-seek.org= should land first. Not a correctness blocker, but the O(n) fetch is 66% of a core per subscriber and would swamp every measurement taken here, making it impossible to attribute a regression.
+
+** Files expected to change
+- =src/store/topic.zig= — condition variable, epoch counter, broadcast in =publish=; a small wait/notify API so the server does not reach into the manager's internals.
+- =src/net/server.zig= — =handleFetch= waits instead of sleeping; =shutdown= broadcasts.
+- =src/store/hooks.zig= — daemon loop waits with a timeout instead of sleeping.
+- =air/context/architecture.org= — the subscription model is part of the architecture and is currently undescribed; say that delivery is notified, and that the wait is a re-check loop.
+
+** Testing
+
+- *Latency*: publish and assert the subscriber is served in well under the old floor. Assert against a generous bound (say 20 ms) rather than a tight one — the point is to distinguish "woken" from "next tick", not to measure the scheduler. This test fails on the current tree, which makes it the negative control.
+- *Idle cost*: N subscribers parked for a fixed interval, assert the server's CPU time is near zero. Fails today.
+- *No lost wakeup*: publish immediately after the subscriber sends its fetch, repeatedly, and assert it is never served late. The race — event published between the fetch's check and the wait — is the one bug this design can actually have, and it is prevented by bumping the epoch inside the same critical section that updates the index, so the test needs to hammer that window rather than sample it.
+- *Shutdown*: a parked subscriber with a long =block_ms= must not delay shutdown.
+- *Existing suite* in Debug, ReleaseSafe and ReleaseFast — a concurrency change, and the repository note is explicit that races may only appear in release builds.
+
+** What this does not foreclose
+
+Request/reply queues, named as a later addition, need exactly this primitive: park a waiter until something arrives, wake it directly. A reply queue is a wait on a different predicate. Building this is a step toward that.
+
+* History
+- 2026-08-08: Drafted. Reported by the owner, who had designed a consumer around a push model that does not exist. Measurements above taken against a store built from this tree; the condition-variable behaviour validated in a standalone program on the pinned toolchain before being specified.
+- 2026-08-08: State: draft → ready → work-in-progress.
+- 2026-08-08: Shipped. =TopicManager= gained =append_epoch=, =append_cond=, and the three-call API =appendEpoch= / =waitForAppend= / =wakeAllWaiters=; =publish= bumps the epoch inside the critical section that updates the index and broadcasts after releasing it; =handleFetch= waits instead of sleeping; =Server.shutdown= wakes everyone; the hook daemon waits with a 500 ms timeout, so its tick still drives =reapChildren= and =checkTimeouts= while event dispatch became immediate.
+
+  The blocking-fetch deadline is now taken from =CLOCK_BOOTTIME= rather than accumulated from a fixed sleep interval. Accumulating stops being a measure of elapsed time the moment the waits are variable, and the wall clock can be stepped by NTP mid-wait.
+
+  *Measured end to end.* Publish sent → server begins the subscriber's response: *median 3.96 ms*, against 93 ms before, and the 4 ms includes the publish crossing the socket, the log append, the index update, the broadcast and the subscriber's re-fetch. Four parked subscribers over a one-second window: *zero* fetch attempts, where polling made about forty.
+
+  *Negative controls, one per test, because each proves a different thing.*
+
+  | Test                                   | Control                                        | Result                       |
+  |----------------------------------------+------------------------------------------------+------------------------------|
+  | publish wakes a blocked subscriber     | tree reverted to the polling loop              | fails — the improvement      |
+  | blocked subscribers look once          | tree reverted, counter patched in              | fails — the improvement      |
+  | append between the look and the wait   | =waitForAppend= short-circuit removed          | fails — the guard has teeth  |
+  | shutdown does not wait out block_ms    | =wakeAllWaiters= removed from =shutdown=       | fails — the guard has teeth  |
+
+  *One honest limitation.* The socket-level race test cannot reliably hit the window it is named for. With the baseline deliberately read *after* the fetch — the exact mistake that loses a wakeup — forty rounds of publishing the instant the server starts looking still passed, because the window between the fetch and the epoch read is nanoseconds wide and nothing outside the process can aim at it. That is why the real guard is the unit test, which reproduces the interleaving deterministically by publishing between taking the baseline and calling =waitForAppend=; that one does fail against the broken variant. The socket test is kept as end-to-end coverage and is described as such rather than as a control.
+
+  138/138 tests pass in Debug, ReleaseSafe and ReleaseFast, and the new tests were run eight times in a row plus three times under four busy cores to check for flakiness. They did not flake. *Two pre-existing tests did* — "status server probe flips true then false" and "status over TCP reports live stats" both fail under heavy CPU contention, because their startup probe gives up after 50 attempts at 20 ms. Not caused by this change, not fixed here; it belongs with =testable-server-lifecycle.org=.
+
+  *What the latency win exposed.* End-to-end delivery measured 44 ms even though the server responds in 4 ms. The missing 40 ms is not this code: =protocol.writeFrame= writes the header and the body as two separate =write= calls, so Nagle holds the body until the peer's delayed ACK fires — measured directly as header in 0.32 ms, body 40.76 ms later. It is on *every response Ever sends*, not just subscriptions, and it is now the dominant term. Specified separately in =protocol-frame-single-write.org=.

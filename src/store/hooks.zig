@@ -843,17 +843,19 @@ pub const HookDaemon = struct {
     }
 
     fn daemonLoop(self: *HookDaemon) void {
+        // Baseline read before the first dispatch, and refreshed by the wait,
+        // so a publish landing during dispatch is not slept through.
+        var epoch = self.topic_manager.appendEpoch();
         while (!self.shutdown.load(.acquire)) {
             self.reapChildren();
             self.checkTimeouts();
             self.pollAndExecute();
 
-            // Sleep 500ms between polls
-            const ts = std.os.linux.timespec{
-                .sec = 0,
-                .nsec = 500_000_000,
-            };
-            _ = std.os.linux.nanosleep(&ts, null);
+            // Wake on a publish, or after 500ms, whichever comes first. The
+            // timeout is not a poll interval for events -- it is the tick
+            // reapChildren and checkTimeouts need, and neither is driven by
+            // an append. Event dispatch itself is now immediate.
+            epoch = self.topic_manager.waitForAppend(epoch, 500);
         }
     }
 

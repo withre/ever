@@ -144,6 +144,16 @@ pub const TopicManager = struct {
     /// discipline now deadlocks quietly rather than spinning visibly.
     /// See air/v0.1/store-blocking-locks.org.
     mutex: std.Io.Mutex = .init,
+    /// Publication epoch: bumped under `mutex` on every event appended
+    /// through `publish`, and by `wakeAllWaiters`.
+    ///
+    /// The condition variable is only the notification; *this* is the state.
+    /// A waiter records the epoch before it looks for events and waits for it
+    /// to move, so an append that lands between the look and the wait is
+    /// never slept through -- the waiter finds the epoch already changed and
+    /// returns without parking. See air/v0.1/subscribe-notify-on-append.org.
+    append_epoch: u64 = 0,
+    append_cond: std.Io.Condition = .init,
     /// Test-only fault injection: when true, `createTopicLocked` fails just
     /// before appending the topic-creation marker, simulating a log-append
     /// failure. Never set in production code.
@@ -374,8 +384,62 @@ pub const TopicManager = struct {
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             try idx.offsets.append(self.allocator, offset);
             if (value.len != 0) idx.non_marker_count += 1 else try idx.noteMarker(self.allocator);
+            // Same critical section as the index update, so a reader that
+            // observes the epoch also observes the event.
+            self.append_epoch += 1;
         }
+        // Phase 4: wake anyone waiting for this. Outside the lock, so woken
+        // readers do not immediately contend with the thread that woke them.
+        self.append_cond.broadcast(self.log.io);
         return offset;
+    }
+
+    /// Current publication epoch, for use as a wait baseline.
+    ///
+    /// Read this *before* looking for events, never after. An append landing
+    /// between the look and the read would otherwise be folded into the
+    /// baseline, and the waiter would sleep through the event it wanted.
+    pub fn appendEpoch(self: *TopicManager) u64 {
+        self.lock();
+        defer self.unlock();
+        return self.append_epoch;
+    }
+
+    /// Block until the publication epoch moves away from `baseline`, or until
+    /// `timeout_ms` elapses, whichever comes first. Returns the epoch seen on
+    /// waking, to be used as the next baseline.
+    ///
+    /// Returning immediately when the epoch has already moved is not an
+    /// optimisation, it is the correctness property: it is what makes a
+    /// wakeup delivered before the waiter parked impossible to lose.
+    ///
+    /// A wake means "look again", never "here is your event". Spurious
+    /// wakeups, wakeups for another topic, and events taken by another reader
+    /// all resolve the same way, by re-reading.
+    pub fn waitForAppend(self: *TopicManager, baseline: u64, timeout_ms: u32) u64 {
+        self.lock();
+        defer self.unlock();
+        if (self.append_epoch != baseline) return self.append_epoch;
+        self.append_cond.waitTimeout(self.log.io, &self.mutex, .{ .duration = .{
+            .raw = .fromMilliseconds(timeout_ms),
+            .clock = .boot,
+        } }) catch {}; // Timeout and cancelation are both "look again".
+        return self.append_epoch;
+    }
+
+    /// Wake every waiter whether or not anything was published. Used by
+    /// shutdown, which must not wait out each subscriber's block window.
+    ///
+    /// Bumps the epoch as well as broadcasting, so a waiter that has decided
+    /// to wait but has not parked yet also returns immediately instead of
+    /// sleeping out its timeout.
+    pub fn wakeAllWaiters(self: *TopicManager) void {
+        {
+            self.lock();
+            defer self.unlock();
+            self.append_epoch += 1;
+        }
+        self.append_cond.broadcast(self.log.io);
     }
 
     /// Fetch events for a single topic by topic-local offset range.

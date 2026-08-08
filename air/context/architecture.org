@@ -144,10 +144,20 @@ Three patterns, common cases need no shell quoting:
 
 Trailing dot is shell-safe (no quoting needed). The =*= wildcard matches exactly one segment.
 
+*** Delivery is notified, not polled
+
+A blocking fetch (=block_ms > 0=) parks on a condition variable and is woken by the append. It does not sleep on a timer, and an idle subscriber costs no CPU and no wakeups.
+
+The wait predicate is =TopicManager.append_epoch=, bumped inside the same critical section that updates the topic index. *The condition variable is only the notification; the epoch is the state.* A reader takes the epoch before it looks for events, so an append landing between the look and the wait leaves the epoch already moved and the wait returns without parking — that is what makes a wakeup impossible to lose, and reading the epoch after the look instead of before is the one way to break it.
+
+A wake means "look again", never "here is your event": the first version broadcasts to every waiter on any append, so spurious wakes, wakes for another topic and events taken by another reader all resolve by re-reading. Per-topic wait queues are a deliberate later refinement.
+
+Shutdown must call =wakeAllWaiters=. Parking is the one property that replacing a poll with a wait takes away — a poller noticed the shutdown flag within its tick — so it has to be given back explicitly or every subscriber waits out its full =block_ms=.
+
 ** Concurrency Model
 
-- TCP server: thread-per-connection (detached)
-- TopicManager: single mutex guards all operations
+- TCP server: thread-per-connection (detached). This is why no event loop is needed for notification: the thread that would sleep can wait on anything it likes.
+- TopicManager: single blocking mutex (=std.Io.Mutex=) guards all operations, plus a condition variable for append notification
 - Log: nested mutex (redundant under TopicManager mutex, but safe)
 - Hook daemon: separate thread, polls TopicManager
 - Timer daemon: separate thread, publishes to TopicManager (planned)

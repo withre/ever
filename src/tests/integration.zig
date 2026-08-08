@@ -1682,3 +1682,228 @@ test "integration: threads waiting on the store lock burn no CPU" {
     const spin_would_cost_ns: i64 = waiters.len * hold_ms * 1_000_000;
     try testing.expect(spent_ns < @divTrunc(spin_would_cost_ns, 4));
 }
+
+// ── Notified delivery (air/v0.1/subscribe-notify-on-append.org) ─────────────
+//
+// A blocking fetch waits on the publication epoch instead of sleeping on a
+// 100ms timer. These tests all fail on the polling tree, which is what makes
+// them worth having: two on latency, one on idle cost, one on the race that
+// is the only bug this design can actually have.
+
+const NotifyHarness = struct {
+    tm: *TopicManager,
+    server: *ever.net.Server,
+    thread: std.Thread,
+    port: u16,
+
+    fn start(tm: *TopicManager, server: *ever.net.Server, port: u16) !NotifyHarness {
+        const thread = try std.Thread.spawn(.{}, runServerForTest, .{server});
+        var attempts: u32 = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (ever.status.probeServer(io, "127.0.0.1", port, 50)) break;
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 10_000_000 }, null);
+        } else return error.ServerNeverCameUp;
+        return .{ .tm = tm, .server = server, .thread = thread, .port = port };
+    }
+
+    fn stop(self: *NotifyHarness) void {
+        self.server.shutdown_requested.store(true, .release);
+        _ = ever.status.probeServer(io, "127.0.0.1", self.port, 50); // wake accept
+        self.thread.join();
+        self.server.shutdown();
+    }
+};
+
+/// A blocking fetch run on its own thread, recording when it was served.
+const BlockedFetcher = struct {
+    port: u16,
+    topic: []const u8,
+    from: u64,
+    block_ms: u32,
+    served_at_ns: std.atomic.Value(i64) = .init(0),
+    event_count: std.atomic.Value(u64) = .init(0),
+    sent: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BlockedFetcher) void {
+        var client = ever.client.Client.connect(allocator, io, "127.0.0.1", self.port) catch return;
+        defer client.deinit();
+        self.sent.store(true, .release);
+        var res = client.fetchBlocking(self.topic, null, self.from, 10, self.block_ms) catch return;
+        defer res.deinit();
+        self.event_count.store(res.events.len, .release);
+        self.served_at_ns.store(nowNanos(), .release);
+    }
+};
+
+fn nowNanos() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.BOOTTIME, &ts);
+    return ts.sec * 1_000_000_000 + ts.nsec;
+}
+
+fn processCpuNanos() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+    return ts.sec * 1_000_000_000 + ts.nsec;
+}
+
+test "integration: a publish wakes a blocked subscriber immediately" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("notify.topic");
+
+    const port: u16 = 35000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    var h = try NotifyHarness.start(&tm, &server, port);
+
+    var f = BlockedFetcher{ .port = port, .topic = "notify.topic", .from = 0, .block_ms = 30_000 };
+    const ft = try std.Thread.spawn(.{}, BlockedFetcher.run, .{&f});
+
+    // Let it get all the way into the wait. Generous, so the test is about
+    // the wakeup and not about a race to park.
+    while (!f.sent.load(.acquire)) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 200_000_000 }, null);
+
+    const published_at = nowNanos();
+    _ = try tm.publish("notify.topic", null, "wake up");
+    ft.join();
+
+    try testing.expectEqual(@as(u64, 1), f.event_count.load(.acquire));
+    const latency_ms = @divTrunc(f.served_at_ns.load(.acquire) - published_at, 1_000_000);
+    // The old floor was a 100ms grid; a notified wakeup is a scheduler hop.
+    // 20ms separates the two without measuring the scheduler.
+    try testing.expect(latency_ms < 20);
+
+    h.stop();
+}
+
+test "integration: blocked subscribers look once, not ten times a second" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("idle.topic");
+
+    const port: u16 = 36000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    var h = try NotifyHarness.start(&tm, &server, port);
+
+    var fetchers: [4]BlockedFetcher = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&fetchers, &threads) |*f, *t| {
+        f.* = .{ .port = port, .topic = "idle.topic", .from = 0, .block_ms = 1_500 };
+        t.* = try std.Thread.spawn(.{}, BlockedFetcher.run, .{f});
+    }
+    for (&fetchers) |*f| {
+        while (!f.sent.load(.acquire)) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+    }
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 100_000_000 }, null);
+
+    // Deterministic, unlike a CPU threshold: with a 100ms poll each of the
+    // four subscribers looks ~10 times a second, so ~40 looks over the
+    // window. Parked waiters look once each and then not again.
+    ever.net.test_fetch_attempts.store(0, .monotonic);
+    const cpu_before = processCpuNanos();
+    _ = std.os.linux.nanosleep(&.{ .sec = 1, .nsec = 0 }, null);
+    const spent_ns = processCpuNanos() - cpu_before;
+    const looks = ever.net.test_fetch_attempts.load(.monotonic);
+    for (&threads) |*t| t.join();
+
+    try testing.expect(looks == 0);
+    // And the CPU that used to buy those looks is gone too.
+    try testing.expect(spent_ns < 50_000_000);
+
+    h.stop();
+}
+
+test "unit: an append between the look and the wait is not slept through" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("window.topic");
+
+    // The one bug this design can have, reproduced deterministically instead
+    // of hoped for over a socket. A reader takes its baseline, looks and
+    // finds nothing, and *then* the append lands. The wait must return at
+    // once, because the epoch has already moved past the baseline.
+    const baseline = tm.appendEpoch();
+    _ = try tm.publish("window.topic", null, "landed in the window");
+
+    const t0 = nowNanos();
+    const woke_at = tm.waitForAppend(baseline, 10_000);
+    const waited_ms = @divTrunc(nowNanos() - t0, 1_000_000);
+
+    try testing.expect(woke_at != baseline);
+    try testing.expect(waited_ms < 100);
+
+    // And with no append, the same call does wait out its timeout rather
+    // than spinning through it — otherwise the test above proves nothing.
+    const t1 = nowNanos();
+    _ = tm.waitForAppend(woke_at, 150);
+    try testing.expect(@divTrunc(nowNanos() - t1, 1_000_000) >= 100);
+}
+
+test "integration: a publish racing the wait is never slept through" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("race.topic");
+
+    const port: u16 = 37000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    var h = try NotifyHarness.start(&tm, &server, port);
+
+    // Same window as the unit test above, but end to end, so the assertion
+    // covers the server reading its baseline *before* the fetch rather than
+    // after. The fetch-attempt counter is what makes the timing aimable:
+    // publish the instant the server starts looking, which is as close to
+    // the window as this side of the socket can get.
+    var round: u64 = 0;
+    while (round < 40) : (round += 1) {
+        ever.net.test_fetch_attempts.store(0, .monotonic);
+        var f = BlockedFetcher{ .port = port, .topic = "race.topic", .from = round, .block_ms = 2_000 };
+        const ft = try std.Thread.spawn(.{}, BlockedFetcher.run, .{&f});
+        while (ever.net.test_fetch_attempts.load(.monotonic) == 0) {
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 50_000 }, null);
+        }
+        _ = try tm.publish("race.topic", null, "racy");
+        ft.join();
+        try testing.expectEqual(@as(u64, 1), f.event_count.load(.acquire));
+    }
+
+    h.stop();
+}
+
+test "integration: shutdown does not wait out a subscriber's block window" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("bye.topic");
+
+    const port: u16 = 38000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    var h = try NotifyHarness.start(&tm, &server, port);
+
+    // A subscriber that asked to block for a minute. Parking made this the
+    // one property replacing a poll with a wait takes away, so shutdown has
+    // to give it back explicitly.
+    var f = BlockedFetcher{ .port = port, .topic = "bye.topic", .from = 0, .block_ms = 60_000 };
+    const ft = try std.Thread.spawn(.{}, BlockedFetcher.run, .{&f});
+    while (!f.sent.load(.acquire)) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 200_000_000 }, null);
+
+    const t0 = nowNanos();
+    h.stop();
+    ft.join();
+    const elapsed_ms = @divTrunc(nowNanos() - t0, 1_000_000);
+    try testing.expect(elapsed_ms < 2_000);
+}
