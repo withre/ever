@@ -136,7 +136,14 @@ pub const TopicManager = struct {
     log: Log,
     topics: StringArrayHashMap(TopicIndex),
     deleted_topics: std.StringHashMap(void),
-    mutex: std.atomic.Mutex ,
+    /// Blocking, not spinning: a thread that loses this lock parks on a futex
+    /// instead of burning a core. That matters because `fetchPatternByOffset`
+    /// holds it across a whole log scan, so the waiter is a publisher and the
+    /// wait can be long. Non-reentrant, as before -- the `*Locked` entry-point
+    /// variants still exist for exactly that reason, and violating the
+    /// discipline now deadlocks quietly rather than spinning visibly.
+    /// See air/v0.1/store-blocking-locks.org.
+    mutex: std.Io.Mutex = .init,
     /// Test-only fault injection: when true, `createTopicLocked` fails just
     /// before appending the topic-creation marker, simulating a log-append
     /// failure. Never set in production code.
@@ -153,7 +160,7 @@ pub const TopicManager = struct {
             .log = log,
             .topics = .empty,
             .deleted_topics = std.StringHashMap(void).init(allocator),
-            .mutex = .unlocked,
+            .mutex = .init,
         };
 
         // Rebuild topic index from log contents
@@ -174,7 +181,11 @@ pub const TopicManager = struct {
     }
 
     fn lock(self: *TopicManager) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.mutex.lockUncancelable(self.log.io);
+    }
+
+    fn unlock(self: *TopicManager) void {
+        self.mutex.unlock(self.log.io);
     }
 
     /// Public lock used by the hook-registration path to compute a "tip"
@@ -188,8 +199,9 @@ pub const TopicManager = struct {
     }
 
     pub fn unlockForHookRegistration(self: *TopicManager) void {
-        self.mutex.unlock();
+        self.unlock();
     }
+
 
     /// Return the current tip for `pattern` — the cursor value the hook
     /// daemon should use as a starting point so only events published after
@@ -229,7 +241,7 @@ pub const TopicManager = struct {
     /// and any subsequent action by the caller.
     pub fn tipForPattern(self: *TopicManager, pattern: []const u8) u64 {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.tipForPatternLocked(pattern);
     }
 
@@ -237,7 +249,7 @@ pub const TopicManager = struct {
     /// topic survives restart even if no events are published to it.
     pub fn createTopic(self: *TopicManager, name: []const u8) !void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         try self.createTopicLocked(name);
     }
 
@@ -267,7 +279,7 @@ pub const TopicManager = struct {
     /// A tombstone marker is written to the log so the state survives restart.
     pub fn deleteTopic(self: *TopicManager, name: []const u8) !void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         if (!self.topics.contains(name)) return TopicError.NotFound;
         if (self.deleted_topics.contains(name)) return TopicError.NotFound;
 
@@ -285,7 +297,7 @@ pub const TopicManager = struct {
     /// Check if a topic exists (including soft-deleted topics).
     pub fn hasTopic(self: *TopicManager, name: []const u8) bool {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.topics.contains(name);
     }
 
@@ -298,14 +310,14 @@ pub const TopicManager = struct {
     /// Check if a topic is soft-deleted.
     pub fn isTopicDeleted(self: *TopicManager, name: []const u8) bool {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.deleted_topics.contains(name);
     }
 
     /// List all topic names. Caller owns the returned slice and strings.
     pub fn listTopics(self: *TopicManager, allocator: Allocator) ![]TopicListEntry {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         const keys = self.topics.keys();
         const result = try allocator.alloc(TopicListEntry, keys.len);
         var initialized: usize = 0;
@@ -326,7 +338,7 @@ pub const TopicManager = struct {
     /// Return all topic names matching a subscription pattern.
     pub fn matchTopics(self: *TopicManager, allocator: Allocator, input: []const u8) ![][]const u8 {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         var matched: std.ArrayList([]const u8) = .empty;
         errdefer { for (matched.items) |m| allocator.free(m); matched.deinit(allocator); }
         for (self.topics.keys()) |key| {
@@ -349,7 +361,7 @@ pub const TopicManager = struct {
         // Phase 1: validate under lock
         {
             self.lock();
-            defer self.mutex.unlock();
+            defer self.unlock();
             if (self.deleted_topics.contains(topic_name)) return TopicError.TopicDeleted;
             if (!self.topics.contains(topic_name)) return TopicError.NotFound;
         }
@@ -358,7 +370,7 @@ pub const TopicManager = struct {
         // Phase 3: update index under lock
         {
             self.lock();
-            defer self.mutex.unlock();
+            defer self.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             try idx.offsets.append(self.allocator, offset);
             if (value.len != 0) idx.non_marker_count += 1 else try idx.noteMarker(self.allocator);
@@ -377,7 +389,7 @@ pub const TopicManager = struct {
         // discover they are skipped. See air/v0.1/subscribe-fetch-seek.org.
         const offsets_copy = blk: {
             self.lock();
-            defer self.mutex.unlock();
+            defer self.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             const from = idx.firstIndexForSkip(start);
             break :blk try allocator.dupe(u64, idx.offsets.items[from..]);
@@ -414,7 +426,7 @@ pub const TopicManager = struct {
         // Phase 1: copy the relevant tail of the offset index under lock
         const offsets_copy = blk: {
             self.lock();
-            defer self.mutex.unlock();
+            defer self.unlock();
             const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
             const items = idx.offsets.items;
             // Binary search: first index with items[i] > after_offset
@@ -453,7 +465,7 @@ pub const TopicManager = struct {
     /// "start beyond end of topic" from "topic is empty".
     pub fn topicEventCount(self: *TopicManager, topic_name: []const u8) ?u64 {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         if (self.topics.getPtr(topic_name)) |idx| return idx.non_marker_count;
         return null;
     }
@@ -479,7 +491,7 @@ pub const TopicManager = struct {
         // so log appends and readBatch don't race; readBatch itself is not
         // thread-safe against concurrent appends.
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
 
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
@@ -546,7 +558,7 @@ pub const TopicManager = struct {
         // Same locking rationale as fetchPatternByOffset: readBatch is not
         // thread-safe against concurrent appends.
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
 
         var count: u64 = 0;
         var cursor = start_offset;
@@ -579,7 +591,7 @@ pub const TopicManager = struct {
         }
         {
             self.lock();
-            defer self.mutex.unlock();
+            defer self.unlock();
             var topic_iter = self.topics.iterator();
             while (topic_iter.next()) |entry| {
                 if (!matchTopic(pattern, entry.key_ptr.*)) continue;

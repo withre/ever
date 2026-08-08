@@ -699,8 +699,8 @@ pub const Server = struct {
         var segments: u64 = 0;
         var total_bytes: u64 = 0;
         {
-            while (!tm.log.mutex.tryLock()) std.atomic.spinLoopHint();
-            defer tm.log.mutex.unlock();
+            tm.log.mutex.lockUncancelable(tm.log.io);
+            defer tm.log.mutex.unlock(tm.log.io);
             segments = tm.log.segments.items.len;
             for (tm.log.segments.items) |seg| total_bytes += seg.size;
         }

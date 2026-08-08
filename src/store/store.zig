@@ -112,7 +112,9 @@ pub const Log = struct {
     segments: std.ArrayList(Segment) = .empty,
     next_offset: u64 = 0,
     config: Config,
-    mutex: std.atomic.Mutex ,
+    /// Blocking, not spinning. See the note on `TopicManager.mutex` and
+    /// air/v0.1/store-blocking-locks.org.
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !Log {
         var log = Log{
@@ -120,7 +122,7 @@ pub const Log = struct {
             .io = io,
             .dir = dir,
             .config = config,
-            .mutex = .unlocked,
+            .mutex = .init,
         };
         try log.recover();
         return log;
@@ -133,8 +135,8 @@ pub const Log = struct {
 
     /// Append an event. Thread-safe. Returns the global offset.
     pub fn append(self: *Log, topic: []const u8, key: ?[]const u8, value: []const u8) !u64 {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const offset = self.next_offset;
         const event = Event{

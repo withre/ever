@@ -1621,3 +1621,64 @@ test "integration: fetch at the tail does not re-read the topic" {
     }
     try testing.expect(ever.store.Log.test_read_count >= n);
 }
+
+// ── Store locks park, they do not spin (air/v0.1/store-blocking-locks.org) ──
+//
+// Correctness is unchanged by the spinlock -> Io.Mutex conversion, so the
+// only assertion that distinguishes the two implementations is the one about
+// what a *waiting* thread costs. This test fails on the spinlock.
+
+const LockHog = struct {
+    tm: *TopicManager,
+    hold_ns: i64,
+    started: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LockHog) void {
+        self.tm.lockForHookRegistration();
+        defer self.tm.unlockForHookRegistration();
+        self.started.store(true, .release);
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = self.hold_ns }, null);
+    }
+};
+
+fn waitForTopicCount(tm: *TopicManager) void {
+    // Any call that takes the manager lock. Blocks until the hog releases.
+    _ = tm.topicEventCount("lock.topic");
+}
+
+fn threadCpuNanos() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+    return ts.sec * 1_000_000_000 + ts.nsec;
+}
+
+test "integration: threads waiting on the store lock burn no CPU" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("lock.topic");
+
+    const hold_ms = 300;
+    var hog = LockHog{ .tm = &tm, .hold_ns = hold_ms * 1_000_000 };
+    const hog_thread = try std.Thread.spawn(.{}, LockHog.run, .{&hog});
+
+    // Wait until the hog definitely holds the lock, without holding it here.
+    while (!hog.started.load(.acquire)) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+
+    const cpu_before = threadCpuNanos();
+    var waiters: [4]std.Thread = undefined;
+    for (&waiters) |*t| t.* = try std.Thread.spawn(.{}, waitForTopicCount, .{&tm});
+    for (&waiters) |*t| t.join();
+    const cpu_after = threadCpuNanos();
+    hog_thread.join();
+
+    // Four threads each blocked for ~300ms. Spinning would charge the process
+    // ~1.2s of CPU; parking charges approximately nothing. The bound is loose
+    // on purpose — the point is to separate 1,200,000,000 from ~0, not to
+    // measure a scheduler.
+    const spent_ns = cpu_after - cpu_before;
+    const spin_would_cost_ns: i64 = waiters.len * hold_ms * 1_000_000;
+    try testing.expect(spent_ns < @divTrunc(spin_would_cost_ns, 4));
+}

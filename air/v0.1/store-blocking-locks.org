@@ -1,0 +1,99 @@
+#+title: The Store's Locks Should Block, Not Spin
+#+state: complete
+#+FILETAGS: :store:core:performance:
+
+* Summary
+=TopicManager.mutex= and =Log.mutex= are =std.atomic.Mutex=, a spinlock: =while (!self.mutex.tryLock()) std.atomic.spinLoopHint();=. A thread that loses the lock burns a core until it wins. =fetchPatternByOffset= holds the manager lock across an entire log scan with =pread= syscalls inside it, so a publisher waiting on that scan does not sleep — it spins for the duration. Convert both to =std.Io.Mutex=, which is in the pinned toolchain and parks the loser on a futex. This is worth doing on its own, and it is a prerequisite for =subscribe-notify-on-append.org=.
+
+* Motivation
+
+** The spinlocks exist because of a wrong note in our own context files
+
+=air/context/implementation-guide.org= says, under Zig 0.16/0.17 API Notes:
+
+#+begin_quote
+*Mutex*: =std.Thread.Mutex= is gone. Use =std.atomic.Mutex= (spinlock enum with =.tryLock()= and =.unlock()=, no blocking =.lock()=).
+#+end_quote
+
+The first half is true and the conclusion does not follow. The blocking primitives did not disappear from the standard library; they moved to =std.Io=. The pinned snapshot has =std.Io.Mutex=, =std.Io.Condition=, =std.Io.RwLock=, =std.Io.Semaphore= and =std.Io.Event=, all built on =io.futexWait= / =io.futexWake=. On Linux those are the plain =futex(2)= syscall, and they work from threads created with =std.Thread.spawn= — the cancel check returns early when there is no =Io= thread registered, which is the case for every thread this project spawns.
+
+So the note cost the project a blocking mutex it always had, and — I believe — the polling subscriber too: with no way to wait for a condition, a sleep loop is the only thing left.
+
+** What the spinlock costs today
+
+- =fetchPatternByOffset= takes the manager lock and holds it for a whole scan: =readBatch= in a loop, two =pread= calls per event, up to the log head. Any publish arriving during that scan spins a core until it finishes. The scan length is unbounded in the log's size.
+- =publish= itself takes the lock three times per event (validate, then update the index) and the hook daemon takes it every 500 ms per hook. On a busy store these collide, and every collision is a spin rather than a sleep.
+- The project already knows the shape of the rule — implementation-guide.org says "Mutex scope for I/O: copy index data under the lock, release it, then do disk I/O without the lock". =fetch=, =fetchPattern= and =fetchAfterOffset= obey it. =fetchPatternByOffset= does not, and documents its reason in a comment: =readBatch= is not safe against concurrent appends. That reason is real, so the fix is not "drop the lock" — it is "make waiting cheap", and separately to shorten the hold.
+
+** Why it must happen before notification
+
+=subscribe-notify-on-append.org= replaces per-subscriber sleeps with a broadcast. Today's pollers are staggered by their own arrival times and rarely collide. A broadcast wakes every waiter at the same instant and they all immediately want the same lock: a thundering herd, and on a spinlock every loser burns CPU instead of parking. Notification landing on spinlocks would make idle-subscriber CPU *worse* at the moment an event arrives — precisely the moment latency is being measured. This document is the prerequisite, not a nice-to-have.
+
+* Goals
+- A thread waiting for either store lock consumes no CPU while it waits.
+- No change to locking *discipline*: both locks stay non-reentrant, the =*Locked= entry-point variants keep their meaning, and no critical section is widened or narrowed.
+- No change to any behaviour observable from the wire or the CLI.
+
+* Non-Goals
+- Reducing how long =fetchPatternByOffset= holds the lock. That is a real and separate improvement (snapshot a bounded window, read outside the lock, as =fetch= does) and it deserves its own change with its own tests. Making the wait cheap is orthogonal to making the hold short, and doing both at once would make a regression impossible to attribute.
+- Replacing either lock with an =RwLock=. Plausible later; it changes the concurrency model and needs its own argument.
+- Any change to =HookTable=, =ProcessTable= or =TimerTable= locking. They have the same spinlock and =HookTable= holds it across =saveLocked=, which writes a file — so the same defect, arguably worse. They are excluded for a concrete reason and not an arbitrary one: none of them carries an =Io=, and =Io.Mutex= needs one, so converting them means threading =io= through three constructors and every call site that builds them. That is a field-propagation change of the kind this project already flags as costing "12+ coordinated updates", and it does not belong in the same commit as a type swap that needed none. Recorded here as follow-up.
+
+* Proposal
+
+Replace the field type and route the existing helpers through it.
+
+#+begin_src zig
+mutex: std.Io.Mutex = .init,
+
+fn lock(self: *TopicManager) void {
+    self.mutex.lockUncancelable(self.log.io);
+}
+
+fn unlock(self: *TopicManager) void {
+    self.mutex.unlock(self.log.io);
+}
+#+end_src
+
+=TopicManager= already reaches an =Io= through =self.log.io=, so nothing needs new plumbing. =Log= holds =io= directly.
+
+=lockUncancelable= rather than =lock=: the cancelable variant introduces a cancelation point and returns =Cancelable!void=, which would turn every lock acquisition in the store into an error path for a facility this project does not use. If Ever later adopts =io.async= for connection handling, revisiting that is a deliberate decision rather than an accident.
+
+** Call sites
+
+=TopicManager= currently calls =self.lock()= and then =self.mutex.unlock()= directly — around thirty sites. Introducing the =unlock= helper and routing every site through the pair keeps the =io= argument in one place, so a future change of =Io= source touches two lines rather than thirty. The same applies to =Log=.
+
+* Design Details
+
+** Files expected to change
+- =src/store/topic.zig= — field type, =lock=/=unlock= helpers, call sites.
+- =src/store/store.zig= — same for =Log=.
+- =air/context/implementation-guide.org= — correct the Mutex note; it is the root cause and leaving it would reintroduce the spinlocks in the next module.
+
+** Risks
+
+- *Deadlock on the non-reentrant lock is now silent instead of hot.* Today a reentrant acquisition spins at 100% CPU and is obvious in =top=. After this change it parks and the process simply stops making progress. The =*Locked= discipline is already documented as a repository trap; this makes violating it quieter, which is worth stating in the same trap entry rather than discovering later.
+- *Tests use =std.testing.io=.* Confirm the test =Io= services =futexWait= — a test that hangs rather than fails is the worst outcome here. Verify before converting, not after.
+
+** Testing
+
+Correctness is unchanged by construction, so the tests that matter are the ones proving the *property*:
+
+- A contention test: one thread holds the lock for a known interval while N others wait; assert the waiters' CPU time is near zero. This fails on the spinlock and passes after — the same negative-control discipline used for the opcode work, and it is the only assertion that actually distinguishes the two implementations.
+- The existing suite must pass unchanged, in Debug and ReleaseSafe, and in ReleaseFast because this is a concurrency change and the repository note is explicit that races may only show in release builds.
+
+* History
+- 2026-08-08: Drafted. Found while establishing what notification would cost (=subscribe-notify-on-append.org=): the manager lock a broadcast would wake everyone onto turned out to be a spinlock, and the context note that put it there turned out to be wrong.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.
+- 2026-08-08: Shipped. =TopicManager.mutex= and =Log.mutex= are =std.Io.Mutex=; =TopicManager= gained an =unlock= helper so the =io= argument appears twice rather than seventeen times. One call site outside the store — =handleStatus= reaching into =tm.log.mutex= directly for segment stats — also needed updating, which is its own small argument for the helper pair.
+
+  Verified before converting, not after, because the failure mode of getting this wrong is a hung test rather than a failing one: a standalone program confirmed =Io.Mutex= and =Io.Condition= work from =std.Thread.spawn= threads under both a real =Io= and =std.testing.io=, and that four threads hammering an =Io.Mutex= 20,000 times each produce exactly 80,000 increments.
+
+  The regression is the only assertion that can tell the two implementations apart: four threads block ~300 ms on the manager lock while a fifth holds it, and the process's CPU time over that window must come in under a quarter of what spinning would cost. Negative control on a copy of the tree with the three files reverted: it fails there, and only it — 131 of 132 pass.
+
+  131/131 plus the new test pass in Debug, ReleaseSafe and ReleaseFast.
+
+  =implementation-guide.org= now says the blocking primitives moved to =std.Io= rather than that they are gone, records that they work from plain =std.Thread= threads and under =std.testing.io=, and says which variants to prefer. Leaving the old note would have reintroduced the spinlock in the next module that needed a lock.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.
