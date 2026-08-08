@@ -58,7 +58,6 @@ ever pub <topic> --stdin  # Publish events from stdin
 
 ever sub <topic>          # Subscribe and print events
 ever sub <topic> --from <offset>  # Start from specific offset
-ever sub <topic> --group <name>   # Join consumer group
 ever sub <topic> --follow         # Keep listening for new events
 
 ever status               # Overall system status
@@ -71,6 +70,10 @@ ever version              # Version information
 - =--quiet= flag for minimal output (just data, no decoration)
 - Error messages go to stderr, data goes to stdout
 - Exit codes: 0 for success, 1 for errors, 2 for usage errors
+
+*** No Consumer Groups
+
+There is no =--group= and no server-side offset commit, and this is a decision rather than a gap. Resumption is client-side: =ever on --name <n>= keeps a cursor file (=event-triggers.org= argues the case, including why putting consumer state in the store "makes the store a scheduler"), and =ever hook= carries a server-side cursor keyed to a registration when a durable, server-driven consumer is genuinely wanted. The =ack= opcode that once declared the group commit answered =ack_ok= and stored nothing for as long as it existed; it is gone (=v0.1/ack-opcode-removal.org=). Do not reintroduce a group flag without a named consumer and a reason those two cursors do not serve it.
 
 *** Interactive Patterns
 - =ever sub --follow= streams continuously until Ctrl-C

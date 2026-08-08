@@ -160,7 +160,6 @@ pub const Server = struct {
             .create_topic => try self.handleCreateTopic(frame.body, fd),
             .delete_topic => try self.handleDeleteTopic(frame.body, fd),
             .list_topics => try self.handleListTopics(fd),
-            .ack => try protocol.writeFrame(fd, .ack_ok, "{}"),
             .register_hook => try self.handleRegisterHook(frame.body, fd),
             .unregister_hook => try self.handleUnregisterHook(frame.body, fd),
             .list_hooks => try self.handleListHooks(fd),

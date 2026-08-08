@@ -1467,6 +1467,12 @@ test "integration: every opcode byte is answered, not fatal" {
         // On an exhaustive MessageType this is the byte that killed the store.
         try expectUnknownRequestType(cfd, 0x11, "{}");
 
+        // Retired byte: 0x06 was `ack`, which answered ack_ok to anything --
+        // including this body, whose topic does not exist. It must now be
+        // refused like any other opcode the server does not implement.
+        // (air/v0.1/ack-opcode-removal.org)
+        try expectUnknownRequestType(cfd, 0x06, "{\"topic\":\"no.such.topic\",\"group\":\"g\",\"offset\":7}");
+
         // Assigned but not a request: a response opcode replayed inbound.
         // This case always worked; assert the fix did not reroute it.
         try expectUnknownRequestType(cfd, 0x81, "{}");
@@ -1477,7 +1483,7 @@ test "integration: every opcode byte is answered, not fatal" {
         try expectUnknownRequestType(cfd, 0xFE, "{}");
 
         // Same connection, still serving: the server neither died nor
-        // dropped the client that spoke nonsense to it four times.
+        // dropped the client that spoke nonsense to it five times.
         try writeRawFrame(cfd, @intFromEnum(ever.protocol.MessageType.list_topics), "{}");
 
         const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;

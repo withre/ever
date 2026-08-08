@@ -1,0 +1,144 @@
+#+title: Remove the ack Opcode
+#+state: complete
+#+FILETAGS: :protocol:subscriber:bug:
+
+* Summary
+The =ack= opcode answers =ack_ok= and does nothing. =AckRequest= carries ={ topic, group, offset }= — a consumer-group offset commit — and the body is never decoded, because there is nothing that would read it. Delete the opcode, its response, and the request struct. Consumer groups have been declined in writing four times in this project's own documents; the concept has no owner here, and the one consumer large enough to have prompted the report says it will decline the feature if it is built. Removal depends on =protocol-unknown-opcode.org=, without which deletion turns the lie into a crash.
+
+* Motivation
+
+** The finding
+
+=src/net/server.zig:163=, the entire implementation:
+
+#+begin_src zig
+.ack => try protocol.writeFrame(fd, .ack_ok, "{}"),
+#+end_src
+
+Reported by an assessment agent working on Reverie, reading this tree from outside. Verified here on every count, and the verification is stronger than the report:
+
+- No reader of =AckRequest= exists. =grep= finds the struct definition at =message.zig:122= and nothing else — no decode site, no storage, no test.
+- =Client= has no =ack= method. There is no CLI surface and no HTTP route.
+- Nothing anywhere in =src/= mentions a consumer group. The word =group= appears in =message.zig= (this struct's field) and otherwise only in =hooks.zig=, meaning process groups.
+
+Reproduced against a store built from this tree, on port 47611, speaking raw frames:
+
+#+begin_example
+ack, well-formed body, topic 'probe.topic' DOES NOT EXIST -> 0x86 {}
+ack, body "this is not json at all"                       -> 0x86 {}
+ack, empty body                                           -> 0x86 {}
+#+end_example
+
+The server does not check that the topic exists, because it does not look at the body at all. Every one of those is a client being told its cursor was committed.
+
+** The failure class
+
+This is the shape Ever's collaborators have already named: *the visible half of a two-part guarantee is the half that gets implemented.* The =ack_ok= frame is the visible half. Storing the cursor is the half that is missing, and its absence is undetectable from the client side — an =ack= that silently did nothing looks exactly like an =ack= that worked, until a restart resumes from a position nobody committed.
+
+The same shape is on file elsewhere in this tree: =publish-input-validation.org= (a tombstone injection that returned an offset and was invisible until the next rebuild), and =hook-scan-cursor-and-lag.org= (a hook that advances its cursor only on delivery, so a scan that matches nothing leaves no trace of having run). The pattern is worth naming each time it is found, because each instance is cheap to fix and expensive to discover.
+
+* Goals
+- No opcode in the protocol claims a guarantee no code delivers.
+- A client that still sends =ack= gets a truthful refusal, not a false success and not a dead socket.
+- The bytes =0x06= / =0x86= are not silently reassigned to something else, so an old =ack= frame cannot be reinterpreted as a future opcode.
+
+* Non-Goals
+- Implementing consumer groups. Argued below; if the concept is ever wanted, it starts from a new document and a stated demand, not from resurrecting an opcode nobody called.
+- Any change to hook cursors. Hooks already carry persisted server-side cursors (=hook-registration-cursor.org=) and are unaffected.
+- Any change to =ever on= cursor files, which are client-side by deliberate design (=event-triggers.org=).
+- A protocol version bump. See "Compatibility".
+
+* Proposal
+
+Delete, in one change:
+
+- =MessageType.ack = 0x06= and =MessageType.ack_ok = 0x86=, replaced by a comment recording that the pair is retired and must not be reused.
+- =AckRequest=.
+- The =.ack= arm of =handleFrame=.
+
+After the deletion — and only because =protocol-unknown-opcode.org= has landed first — a client that sends =0x06= receives =0xFF {"code":400,"message":"unknown request type"}= and keeps its connection. That is the honest answer to a request the server does not implement, and it is the same answer every other unimplemented byte gives.
+
+** Dependency
+
+=protocol-unknown-opcode.org= is a blocker, not a nicety. On today's exhaustive enum, removing =ack= moves =0x06= into the set of bytes that panic =readFrame= and end the process. Shipping the deletion alone would convert "tells you it worked" into "kills the store", aimed precisely at the clients the deletion exists to stop misleading. Land the decoder fix first, in its own commit, and this change becomes safe and small.
+
+** Compatibility
+
+No version bump. =PROTOCOL_VERSION= gates frame *layout*, which is unchanged; a client built against the old header and a server built against the new one still agree on all six header bytes and on every opcode either of them will actually send. The only observable difference is that =0x06= now answers =400= instead of =ack_ok=, and no shipped client can produce a =0x06= frame — =Client= never had the method. A version bump would break every working client to protect a call nobody can make.
+
+** Reserving the byte
+
+The enum keeps a comment where the pair was:
+
+#+begin_src zig
+// 0x06 / 0x86 were `ack` / `ack_ok` — a consumer-group offset commit that
+// was never implemented (see air/v0.1/ack-opcode-removal.org). Do not
+// reuse these bytes: an old client's ack must keep getting 400 rather
+// than being silently reinterpreted as some later opcode.
+#+end_src
+
+Two bytes out of 256 is a cheap price for never having to wonder whether an inbound =0x06= meant the old thing or the new one.
+
+* Design Details
+
+** Files expected to change
+- =src/protocol/message.zig= — remove two enum values and =AckRequest=; add the reservation comment.
+- =src/net/server.zig= — remove the =.ack= arm.
+- =air/context/architecture.org= — the wire-protocol table lists =0x01-06 ... ack=; correct the range and the contents.
+- =air/v0.1/wire-protocol.org= — the original spec declared =ack=. Per the conventions, the shipped spec is not rewritten; a History entry records the retirement and points here.
+- =SKILL.md= — no change needed; it never documented =ack=, which is itself evidence of how unused it was.
+
+** Testing
+
+Assert the absence rather than trusting the deletion: a raw-frame test that sends =0x06= and expects =400=. That test is a strict subset of the unknown-opcode test in =protocol-unknown-opcode.org= — same assertion, a byte with history instead of a byte without. Both live in =src/tests/integration.zig=.
+
+Nothing else needs a test, because nothing else can observe the change: no client method to break, no CLI path to regress, no persisted state to migrate.
+
+* Decision Log
+
+** Remove rather than implement (2026-08-08)
+
+The brief offered both and left the choice here. Removal, for four reasons drawn from this project's record rather than from any consumer's preference:
+
+*1. Ever has declined server-side consumer groups four times, in writing.*
+
+| Document                    | What it says                                                        |
+|-----------------------------+---------------------------------------------------------------------|
+| =client-library.org=        | Non-Goals: "Consumer group offset management (track offsets client-side for now)" |
+| =topic-management.org=      | Non-Goals: "Consumer group / offset tracking (separate spec)"        |
+| =offset-coherence.org=      | Non-Goals: "Consumer groups / server-side acks."                     |
+| =event-triggers.org=        | Chooses the opposite architecture outright                           |
+
+The "separate spec" =topic-management.org= promised was never written. =event-triggers.org= goes further than deferral: =ever on= persists its position in a *cursor file*, and the document defends that choice explicitly — "Kafka solves this with committed offsets per consumer group. =ever on= solves it with a file. No server involvement, no protocol change" — with a named rejected counterargument that moving consumer state into the store "makes the store a scheduler". Implementing =ack= now would contradict four documents to satisfy nobody.
+
+*2. The server-side cursor that earned its place already exists.* Hooks carry persisted cursors, keyed to a registration rather than to a group name, and they are what this project actually reaches for when it wants "remember where I was" (=hook-registration-cursor.org=). =ack= would be a second, unrelated, unused mechanism for the same want, with its own persistence and its own bugs.
+
+*3. The four-line estimate prices the wrong half.* Four lines buys a hash map. The guarantee needs all of:
+
+- *Persistence.* A cursor that a restart forgets is the same lie on a longer timer. The tree's two comparable registries — =hooks.zig= and =timers.zig= — are 1773 and 1057 lines, and this project's own note is that adding one field to a persisted struct costs "12+ coordinated updates".
+- *A read path.* Commit with no way to resume is the visible half of the guarantee again, in a new place. That means =FetchRequest= gains a group, or a new opcode does.
+- *A decided unit for =offset=.* Global log offset or topic-local skip count? =offset-coherence.org= exists because this exact ambiguity already bit this project once, and =hook-registration-cursor.org= ended up with a cursor whose meaning is polymorphic in the pattern shape. =AckRequest.offset= specifies neither.
+- *Monotonicity.* Two members of one group committing out of order: last-writer-wins silently rewinds the group.
+- *Garbage collection.* Groups that never come back accumulate forever. =hook-gc-and-lease.org= is the same problem for hooks and is still only =ready=.
+
+*4. Removal costs nothing, because nothing can call it.* No client method, no CLI flag, no HTTP route, no test, no reader. The deletion cannot break a caller that does not exist.
+
+*What would change this decision:* a named consumer that wants a group cursor and has a reason the hook cursor and =ever on= cursor files do not serve. Reverie is not that consumer — a committed cursor has no offset, so it cannot lose a race to a drop, and Reverie orders everything by "lower global offset happened first". No demand signal is not the same as an unpopular feature; it is the reason not to carry the declaration.
+
+** Rejected: keep the opcode and answer 400 from its own arm (2026-08-08)
+
+Honest, and one line. Rejected because it keeps =AckRequest= and two enum values alive as a standing invitation to "finish" them, and because the =else= arm gives the identical answer for free once =protocol-unknown-opcode.org= lands. A retired-byte comment carries the same history at less weight.
+
+* History
+- 2026-08-08: Drafted. Reported by an assessment agent working on Reverie; verified here against a store built from this tree, including the two cases the report did not cover — an =ack= for a topic that does not exist, and an =ack= whose body is not JSON, both of which return =ack_ok=. Decision recorded above.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.
+- 2026-08-08: Shipped, on top of =protocol-unknown-opcode.org= as required. =MessageType= loses =ack= and =ack_ok=, each replaced by a comment marking the byte retired and asking that it not be reused; =AckRequest= and the =.ack= arm of =handleFrame= are gone. Nothing else changed, because nothing else referred to any of it — which was the argument for removal.
+
+  129/129 tests pass in Debug, ReleaseSafe and ReleaseFast. The regression is one line added to =integration: every opcode byte is answered, not fatal=: =0x06= carrying a plausible =ack= body for a topic that does not exist, expecting =400=. Its negative control is on record from the previous commit — a store built with the decoder fix but before this one answered that exact frame =0x86 {}=.
+
+  Verified live on port 47613: =0x06= and =0x86= both return =400 unknown request type=, and =create_topic= / =publish= / =list_topics= / =ever pub= / =ever sub= / =ever status= all work unchanged over the same server. No caller regressed because no caller existed.
+
+  Documentation: =architecture.org= marks =0x06= retired in the message-type table; =wire-protocol.org= keeps its original text and records the retirement in History, per the convention that shipped specs are annotated rather than rewritten. =interface-design.org= lost its =ever sub --group <name>  # Join consumer group= line, which was a CLI sketch for the feature this document declines — replaced by a short section saying there are no consumer groups, naming the two cursors that do the job instead, and asking that a group flag not come back without a named consumer. Leaving that line in place would have been the same failure one layer up: a declared interface with nothing behind it.
+
+  *One thing this change does not fix.* =interface-design.org= > Request-Response Pattern still says "Publish → Ack (with assigned offset)". That "Ack" is =publish_ok= and is real — it does carry the assigned offset — but the word now has only one meaning in this protocol and it is not this one. Left alone deliberately rather than churned; noted so the next reader does not think it points at something that was deleted.

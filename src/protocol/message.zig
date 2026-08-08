@@ -22,7 +22,11 @@ pub const MessageType = enum(u8) {
     create_topic = 0x03,
     delete_topic = 0x04,
     list_topics = 0x05,
-    ack = 0x06,
+    // 0x06 is retired. It was `ack` -- a consumer-group offset commit that
+    // replied ack_ok and stored nothing, so every client that committed a
+    // cursor through it was told it worked. Do not reuse the byte: an old
+    // client's ack must keep getting 400 rather than being silently
+    // reinterpreted as a later opcode. See air/v0.1/ack-opcode-removal.org.
     register_hook = 0x07,
     unregister_hook = 0x08,
     list_hooks = 0x09,
@@ -40,7 +44,7 @@ pub const MessageType = enum(u8) {
     create_topic_ok = 0x83,
     delete_topic_ok = 0x84,
     list_topics_ok = 0x85,
-    ack_ok = 0x86,
+    // 0x86 is retired with its request; see 0x06 above.
     register_hook_ok = 0x87,
     unregister_hook_ok = 0x88,
     list_hooks_ok = 0x89,
@@ -127,12 +131,6 @@ pub const TopicInfoItem = struct {
 
 pub const ListTopicsResponse = struct {
     topics: []const TopicInfoItem,
-};
-
-pub const AckRequest = struct {
-    topic: []const u8,
-    group: []const u8,
-    offset: u64,
 };
 
 pub const ErrorResponse = struct {
