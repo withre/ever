@@ -1,0 +1,133 @@
+#+title: An Unknown Opcode Byte Must Not Kill the Store
+#+state: complete
+#+FILETAGS: :protocol:core:bug:
+
+* Summary
+=readFrame= turns the wire's =msg_type= byte into a =MessageType= with a bare =@enumFromInt= on an *exhaustive* enum. Every byte outside the assigned set is illegal behaviour, which in Debug and ReleaseSafe is a panic on the connection thread — and a panic on any thread ends the process. One six-byte frame from anything that can reach the port stops the store, the hook daemon and the timer daemon together. Make =MessageType= non-exhaustive so unassigned bytes are ordinary values and reach the =else= arm that already exists and already answers =400 unknown request type=.
+
+* Motivation
+
+** Live reproduction
+
+Store built from this tree at =oknuvvtl=, run on an isolated data directory:
+
+#+begin_src bash
+ever start --data-dir /tmp/ackfix-store --port 47611
+#+end_src
+
+One frame, version =1=, opcode byte =0x11= (unassigned — the assigned request range ends at =status = 0x10=), body ={}=:
+
+#+begin_src
+unknown opcode 0x11 -> EXC [Errno 104] Connection reset by peer
+#+end_src
+
+Server log:
+
+#+begin_example
+[..] Ready. Press Ctrl-C to stop.
+thread 3071840 panic: invalid enum value
+src/protocol/message.zig:328:35: 0x1234afb in readFrame (root.zig)
+    const msg_type: MessageType = @enumFromInt(header[1]);
+                                  ^
+src/net/server.zig:149:45: 0x136e3c2 in handleConnection (root.zig)
+    const frame = protocol.readFrame(self.allocator, fd) catch break;
+#+end_example
+
+The process is gone afterwards — the next connection attempt gets =ECONNREFUSED=, and =pgrep= finds nothing. The hook daemon and timer daemon are threads of that process and die with it.
+
+** Why the existing guard does not catch it
+
+=handleFrame= ends with
+
+#+begin_src zig
+else => try sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "unknown request type"),
+#+end_src
+
+which reads like the unknown-opcode guard and is not one. The switch cannot run at all unless =readFrame= already produced a valid =MessageType=, so the =else= arm is reachable only for bytes that *are* assigned but are not requests — a response opcode replayed as a request. Confirmed on the same store: opcode =0x81= (=publish_ok=) sent as a request returns =0xFF {"code":400,"message":"unknown request type"}= and the connection survives. The arm works; it is simply downstream of the crash.
+
+The spec asked for the check. =wire-protocol.org= > Frame Reading lists, in order: "Validate version (must be 1)", "*Validate msg_type is a known enum value*", "Validate body_len ≤ max_message_size". Two of those three were written. The third was not, and its absence reads as its presence, because =MessageType= is a typed value by the time anyone looks at it.
+
+So the protocol has a hole exactly where it looks covered — 0x11 through 0x80, and 0x91 through 0xFE, are 238 bytes each of which is a remote kill, while the 15 bytes that are merely wrong get a polite 400.
+
+** Why this is worth a document of its own
+
+It was found while verifying the =ack= report (=ack-opcode-removal.org=), and it is the reason that removal cannot ship alone: deleting =ack = 0x06= from an exhaustive enum moves =0x06= from the "lies to you" set into the "kills the store" set, for exactly the clients the removal is meant to stop misleading. But its severity has nothing to do with =ack=. It is present today, it needs no unusual client, and filing it inside a document titled for an opcode deletion would hide it from anyone who ever greps =air/= for protocol robustness.
+
+** Blast radius
+
+- The TCP listener stops. In-flight connections on other threads are killed mid-frame.
+- The hook daemon stops. Registered hooks do not fire and their cursors stay where they were; on restart they resume, so events are delayed rather than lost — but =--once= orchestration hangs.
+- The timer daemon stops. Scheduled publishes do not happen and, unlike hooks, a missed tick is not replayed.
+- =ever.lock= is released by the kernel on process death, so the store restarts cleanly. Nothing warns that it went away.
+- The HTTP listener is a different code path with its own parser and is not implicated.
+
+* Goals
+- Any =msg_type= byte the server does not implement produces an =error_response= frame, not a panic.
+- The connection survives an unknown opcode; the client may send a valid frame next.
+- The response for an unassigned byte is the same one an unhandled assigned byte already gets — one behaviour, not two.
+- A regression test that fails without the fix.
+
+* Non-Goals
+- Rate limiting, authentication, or any other protection against a client that is merely hostile rather than confused. A single well-formed frame killing the process is a correctness bug; deciding who may connect is a separate question and is still out of scope for v0.1.
+- Frame-level hardening beyond the opcode: =body_len= is already bounded by =MAX_MESSAGE_SIZE= and =version= is already checked.
+- Auditing =@enumFromInt= elsewhere in the tree. Worth doing; not this document.
+- Changing the error code or message text. =400 unknown request type= is already correct for this case.
+
+* Proposal
+
+Make =MessageType= non-exhaustive:
+
+#+begin_src zig
+pub const MessageType = enum(u8) {
+    // ... assigned values unchanged ...
+    error_response = 0xFF,
+    _,
+};
+#+end_src
+
+With =_=, =@enumFromInt= is defined for every =u8=, =readFrame= stops being able to trap, and an unassigned byte arrives at =handleFrame= as a value no arm names — which is the =else= arm, which already sends =400 unknown request type= and leaves the connection open. The fix is one token in =message.zig=; the behaviour it produces is code that is already written and already correct.
+
+** Why not validate in readFrame
+
+Rejecting in =readFrame= (returning =error.UnknownMessageType=) also stops the panic, but =handleConnection= does =readFrame(...) catch break= — the client would get a silent connection close with no error frame, which is a worse answer than the one the server already knows how to give. Non-exhaustive keeps the diagnosis on the wire.
+
+** Switch exhaustiveness
+
+=switch (frame.msg_type)= in =handleFrame= is the only switch over =MessageType= in the tree, and it already has an =else=, so no other site needs to change. Equality comparisons in =client.zig= and the tests are unaffected.
+
+* Design Details
+
+** Files expected to change
+- =src/protocol/message.zig= — =_,= on =MessageType=; a comment on =readFrame= recording that the decoder is total by construction and why (so the next person does not "tidy" the =_= away).
+- =src/tests/integration.zig= — regression test.
+- =air/context/architecture.org= — the wire-protocol message-type table gains a row for unassigned bytes.
+
+** Testing
+
+Raw frames, following the pattern already used in =integration: hook logs distinguishes no-such-hook from no-executions=: =Client= collapses every =error_response= into =error.ServerError=, so a test that asserts on a specific code must speak the wire itself. With the enum non-exhaustive, =@enumFromInt(0x11)= is a legal way to name the opcode and =writeFrame= takes it unchanged.
+
+The test asserts, against a live server on a real socket:
+
+1. An unassigned request byte returns =error_response= with code =400= and message =unknown request type=.
+2. The *same connection* then serves a valid =list_topics= and gets =list_topics_ok= — proving the server neither died nor dropped the client.
+3. An assigned-but-unhandled byte (=0x81=) still behaves as it did before, so the fix did not reroute the case that already worked.
+
+Negative control, per the repository trap: build a copy of the tree in =/tmp= without =_,=, run the same test, confirm it panics. A test that passes both with and without the fix proves the exploit never ran.
+
+The test must live in =src/tests/integration.zig= or another file reachable from =root.zig=; a test file nothing imports silently never runs.
+
+* History
+- 2026-08-08: Drafted. Found while verifying the =ack= report against a live store (see =ack-opcode-removal.org= for that report's provenance): probing for what the =else= arm actually covers turned up that unassigned bytes never reach it. Reproduced as recorded above — one frame, process gone.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.
+- 2026-08-08: Shipped. =MessageType= is non-exhaustive; the doc comment on =_= says why and asks not to be tidied away, and =readFrame= gained a note that it is total by construction. No other code changed — the =else= arm in =handleFrame= was already right and is now reachable.
+
+  Negative control, run before the fix: the new test crashed the integration binary with =signal ABRT / panic: invalid enum value= at =message.zig:328=, i.e. the exploit ran. After the fix, 129/129 pass in both Debug and ReleaseSafe (was 128; integration 29 → 30).
+
+  The request side of the test writes the six header bytes by hand instead of calling =writeFrame=, so it compiles unchanged against a tree without =_=. Going through =MessageType= would have made the negative control impossible to build: =@enumFromInt(0x11)= is itself illegal behaviour on the exhaustive enum, so the test would have trapped in the test process rather than showing the server dying.
+
+  Verified independently of the tests, against a store built from this tree on port 47612: opcodes =0x11=, =0x2f=, =0x80=, =0x91=, =0xfe= and =0x81= each return =0xFF {"code":400,"message":"unknown request type"}=; =list_topics= on that same connection afterwards returns =0x85 {"topics":[]}=; the process is still alive and its log contains no panic. Before the fix the first of those frames ended the process.
+
+  =air/context/architecture.org=: the message-type table gained the unassigned-byte row and a paragraph recording that non-exhaustiveness is load-bearing. The table's assigned ranges were stale in the same edit — =0x0E-0x10= were missing entirely and timers were still marked "(planned)" — which had to be corrected for "any other" to mean anything.
+
+  *Not fixed here, and worth someone's time:* the un-decoded body of an unknown opcode is still allocated before it is refused, up to =MAX_MESSAGE_SIZE= (16MB). That is equally true of every known opcode, so it is not a regression and not this document's bug, but it is the next thing an unauthenticated peer can lean on.

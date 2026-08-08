@@ -1388,3 +1388,106 @@ test "integration: a real deleteTopic still deletes across the same rebuild" {
         try testing.expectEqual(@as(usize, 1), events.len);
     }
 }
+
+// ── Unknown opcode totality (air/v0.1/protocol-unknown-opcode.org) ─────────
+//
+// The request opcode arrives as an untrusted byte. Every value of that byte
+// must produce an answer on the wire; none may end the process. The request
+// side of these tests is written as raw bytes rather than through
+// `writeFrame`, so the test compiles identically against a tree without the
+// fix — that is what makes it a negative control rather than decoration.
+
+/// Write a frame with an arbitrary opcode byte, bypassing `MessageType`.
+fn writeRawFrame(fd: std.posix.fd_t, msg_type_byte: u8, body: []const u8) !void {
+    var header: [ever.protocol.HEADER_SIZE]u8 = undefined;
+    header[0] = ever.protocol.PROTOCOL_VERSION;
+    header[1] = msg_type_byte;
+    std.mem.writeInt(u32, header[2..6], @intCast(body.len), .little);
+    try rawWriteAll(fd, &header);
+    try rawWriteAll(fd, body);
+}
+
+fn rawWriteAll(fd: std.posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = std.os.linux.write(fd, data[written..].ptr, data.len - written);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) return error.WriteFailed;
+        if (signed == 0) return error.WriteFailed;
+        written += @intCast(signed);
+    }
+}
+
+/// Send `msg_type_byte` and assert the reply is `400 unknown request type`.
+fn expectUnknownRequestType(fd: std.posix.fd_t, msg_type_byte: u8, body: []const u8) !void {
+    try writeRawFrame(fd, msg_type_byte, body);
+    const frame = (try ever.protocol.readFrame(allocator, fd)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(frame.body);
+    try testing.expectEqual(ever.protocol.MessageType.error_response, frame.msg_type);
+    const parsed = try ever.protocol.decodeBody(ever.protocol.ErrorResponse, allocator, frame.body);
+    defer parsed.deinit();
+    try testing.expectEqual(ever.protocol.ErrorCode.bad_request, parsed.value.code);
+    try testing.expectEqualStrings("unknown request type", parsed.value.message);
+}
+
+test "integration: every opcode byte is answered, not fatal" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("opcode.survivor");
+
+    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
+    const port: u16 = 34000 + pid_part;
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
+
+    var reachable = false;
+    var attempts: u32 = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+            reachable = true;
+            break;
+        }
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    try testing.expect(reachable);
+
+    {
+        const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
+        const ip_address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
+        const stream = try ip_address.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        const cfd = stream.socket.handle;
+
+        // Unassigned request byte: the request range ends at status = 0x10.
+        // On an exhaustive MessageType this is the byte that killed the store.
+        try expectUnknownRequestType(cfd, 0x11, "{}");
+
+        // Assigned but not a request: a response opcode replayed inbound.
+        // This case always worked; assert the fix did not reroute it.
+        try expectUnknownRequestType(cfd, 0x81, "{}");
+
+        // The high end of the byte range, either side of the one assigned
+        // value there (error_response = 0xFF).
+        try expectUnknownRequestType(cfd, 0x91, "{}");
+        try expectUnknownRequestType(cfd, 0xFE, "{}");
+
+        // Same connection, still serving: the server neither died nor
+        // dropped the client that spoke nonsense to it four times.
+        try writeRawFrame(cfd, @intFromEnum(ever.protocol.MessageType.list_topics), "{}");
+
+        const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;
+        defer allocator.free(frame.body);
+        try testing.expectEqual(ever.protocol.MessageType.list_topics_ok, frame.msg_type);
+        try testing.expect(std.mem.indexOf(u8, frame.body, "opcode.survivor") != null);
+    }
+
+    server.shutdown_requested.store(true, .release);
+    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
+    thread.join();
+    server.shutdown();
+}

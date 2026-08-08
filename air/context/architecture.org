@@ -103,13 +103,17 @@ Header: 26 bytes. Topic name embedded in every record (max 255 bytes). Key is op
 
 6-byte frame header. Bodies are JSON. Message types:
 
-| Range   | Purpose        | Types                                                 |
-|---------+----------------+-------------------------------------------------------|
-| 0x01-06 | Core requests  | publish, fetch, create/delete/list topics, ack        |
-| 0x07-09 | Hook requests  | register/unregister/list hooks                        |
-| 0x0A-0D | Timer requests | add/remove/list/info timers (planned)                 |
-| 0x81-89 | OK responses   | Mirrors of requests                                  |
-| 0xFF    | Error          | Code + message                                        |
+| Range     | Purpose        | Types                                                |
+|-----------+----------------+------------------------------------------------------|
+| 0x01-0x06 | Core requests  | publish, fetch, create/delete/list topics, ack       |
+| 0x07-0x09 | Hook requests  | register/unregister/list hooks                       |
+| 0x0A-0x0D | Timer requests | add/remove/list/info timers                          |
+| 0x0E-0x10 | Inspection     | hook ps, hook logs, status                           |
+| 0x81-0x90 | OK responses   | Mirrors of requests                                  |
+| 0xFF      | Error          | Code + message                                       |
+| any other | Unassigned     | =400 unknown request type=; the connection stays open |
+
+=MessageType= is *non-exhaustive* (=_=) and this is load-bearing, not stylistic. =readFrame= converts the opcode byte with =@enumFromInt= straight off the wire; on an exhaustive enum every unassigned byte is illegal behaviour, i.e. a panic on the connection thread, i.e. the whole store process — listener, hook daemon and timer daemon — gone on one six-byte frame from anything that can reach the port. Non-exhaustive makes the decode total, so unassigned opcodes reach the server's =else= arm and are answered instead of being fatal. See =air/v0.1/protocol-unknown-opcode.org=.
 
 Fetch supports =block_ms= for blocking long-poll (server delays response until events arrive or timeout).
 

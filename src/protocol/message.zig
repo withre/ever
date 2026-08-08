@@ -54,6 +54,16 @@ pub const MessageType = enum(u8) {
 
     // Error
     error_response = 0xFF,
+
+    /// Non-exhaustive on purpose: `msg_type` arrives as an untrusted byte and
+    /// `readFrame` converts it with `@enumFromInt`, which on an exhaustive
+    /// enum is illegal behaviour for every unassigned value — a panic on the
+    /// connection thread, which ends the whole store process. With `_` the
+    /// conversion is total, and an unassigned byte falls through to the
+    /// server's `else` arm, which answers 400 "unknown request type" and
+    /// keeps the connection. Do not remove this while `readFrame` decodes
+    /// straight from the wire. See air/v0.1/protocol-unknown-opcode.org.
+    _,
 };
 
 pub const Frame = struct {
@@ -316,6 +326,12 @@ pub fn writeFrame(fd: std.posix.fd_t, msg_type: MessageType, body: []const u8) !
 
 /// Read a frame from a posix fd. Returns null on clean EOF.
 /// Caller owns the returned body slice.
+///
+/// Every byte of the header is attacker-controlled. `version` and `body_len`
+/// are range-checked here; `msg_type` is made total by `MessageType` being
+/// non-exhaustive, so an unrecognised opcode is a value this function returns
+/// rather than a panic it takes the process down with. Deciding what to do
+/// with an unrecognised opcode belongs to the caller's dispatch.
 pub fn readFrame(allocator: Allocator, fd: std.posix.fd_t) !?Frame {
     var header: [HEADER_SIZE]u8 = undefined;
     const header_read = readAll(fd, &header) catch return null;
