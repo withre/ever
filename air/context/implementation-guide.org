@@ -3,14 +3,14 @@
 ** Development Environment
 
 *** Language Configuration
-- *Language*: Zig v0.17 development target; keep Zig 0.16.0 green for deployment until the 0.17 release is cut
+- *Language*: Zig 0.17 development line, at the *exact* snapshot pinned in =nix/zig.nix= and declared as =minimum_zig_version= in =build.zig.zon=. Zig 0.16.0 is retired — the source uses std APIs it does not have and cannot compile this tree — though =channel = "0.16.0"= stays reachable for comparison against a tagged release. (=OVERVIEW.org= and =nix/zig.nix= are the authority; this file said "keep 0.16.0 green" long after that stopped being true.)
 - *Build System*: Zig build system (=build.zig=)
 - *Documentation*: use https://ziglang.org/documentation/master/ for the 0.17 target and https://ziglang.org/documentation/0.16.0/ when checking the deployment baseline
 - *Project Structure*: Multi-module with shared types
 
 *** Build Environment
 - *Nix flake*: Reproducible development environment with Zig toolchain
-- *Required*: Zig 0.17 development for target work; Zig 0.16.0 must continue to pass deployment builds/tests
+- *Required*: the pinned 0.17-dev snapshot. It is a pin, not a floor — see the toolchain trap below before reaching for whatever =zig= is on =PATH=.
 - *Development shell*: =nix develop= or =direnv allow=
 
 *** Dependency Management
@@ -83,6 +83,8 @@
 - =std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true })= for decoding
 - Binary wire format: manual =std.mem.writeInt= / =std.mem.readInt= with =.little= endianness
 - Validate all untrusted input — check message sizes, offset bounds, topic name characters
+- *Any enum decoded from bytes you did not write must be non-exhaustive* (=_,=). =@enumFromInt= on an exhaustive enum is illegal behaviour for every unassigned value: in Debug and ReleaseSafe that is a panic, and a panic on a connection thread ends the whole process, so one byte from any peer that can reach the port is a remote kill. Non-exhaustive makes the decode total and pushes the decision "what is this?" out to the dispatch, where an unknown value can be answered with an error instead of being fatal. This bit the wire protocol (=v0.1/protocol-unknown-opcode.org=); it applies to any tag byte, kind field, or schedule type that ever arrives from a socket or a file.
+- *A typed value is not a validated value.* Once =@enumFromInt= has run, the rest of the code sees a =MessageType= and reasonably assumes something checked it. The wire-protocol spec even listed "validate msg_type is a known enum value" as a requirement, and its absence went unnoticed for the life of the protocol, because the type system made the check look already done. When reading a validation checklist against an implementation, confirm each item has a line of code — do not accept a type as evidence.
 - Shell-escape all strings passed to fork/exec (single-quote wrapping with ='\''= escape)
 
 *** Process Spawning Patterns
@@ -201,6 +203,7 @@ zig build test -Doptimize=ReleaseSafe
 - *Shell escaping is security-critical*: Every string interpolated into a shell command (topic names, keys, env vars, cwd) must be single-quote escaped. A topic name containing ='= breaks out of quoting context. Use =appendShellEscaped= helper.
 - *JSON escaping needed everywhere*: Topic names, keys, and values all need escaping when building JSON strings manually. Use =appendJsonEscaped= helper.
 - *Debug vs ReleaseFast differ*: Data races may only manifest in release builds. Always test =zig build -Doptimize=ReleaseFast= before committing concurrency changes.
+- *The visible half of a two-part guarantee is the half that gets implemented.* When an operation must both answer the caller and change state, the answer is the part that is exercised by every test and every manual check, and the state change is the part that can be missing without anyone noticing — an =ack_ok= with no stored cursor, an offset returned for an event no reader will ever see, a cursor advanced in memory and not on disk. When adding a handler that reports success, write the assertion against the state, not against the reply.
 - *Lockfile released on process death*: =flock= is automatically released by the kernel when the process exits (even kill -9). No stale lockfile cleanup needed.
 - *reuse_address=false is essential*: With =true=, multiple stores bind to the same port and clients get randomly routed. Set =false= so the OS rejects duplicate binds.
 - *Field propagation discipline*: Adding a field to a data struct (Hook, Timer, etc.) requires coordinated updates across 12+ locations: struct definition, JSON serialization struct, legacy struct, add/addFull method, load method, saveLocked, deepCopy helper, free/freeCopy helper, protocol message struct, server handler, client struct+methods, CLI handler. Missing any one causes silent data loss or distant compile errors.
@@ -221,11 +224,16 @@ zig build test -Doptimize=ReleaseSafe
 
 Behaviours that cost an implementer real time and are not discoverable by reading the code you are changing. Each was found the expensive way; add to this list rather than rediscovering.
 
+*** Toolchain
+
+- *The pinned Zig snapshot is a pin, not a minimum.* =minimum_zig_version= reads like a floor, so a newer 0.17-dev =zig= on =PATH= satisfies the manifest and then fails to compile the tree, because the development line renames std APIs underneath it. The symptom is a compile error in code you did not touch — e.g. =error: no field named 'params' in struct 'lang.Type.Fn'= from =@typeInfo(...).@"fn".params= against a snapshot where that field moved. Use =nix develop= / =direnv=, or invoke the pinned toolchain directly; do not "fix" the std API drift.
+
 *** Testing
 
 - =zig build test= *prints nothing on success.* Silence means pass — and equally means you ran the wrong step, or everything was cached. Always pass =--summary all=, which gives per-binary counts and distinguishes "ran" from "cached".
 - *Tests live in three separate binaries*: =root.zig= (via =refAllDecls=), =main.zig=, and =src/tests/integration.zig=. A test added to a file not reachable from =root.zig= *silently never runs*. You will not see a failure; you will see success. Confirm new tests actually execute.
-- *Build a negative control before trusting a new test.* Copy the tree to =/tmp= (=src=, =build.zig=, =build.zig.zon=, =zig-pkg= build standalone), remove the fix, and run the suite. A test that does not fail without the fix is decoration. This is the difference between "the guard works" and "the exploit never ran".
+- *Build a negative control before trusting a new test.* Copy the tree to =/tmp= (=src=, =build.zig=, =build.zig.zon=, =zig-pkg= build standalone), remove the fix, and run the suite. A test that does not fail without the fix is decoration. This is the difference between "the guard works" and "the exploit never ran". Cheaper variant when the fix is not yet applied: write the test first and run it against the untouched tree — same evidence, no copy.
+- *A malformed-input test must not construct its input through the API that rejects it.* A test for "the server survives an unknown opcode" written with =writeFrame(fd, @enumFromInt(0x11), ...)= cannot serve as a negative control, because on the un-fixed tree the =@enumFromInt= traps in the *test* process — you learn nothing about the server. Assemble the bad input as raw bytes so the test compiles and runs identically before and after the fix. The same applies to any invalid frame, record, or config the fix teaches the code to reject.
 - *The correct server shutdown sequence appears exactly once*, in the first test of =src/tests/integration.zig= — which is named for status probing, so grepping for shutdown-related words will not find it. The order is: set =shutdown_requested=, call =probeServer= to wake the blocked =accept()=, *then* join, *then* =shutdown()=. Do not stand up =Server= and =HttpServer= in one test; that combination deadlocks holding both listeners at 0% CPU. See =air/v0.1/testable-server-lifecycle.org=.
 
 *** Client and CLI
