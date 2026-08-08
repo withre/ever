@@ -1,0 +1,105 @@
+#+title: One Frame, One Write
+#+state: complete
+#+FILETAGS: :protocol:core:performance:bug:
+
+* Summary
+=writeFrame= sends the 6-byte header and the body as two separate =write(2)= calls. Nagle's algorithm holds the second write because the first is still unacknowledged, and the peer's delayed ACK fires at Linux's 40 ms. *Every response Ever sends, after the first on a connection, is delivered about 41 ms late* — every publish ack, every topic list, every status query, every fetch. Send the frame with one =writev(2)=.
+
+* Motivation
+
+** Measured
+
+Ten =list_topics= requests down one connection, timing the header and the body separately:
+
+#+begin_example
+list_topics: header after 0.32 ms, BODY after a further 40.76 ms
+  header: 0.6 0.3 0.2 0.2 0.3 0.4 0.5 0.3 0.4 0.3
+  body  : 0.0 41.0 40.8 40.9 40.7 40.7 40.4 41.7 41.6 40.6
+#+end_example
+
+The header is prompt every time. The body is 40-41 ms behind it every time — except the very first, which is free because there is no unacknowledged data yet. That is the signature of Nagle interacting with delayed ACK, and it is not subtle once the two halves are timed apart.
+
+** Why it went unnoticed
+
+Because the number looked like something else. Earlier in this task I measured "publish round-trip: median 41.59 ms, min 1.27" and wrote it down as fsync — a 40 ms disk sync is unremarkable and the store does sync on append. The =min= of 1.27 ms was the tell and I did not read it: a disk cost does not vanish on one call in twenty. It was the first request on the connection.
+
+The defect only became visible after =subscribe-notify-on-append.org= removed the 100 ms poll. Before that, delivery latency was dominated by the timer and 40 ms of it hid inside a 93 ms measurement. Fixing the larger cost is what exposed the one behind it.
+
+** Scale
+
+This is not a subscription defect. It is on every response on every connection:
+
+- =ever pub= in a loop: each publish waits ~41 ms for its own ack, so a shell loop publishing 1,000 events takes 41 seconds regardless of how fast the store is.
+- The subscription work just brought server-side wake latency to ~4 ms; the client still sees ~44 ms, so nine tenths of what a consumer measures is this.
+- Anything measuring Ever's throughput over a single connection has been measuring the delayed-ACK timer.
+
+For a system whose stated direction is to replace JetStream, a 41 ms floor on request/response is the whole ballgame, and it is a two-line fix.
+
+* Goals
+- A response frame leaves the server in one =write= syscall, so Nagle has nothing to hold back.
+- No change to the wire format. The bytes are identical; only the number of syscalls that emit them changes.
+- No allocation added to the response path.
+
+* Non-Goals
+- =TCP_NODELAY=. It would also fix this, and it is the wrong fix: it disables an algorithm that is doing its job — the problem is that we handed it a partial frame, not that it batched. It also leaves two syscalls per response, and it would paper over the next place the code splits a logical message across writes instead of making that impossible.
+- Batching several frames into one write. Different problem, and the server answers one request at a time per connection.
+- The read path. =readAll= is a loop over a stream and that is correct; nothing there depends on message boundaries arriving together.
+- Buffering writes behind an =Io.Writer=. A larger change, and it would reintroduce the same class of bug at a different layer if a flush were ever missed.
+
+* Proposal
+
+Use =writev= with two iovecs — header and body — in a single syscall. No copy, no allocation, no buffer-size ceiling, and the frame is indivisible by construction.
+
+#+begin_src zig
+var iov = [2]std.posix.iovec_const{
+    .{ .base = &header, .len = HEADER_SIZE },
+    .{ .base = body.ptr, .len = body.len },
+};
+// ... writev, advancing past partial writes ...
+#+end_src
+
+Partial writes must be handled: =writev= may write fewer bytes than requested, and the resumption has to advance *across* the iovec boundary, not restart. That is the only real complexity in the change and it is where a naive version would corrupt a frame under load rather than merely be slow, so it needs a test that does not rely on getting a short write by luck.
+
+A zero-length body is legal and common (=create_topic_ok= sends ={}=, but future frames may not). With =writev= it is simply an iovec of length zero, which needs no special case but does need a test.
+
+* Design Details
+
+** Files expected to change
+- =src/protocol/message.zig= — =writeFrame= builds the iovec pair; a =writevAll= helper alongside the existing =writeAll=, with the same errno handling (=EPIPE=, =ECONNRESET=, =EAGAIN=).
+- =src/tests/integration.zig= — tests below.
+- =air/context/architecture.org= and =implementation-guide.org= — the rule, stated generally.
+
+** Testing
+
+- *Latency, over a real socket*: two requests down one connection, and the second must complete well inside the delayed-ACK window. This is the test that fails on the current tree, and the assertion is against a bound like 15 ms rather than a tight one — the gap between 0.3 ms and 41 ms does not need a precise threshold.
+- *Partial writes*: the frame must survive =writev= returning short, including short *within* the header and short *at* the header/body boundary. Getting a real short write from a socket on demand is unreliable, so this belongs as a unit test of the resumption arithmetic rather than a socket test that hopes.
+- *Empty body*, and a body large enough to exceed the socket buffer, so the resumption path is exercised end to end.
+- The existing suite: every response goes through this function, so a mistake here breaks everything at once, which is some comfort.
+
+** The general rule this is an instance of
+
+Any protocol whose framing depends on a header being followed by its payload should emit both in one syscall. Splitting them is correct on the wire and wrong in every other respect: it doubles syscalls, it exposes the delayed-ACK interaction, and it makes a torn frame possible if error handling between the two writes is ever less than perfect. Worth stating in the context files, because the next protocol this project writes will have the same shape.
+
+* History
+- 2026-08-08: Drafted. Found while measuring the result of =subscribe-notify-on-append.org=: server-side wake latency came down to 4 ms and end-to-end delivery stayed at 44 ms, so the remaining 40 ms had to be somewhere else. Timing the header and the body apart found it in one measurement.
+- 2026-08-08: State: draft → ready → work-in-progress.
+- 2026-08-08: Shipped. =writeFrame= emits the frame with one =writev=; =writevAll= handles resumption across the header/body boundary. =frameRemainder= exposes the resumption arithmetic so it can be tested directly — a socket does not produce short writes on demand, and "we never saw one" is not evidence.
+
+  Measured on the same store:
+
+  | Measurement                                  |  Before |    After |
+  |----------------------------------------------+---------+----------|
+  | =list_topics= body, after its header         | 40.76ms | 0.001ms  |
+  | publish round-trip                           | 41.59ms | 0.62ms   |
+  | publish → subscriber delivery, end to end    |    93ms | 3.8ms    |
+  | subscriber served, from the publisher's ack  |       — | 0.30ms   |
+
+  Negative control: the tree with =writeFrame= put back to two writes. The latency test is the single failure out of 139.
+
+  *The fsync attribution earlier in this task was wrong, and this is the correction.* "publish round-trip: median 41.59 ms" was recorded as the cost of =sync_on_append=. It was Nagle. The same publish now round-trips in 0.62 ms with sync unchanged, so the durable write was never the expensive part — the =min= of 1.27 ms in the original sample was the evidence and I read past it. Anything in this project's history that blames publish latency on fsync should be re-measured before it is believed.
+
+  140/140 tests pass in Debug, ReleaseSafe and ReleaseFast. Ten =ever pub= invocations, each a fresh process and connection, now complete in 0.19 s total.
+
+  Not changed, and worth saying: =TCP_NODELAY= is still not set anywhere, deliberately. Nagle is now harmless because no logical message is split across writes, and leaving it on means the next code path that does split one will show up as latency rather than being silently masked.
+- 2026-08-08: State: draft → ready.
+- 2026-08-08: State: ready → work-in-progress.

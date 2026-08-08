@@ -1907,3 +1907,104 @@ test "integration: shutdown does not wait out a subscriber's block window" {
     const elapsed_ms = @divTrunc(nowNanos() - t0, 1_000_000);
     try testing.expect(elapsed_ms < 2_000);
 }
+
+// ── One frame, one write (air/v0.1/protocol-frame-single-write.org) ─────────
+
+test "unit: frame resumption advances across the header/body boundary" {
+    const header = "HDRHDR";
+    const body = "0123456789";
+    const remainder = ever.protocol.frameRemainder;
+
+    // Nothing sent yet.
+    {
+        const h, const b = remainder(header, body, 0);
+        try testing.expectEqualStrings("HDRHDR", h);
+        try testing.expectEqualStrings("0123456789", b);
+    }
+    // Short *within* the header.
+    {
+        const h, const b = remainder(header, body, 2);
+        try testing.expectEqualStrings("RHDR", h);
+        try testing.expectEqualStrings("0123456789", b);
+    }
+    // Short *exactly at* the boundary — the case a naive resumption gets
+    // wrong by restarting the body.
+    {
+        const h, const b = remainder(header, body, header.len);
+        try testing.expectEqualStrings("", h);
+        try testing.expectEqualStrings("0123456789", b);
+    }
+    // Short within the body.
+    {
+        const h, const b = remainder(header, body, header.len + 4);
+        try testing.expectEqualStrings("", h);
+        try testing.expectEqualStrings("456789", b);
+    }
+    // Everything sent.
+    {
+        const h, const b = remainder(header, body, header.len + body.len);
+        try testing.expectEqualStrings("", h);
+        try testing.expectEqualStrings("", b);
+    }
+    // Empty body, header partly sent.
+    {
+        const h, const b = remainder(header, "", 3);
+        try testing.expectEqualStrings("HDR", h);
+        try testing.expectEqualStrings("", b);
+    }
+}
+
+test "integration: a response is not held for the peer's delayed ACK" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("nagle.topic");
+    // A body big enough to cross the socket buffer on the way out, so the
+    // resumption path runs for real and not only in the unit test above.
+    var i: u64 = 0;
+    while (i < 400) : (i += 1) _ = try tm.publish("nagle.topic", null, "0123456789012345678901234567890123456789");
+
+    const port: u16 = 39000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
+    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
+    defer server.deinit();
+    var h = try NotifyHarness.start(&tm, &server, port);
+
+    const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
+    const ip_address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
+    const stream = try ip_address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    const cfd = stream.socket.handle;
+
+    // The first request on a connection is free either way — there is no
+    // unacknowledged data for Nagle to wait on. It is the ones after it that
+    // used to sit for the full delayed-ACK interval, so the assertion is on
+    // the second and later.
+    var round: usize = 0;
+    var worst_ms: i64 = 0;
+    while (round < 6) : (round += 1) {
+        const req = try ever.protocol.encodeBody(allocator, ever.protocol.FetchRequest{
+            .topic = "nagle.topic",
+            .offset = 0,
+            .max_count = 400,
+        });
+        defer allocator.free(req);
+
+        const t0 = nowNanos();
+        try ever.protocol.writeFrame(cfd, .fetch, req);
+        const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;
+        defer allocator.free(frame.body);
+        const elapsed_ms = @divTrunc(nowNanos() - t0, 1_000_000);
+
+        try testing.expectEqual(ever.protocol.MessageType.fetch_ok, frame.msg_type);
+        try testing.expect(frame.body.len > 4000); // multi-segment response
+        if (round > 0 and elapsed_ms > worst_ms) worst_ms = elapsed_ms;
+    }
+
+    // Linux delayed ACK is 40ms. Anything under 15ms cannot have waited for
+    // one; the gap being 0.3ms against 41ms means the bound needs no
+    // precision.
+    try testing.expect(worst_ms < 15);
+
+    h.stop();
+}

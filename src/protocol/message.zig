@@ -311,15 +311,71 @@ pub fn encodeFrame(buf: []u8, msg_type: MessageType, body: []const u8) error{Buf
 }
 
 /// Encode a frame and write it to a posix fd.
+/// The header and body go out in ONE syscall, and that is load-bearing.
+///
+/// Written as two `write` calls, the header goes immediately and the body is
+/// held by Nagle -- there is unacknowledged data on the connection and the
+/// body is a small partial segment -- until the peer's delayed ACK fires, at
+/// 40ms on Linux. That was ~41ms on every response Ever sent after the first
+/// on a connection, measured as header in 0.32ms and body 40.76ms later.
+/// See air/v0.1/protocol-frame-single-write.org.
 pub fn writeFrame(fd: std.posix.fd_t, msg_type: MessageType, body: []const u8) !void {
     var header: [HEADER_SIZE]u8 = undefined;
     header[0] = PROTOCOL_VERSION;
     header[1] = @intFromEnum(msg_type);
     std.mem.writeInt(u32, header[2..6], @intCast(body.len), .little);
 
-    // Write header then body
-    try writeAll(fd, &header);
-    try writeAll(fd, body);
+    try writevAll(fd, &header, body);
+}
+
+/// Write `header` followed by `body` as a single `writev`, resuming across
+/// the boundary on a short write.
+///
+/// Resumption is the whole difficulty: `writev` may return having written
+/// fewer bytes than asked, and the remainder can begin part-way through the
+/// header, exactly at the boundary, or part-way through the body. Restarting
+/// either buffer instead of advancing past `written` would put duplicate
+/// bytes on the wire and desynchronise the peer's framing for the life of
+/// the connection -- a corrupted stream rather than a slow one.
+fn writevAll(fd: std.posix.fd_t, header: []const u8, body: []const u8) !void {
+    const total = header.len + body.len;
+    var written: usize = 0;
+    while (written < total) {
+        // Slice both buffers by how far we have already got. Whichever is
+        // fully sent contributes a zero-length iovec, which is legal.
+        const h_done = @min(written, header.len);
+        const b_done = written - h_done;
+        const h_rest = header[h_done..];
+        const b_rest = body[b_done..];
+        var iov = [2]std.posix.iovec_const{
+            .{ .base = h_rest.ptr, .len = h_rest.len },
+            .{ .base = b_rest.ptr, .len = b_rest.len },
+        };
+
+        const rc = std.os.linux.writev(fd, &iov, iov.len);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            const errno: u16 = @truncate(@as(usize, @bitCast(-signed)));
+            switch (errno) {
+                32 => return error.BrokenPipe, // EPIPE
+                104 => return error.ConnectionResetByPeer, // ECONNRESET
+                11 => continue, // EAGAIN
+                4 => continue, // EINTR
+                else => return error.Unexpected,
+            }
+        }
+        if (rc == 0) return error.BrokenPipe;
+        written += rc;
+    }
+}
+
+/// Byte-for-byte the resumption arithmetic `writevAll` uses, exposed so a
+/// test can drive short writes deliberately instead of hoping a socket
+/// produces one. Returns the two remaining slices after `written` bytes.
+pub fn frameRemainder(header: []const u8, body: []const u8, written: usize) struct { []const u8, []const u8 } {
+    const h_done = @min(written, header.len);
+    const b_done = written - h_done;
+    return .{ header[h_done..], body[b_done..] };
 }
 
 /// Read a frame from a posix fd. Returns null on clean EOF.
