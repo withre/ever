@@ -12,6 +12,8 @@ Its one named external consumer has since withdrawn — the downstream topology 
 
 Two of the three pieces below are well-defined enough to implement and one is not, and even that is conditional ordering rather than a plan. Treat any dependency on this document as blocked on a decision that has not been taken.
 
+*[Added 2026-08-09: do not read this document as the owner of the single-process log/index race.* A coverage audit pointed here for "publish drops the mutex across =log.append=", and this is the wrong home for it: that defect needs one process and two threads, not several processes over one directory, and it is now a *reproducible segfault* on the ordinary client fetch path. It has its own owner, [[./log-read-append-serialization.org]]. This document keeps the multi-*process* question, which is genuinely unowned and genuinely unscheduled, and nothing here gates that fix.*]*
+
 * Summary
 Allow two or three processes to share one data directory safely — a shell running an embedded Ever, plus a UI or terminal attached to the same store. Three separable changes: refresh the in-memory index from disk so readers stop going stale, span the append critical section across processes so writers stop destroying each other, and make the library's concurrency guarantee explicit rather than accidental.
 

@@ -1,0 +1,106 @@
+#+title: A Fetch Should Say How Far It Looked
+#+state: ready
+#+FILETAGS: :protocol:subscriber:store:performance:
+
+* Summary
+=FetchResponse= tells a caller what was delivered and nothing about what was examined. A pattern subscriber can therefore only advance its cursor by delivery, so a subscriber whose pattern is quiet re-walks a range that grows with the log — measured at 1,857 ms per fetch on a 160,000-record log, delivering nothing, once per wake. The value already exists: =fetchPatternByOffset= maintains exactly this watermark internally and discards it, and =hook-scan-cursor-and-lag.org= already specifies returning it *to the hook daemon*. This document carries it the last step, across the process boundary, and owns it as a property of fetch rather than of hooks.
+
+* Motivation
+
+** The gap, stated precisely
+
+=FetchResponse= carries =events= and =topic_events=. =topic_events= is a *count*, documented as "Populated for exact-topic requests only (=null= for pattern requests, which aggregate several topics)". So for the case that has the problem — a pattern subscriber — the response contains no positional information at all beyond the offsets of events that happened to match.
+
+A consumer therefore has exactly one way to advance: take the offset of the last event it received. If it received none, it cannot move. Next fetch starts where the last one started, and the scan is longer because the log grew.
+
+** Measured
+
+A subscriber whose pattern has no new matches, one fetch each time:
+
+| Log size        | One fetch | Events delivered |
+|-----------------+-----------+------------------|
+| 20,000 records  |    228 ms |                0 |
+| 40,000 records  |    457 ms |                0 |
+| 80,000 records  |    915 ms |                0 |
+| 160,000 records |  1,857 ms |                0 |
+
+Linear, as the mechanism predicts. End to end on the shipped server with a 40,000-record log, *one* such subscriber takes publish latency from 0.5 ms median to 480 ms median (968 ms worst), because the scan holds the manager mutex — see =log-read-append-serialization.org=, which owns that half.
+
+** Why this was not already named
+
+The audit that raised it said the watermark appears in Ever's document set only as a hook-lag concern. That is right, and the reason is sharper than "nobody wrote it down".
+
+=hook-scan-cursor-and-lag.org= P1 is, verbatim, "=fetchPatternByOffset= returns the offset it scanned to". It observes that the function "maintains a local =cursor= that is exactly the watermark this document wants, and *discards it*". So the mechanism is specified and correct. What that document then does is hand the value to the *hook daemon* and persist it in =hooks.json=; its only wire-visible change is =HookInfo.scan= for the =hook list= display. Its Scope note is explicit that it is about hooks.
+
+*So the same value, computed in the same function, is given to the in-process consumer and withheld from every network consumer.* Ever met this as hook lag because hooks were where Ever met it. A second consumer met the identical gap from the other side — a pattern subscriber, no hooks involved — and there was no document for it to land in, because the property had never been named as a property of *fetch*.
+
+** Why this is queue semantics, not an accommodation
+
+Every log-shaped queue returns a position alongside the payload, because a consumer cannot maintain a cursor without one: Kafka returns a log-end offset on fetch, JetStream carries stream and consumer sequences on delivery. A subscriber that can only learn positions from messages it receives cannot make progress through a region that does not concern it. Ever's stated direction is to replace JetStream; this is not an optional refinement of that goal, it is a precondition for it.
+
+** What the notification change did to the urgency
+
+Before condition-variable wakeups, a blocking fetch re-scanned on a 100 ms timer, and the sleep acted as an accidental fairness quantum: however long the scan took, writers got the next 100 ms. Wake-on-append removed that window — a woken subscriber rescans as soon as anything is published, and on a busy store that is continuous.
+
+Worth recording precisely because =hook-scan-cursor-and-lag.org= predicted it. Its Non-Goals say of condvar signalling: "Same argument; it removes the fixed 500 ms latency floor, not the pathology." That was correct, it has shipped, and the pathology is now hotter than when the prediction was made.
+
+* Goals
+- A fetch reports the position it examined up to, whether or not it delivered anything.
+- A pattern subscriber can advance its cursor across a region with no matches, so repeated fetches cost O(new events) rather than O(log).
+- The field is additive and optional, so existing clients are unaffected and older servers remain usable.
+- The meaning is unambiguous about which offset space it is in — this project has been bitten by that twice already.
+
+* Non-Goals
+- The lock scope and the =readBatch=/=append= race (=log-read-append-serialization.org=).
+- The hook daemon's use of the watermark. =hook-scan-cursor-and-lag.org= owns that and is =ready=; this document should consume its P1, not re-specify it.
+- Exact-topic fetches. =fetch= walks an index, not the log, and =subscribe-fetch-seek.org= already made it seek. A scan watermark has no meaning there — the same conclusion =hook-scan-cursor-and-lag.org= reaches for exact-topic hooks in its F2.
+- Server-side cursor storage. Emphatically not: the whole point is to let the *client* hold its cursor cheaply. =ack-opcode-removal.org= records why server-side consumer cursors were declined.
+
+* Proposal
+
+=FetchResponse= gains an optional field carrying the exclusive upper bound of the range the server examined:
+
+#+begin_src zig
+/// Global log offset the server scanned up to, exclusive: every offset
+/// below this has been tested against the request and either delivered
+/// or ruled out. A client may resume from here without re-testing.
+/// Null when the request did not scan (exact-topic reads walk an index).
+scan_watermark: ?u64 = null,
+#+end_src
+
+Optional with a default, so an older client decoding a newer response is unaffected and a newer client against an older server sees =null= and behaves exactly as today. No version bump — the same reasoning as =ack-opcode-removal.org=: layout is unchanged and no shipped client can be broken by a field it does not read.
+
+** The unit, stated before anything is built
+
+It is a *global log offset*, the same space as =after_offset= and the =[topic:offset]= display, and it is *exclusive*. This is spelled out here because the project has twice paid for leaving it implicit: =offset-coherence.org= exists because =--from= and the displayed offset were different units, and =hook-registration-cursor.org= ended with a cursor whose meaning depends on the pattern shape. The field name says =scan= and the doc comment says the space; neither is optional.
+
+** Client use
+
+A subscriber resumes from =max(last_event_offset + 1, scan_watermark)=. When events arrive, the two agree. When none do, the watermark advances and the next scan starts where the last one stopped. That is the whole fix from the consumer's side.
+
+** Relationship to the internal half
+
+=hook-scan-cursor-and-lag.org= P1 changes =fetchPatternByOffset= to return the watermark it already computes. This document needs exactly that value and should not duplicate the change; if this lands first it must implement P1's return-value change in a way P1 can adopt unaltered, and say so in both documents.
+
+** Honesty about what a client may assume
+
+The watermark says *examined*, not *delivered*. If a fetch stops early because it filled =max_count=, the watermark is the offset after the last delivered event, not the head — otherwise a client would skip events it was never sent. The current implementation already has this distinction and comments on it: on filling the buffer it deliberately does not advance its local cursor past undelivered events. That behaviour is correct and the watermark must preserve it.
+
+* Design Details
+
+** Files expected to change
+- =src/protocol/message.zig= — the field, with the doc comment above.
+- =src/store/topic.zig= — =fetchPatternByOffset= returns its cursor (P1's change).
+- =src/net/server.zig= — =handleFetch= populates it.
+- =src/net/client.zig= / =src/main.zig= — expose it, and use it in =sub --follow= so the CLI is a working example of the resume rule.
+- =air/context/architecture.org= — the subscription model section should state the resume rule.
+
+** Testing
+- *A quiet subscriber is O(new events).* Seed a large log with a non-matching pattern, fetch twice, and assert the second fetch reads a bounded number of records — a read counter, not wall-clock time, as =subscribe-fetch-seek.org= established. Fails on today's tree, which makes it the control.
+- *No events are skipped when the buffer fills.* Fetch with =max_count= smaller than the number of matches and assert the watermark does not advance past undelivered events. This is the assertion that catches the tempting wrong implementation.
+- *Old client, new server and the reverse.* A response containing the field decodes in a client that does not know it; a client that expects it tolerates =null=.
+- *The unit.* A round-trip test that feeds the watermark back as =after_offset= and gets exactly the events after it — the property =offset-coherence.org= wanted and the reason the unit is pinned here.
+
+* History
+- 2026-08-09: Drafted. Raised by a reviewer working on Reverie, who hit it as a pattern subscriber with no hooks involved. Verified at =3991190c=: =FetchResponse= carries no positional field, and =topic_events= is null for exactly the pattern case that needs one. Costs measured on a store built from this tree (228 ms at 20k records rising linearly to 1,857 ms at 160k, delivering nothing, and 0.5 ms → 480 ms publish latency for one such subscriber). Framed here as fetch semantics rather than hook lag because two consumers reached the same gap from opposite directions and only the hook direction had a document.
+- 2026-08-09: State: draft → ready.

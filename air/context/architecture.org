@@ -118,6 +118,27 @@ Header: 26 bytes. Topic name embedded in every record (max 255 bytes). Key is op
 
 Fetch supports =block_ms= for blocking long-poll (server delays response until events arrive or timeout).
 
+** Durability: what fsync costs, measured
+
+=Log.append= calls =file.sync()= per record when =sync_on_append= is set, and it is set: =ever start= constructs the store with =.{}=, the default is =true=, and *there is no CLI flag, environment variable or config file that changes it* — the only places in the tree that set it false are tests. A decision to run without sync cannot currently be enacted.
+
+Measured on this hardware (ZFS, both the dataset the live store uses and =/tmp=, 5,000-20,000 appends each way, repeated):
+
+| Mode                        | Throughput           | Avg per append | p99      |
+|-----------------------------+----------------------+----------------+----------|
+| =sync_on_append = false=    | 287,000-386,000 /sec | 2.6-3.5 us     | 5-7 us   |
+| =sync_on_append = true=     | 1,950-2,430 /sec     | 411-512 us     | 496-617 us |
+
+So durability costs about *0.41 ms per append* and a *130-160x* throughput reduction. Reproduce with =zig build bench -- --filter log_append=; the benchmark predates this note.
+
+Three consequences worth knowing before trading it away:
+
+- *The ceiling is store-wide, not per-client.* =Log.append= holds =Log.mutex= across the fsync, so concurrent publishers serialise behind each other's disk sync. Ten publishers get ~2,400/sec between them, not each.
+- *There is no group commit.* Every append pays its own fsync. One sync covering a batch is how a JetStream-class system avoids making users choose, and it is the fix if the ceiling ever binds — not switching sync off.
+- *A failed sync is silent.* =seg.file.sync(self.io) catch {}= — the append still returns its offset and still reports success. The caller is told "durable" on the path where durability failed.
+
+Historical note, because a decision was once made on a wrong number: publish latency was for a time believed to be ~42 ms and attributed to fsync. It was the TCP delayed-ACK stall from writing a frame in two syscalls (=protocol-frame-single-write.org=). The same publish now round-trips in 0.62 ms with sync unchanged. *Re-measure before believing any claim in this project that blames publish latency on the disk.*
+
 ** Recovery Model
 
 On startup, =ever store start=:

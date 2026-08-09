@@ -1,0 +1,120 @@
+#+title: Which Lock Protects the Log, and For How Long
+#+state: ready
+#+FILETAGS: :store:core:protocol:bug:
+
+* Summary
+=fetchPatternByOffset= takes =TopicManager.mutex= and calls =Log.readBatch=, which indexes =seg.positions.items=. =Log.append= takes =Log.mutex= — a *different* lock — and calls =seg.positions.append=, which reallocates that array. The two do not exclude each other. Reading an array while another thread reallocates it segfaults, and it does: reproducibly, in Debug, ReleaseSafe and ReleaseFast, on the ordinary client fetch path. The same lock is also held across the whole scan, so a read stalls every writer for its duration. *The lock is held long enough to stall every writer, and not in the right place to protect the reader.* Both halves are the same decision and this document owns both.
+
+* Motivation
+
+** The race, observed
+
+=readBatch= carries this instruction:
+
+#+begin_src zig
+/// Read a batch of events by global offset range.
+/// NOT thread-safe on its own — caller must serialize with appends
+/// (e.g., via TopicManager's mutex).
+#+end_src
+
+=fetchPatternByOffset= follows it exactly:
+
+#+begin_src zig
+// We read from the log directly. Hold the manager mutex while reading
+// so log appends and readBatch don't race; readBatch itself is not
+// thread-safe against concurrent appends.
+self.lock();
+defer self.unlock();
+#+end_src
+
+*The instruction is wrong and the comment is false.* =TopicManager.publish= appends in its phase 2 with the manager lock *released* — the code says so — and =Log.append= takes =Log.mutex=. Holding the manager mutex excludes nothing that appends.
+
+A reader hammering the pattern path against a live publisher, in-process:
+
+#+begin_example
+Segmentation fault at address 0x7846ebd3c008
+src/store/store.zig:225:87: in readBatch
+    const event = try self.readEventAt(allocator, seg, seg.positions.items[@intCast(local_start + i)]);
+src/store/topic.zig:571:49: in fetchPatternByOffset
+    const batch = try self.log.readBatch(allocator, cursor, chunk);
+#+end_example
+
+Reproduced in *all three* optimisation modes. ThreadSanitizer (=zig test -fsanitize-thread=) reports data races on the same run.
+
+This closes an open question rather than raising a new one. =hook-scan-cursor-and-lag.org= records F4 as "a hazard nobody has yet observed" and says of it: "Its first task should be an observation: both rounds established F4 by reading, neither ran a sanitizer." A sanitizer has now been run, and the defect does not need one — it crashes without.
+
+*Honest limit on reachability.* The reproduction is in-process, driving the read path against a tight publish loop. Over TCP against a real server, ordinary pattern fetches concurrent with ordinary publishes ran for 40 seconds without a crash: the round trips widen the gap, and =ArrayList= only reallocates at capacity boundaries, so the window is narrow. This is a genuine memory-safety defect on a path any client can reach; it is *not* demonstrated to be remotely triggerable on demand, and this document does not claim it is.
+
+*The window is not fixed.* It scales with how long a reader spends inside =readBatch=. A subscriber whose pattern has no new matches scans the entire log — measured at 1,857 ms for 160,000 records — and holds =seg.positions= across all of it. =fetch-watermark.org= removes those scans, and in doing so shrinks this race by orders of magnitude without fixing it. The two documents help each other; neither substitutes for the other.
+
+** The index lag, observed
+
+The same phase-2 gap has a second, benign-looking consequence: the log advances before the topic index does. Measured by sampling *while holding the manager lock* — the lock a reader would take precisely to get a consistent view:
+
+#+begin_example
+200,000 samples taken while holding the manager lock
+ 54,959 (27%) saw the log head ahead of the index; worst gap 1 record
+#+end_example
+
+So a reader that does everything right sees an inconsistent store a quarter of the time under a single publisher. Consequences, in increasing order of seriousness:
+
+- =topic_events= (which powers the beyond-end warning) can lag the log by one.
+- An exact-topic =fetch= momentarily does not return an event that a pattern fetch, reading the log directly, does return. Two readers, same instant, different answers.
+- =publish= mints and returns the offset in phase 2. A caller that hands that offset to another process can have it read back nothing.
+- *If phase 3 fails, the event is durably in the log and permanently absent from the index, and the publisher is told the publish failed.* =try idx.offsets.append(...)= can fail on allocation. The event then reappears at the next restart, because =rebuildIndex= reads the log. An event the caller was told was not written shows up after a reboot.
+
+** Why the scope question cannot be owned separately
+
+The obvious fix for the race is to make the append take the manager mutex. That would work, and it would make the scope problem *much* worse: a reader already holds that lock across a full scan, so appends would then block for the length of the scan. Measured today, with the lock not even protecting the append:
+
+| Situation                                              | Publish latency          |
+|--------------------------------------------------------+--------------------------|
+| idle                                                    | 0.5 ms median            |
+| one quiet pattern subscriber, 40,000-record log         | 480 ms median, 968 ms max |
+| in-process, five consecutive full scans                 | blocked 9.4 s            |
+| legitimate replay of 120,000 records in 240 batches     | 5.3 ms worst (from 0.11) |
+
+The last row matters because it is not a bug: a backfill, a migration, or a new subscriber starting from the beginning is a supported operation that a watermark cannot shorten. Whatever locking this document lands on has to leave that case cheap.
+
+So: an implementer told only "narrow the scope" would narrow it and leave a segfault. An implementer told only "fix the race" would widen the lock and cause a write outage. One decision.
+
+* Goals
+- A read of the log cannot observe a segment's position array being mutated.
+- A read cannot stall writers for the length of its scan.
+- The instruction on =readBatch= describes protection that actually exists.
+- The offset a publisher receives is indexed by the time the publisher can act on it, or the failure is reported truthfully.
+
+* Non-Goals
+- The watermark (=fetch-watermark.org=). It shrinks this race dramatically and fixes none of it.
+- Multi-process access (=multi-process-access.org=). That document assumes several processes over one directory; this defect needs only one process and two threads.
+- Replacing the locks with an =RwLock=. It may well be the answer, but it is a concurrency-model change and belongs in Proposal as an option, weighed, not assumed.
+- =HookTable= / =ProcessTable= / =TimerTable= locking, still spinlocks with no =Io= (=store-blocking-locks.org= records why).
+
+* Proposal
+
+Three shapes, to be decided with measurements rather than taste. Stated as options because the right one depends on numbers this document should gather before it leaves =draft=.
+
+*A. One lock, narrow.* =Log= owns its own serialisation: =readBatch= and =read= take =Log.mutex= themselves, as =append= already does, and the manager mutex stops pretending to cover the log at all. Reads and appends then interleave at batch granularity instead of scan granularity. Cost: a lock acquisition per batch; the reader no longer sees a single consistent log snapshot across a whole scan, which needs stating as a semantic.
+
+*B. Snapshot the positions.* =readBatch= copies the segment's position slice under =Log.mutex= and reads the file outside it — the pattern =fetch= and =fetchAfterOffset= already use, and the pattern =implementation-guide.org= already prescribes ("copy index data under the lock, release it, then do disk I/O without the lock"). Appends only ever *append*, so a stale snapshot is a prefix — safe by construction. This looks like the smallest correct change and it keeps the existing per-call semantics.
+
+*C. Publish under one lock end to end.* Phases 2 and 3 both under the manager mutex, closing the index lag as well as the race. Correct and simple; makes the scope problem acute, so it is viable only combined with A or B.
+
+Option B closes the race and leaves the scope problem; A closes both; C closes the index lag. *A plausible landing is B then C*, with the index lag as a second commit — but that ordering should be argued from a benchmark, not from this paragraph.
+
+* Design Details
+
+** Files expected to change
+- =src/store/store.zig= — =readBatch= / =read= locking; the doc comment that currently misinstructs its callers.
+- =src/store/topic.zig= — =fetchPatternByOffset='s lock scope and its false comment; possibly =publish= phases 2/3.
+- =src/tests/integration.zig= — regressions below.
+
+** Testing
+- *The crash, as a test.* A reader on the pattern path against a publisher, sized to reproduce within seconds. It segfaults on today's tree in all three modes, which makes it the negative control; it must survive after.
+- *Under ThreadSanitizer.* =zig test -fsanitize-thread= is available on the pinned toolchain and reports these races today. Whether TSan joins =zig build test= permanently is a separate decision — it is slow — but the fix must be verified under it once, and the invocation recorded so the next person does not have to rediscover it.
+- *No write outage.* Publish latency during a long read must stay within a stated bound. This is the assertion that stops a fix for the race from silently reintroducing the stall.
+- *The index lag*, if option C is taken: the sampling probe above, asserting zero disagreements over a large sample rather than 27%.
+
+* History
+- 2026-08-09: Drafted. Filed under the name =hook-scan-cursor-and-lag.org= has cited three times since 2026-08-03 for F4 ("Status: scheduled, not merely recorded"), so those pointers now resolve. Raised by a reviewer working on Reverie as an index-lag problem; the index lag is real (27% of 200,000 locked samples) and is the lesser half. The reader and the writer take different locks, and the read path segfaults — reproduced in Debug, ReleaseSafe and ReleaseFast, and confirmed under ThreadSanitizer, which is the observation F4 asked for and had not had.
+- 2026-08-09: State: draft → ready.
