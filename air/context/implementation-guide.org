@@ -208,7 +208,23 @@ zig build test -Doptimize=ReleaseSafe
 - *Shell escaping is security-critical*: Every string interpolated into a shell command (topic names, keys, env vars, cwd) must be single-quote escaped. A topic name containing ='= breaks out of quoting context. Use =appendShellEscaped= helper.
 - *JSON escaping needed everywhere*: Topic names, keys, and values all need escaping when building JSON strings manually. Use =appendJsonEscaped= helper.
 - *Debug vs ReleaseFast differ*: Data races may only manifest in release builds. Always test =zig build -Doptimize=ReleaseFast= before committing concurrency changes.
-- *The visible half of a two-part guarantee is the half that gets implemented.* When an operation must both answer the caller and change state, the answer is the part that is exercised by every test and every manual check, and the state change is the part that can be missing without anyone noticing — an =ack_ok= with no stored cursor, an offset returned for an event no reader will ever see, a cursor advanced in memory and not on disk. When adding a handler that reports success, write the assertion against the state, not against the reply.
+- *The visible half of a two-part guarantee is the half that gets implemented.* When an operation must both answer the caller and change state, the answer is the part that every test and every manual check exercises, and the state change is the part that can be missing without anyone noticing. When adding a handler that reports success, write the assertion against the state, not against the reply.
+
+  *This is the most productive defect class this project has.* Every instance below was found by reading or measuring, none by using the system — which is the definition of the shape, because from outside a working one and a broken one are identical:
+
+  | Found      | The visible half                                  | The missing half                                          |
+  |------------+---------------------------------------------------+-----------------------------------------------------------|
+  | 2026-08-05 | =publish= returns an offset                       | a tombstone-keyed event no read path will ever show        |
+  | 2026-08-08 | =ack_ok=                                          | the cursor was never stored                                |
+  | 2026-08-08 | an =else= arm reading as the unknown-opcode guard | unreachable; the spec's "validate msg_type" was never written |
+  | 2026-08-09 | =readBatch='s "serialise via TopicManager's mutex" | that mutex excludes nothing that appends — segfault         |
+  | 2026-08-09 | =publish= reports success with sync on            | =sync(...) catch {}= — a failed fsync is discarded          |
+
+  *How to find the next one, since reading for it works and using the system does not:*
+  1. *Grep for discarded results on state-changing calls* — =catch {}=, =_ = f()=, =catch return= — and ask what the caller was told. The =fsync= swallow sits five lines from a =write= failure that is handled correctly, so proximity to good code is no defence.
+  2. *Read every comment that asserts a guarantee and find the line that provides it.* Three of the five above were documented and absent: a spec step never written, a doc comment naming a lock that does not apply, a Non-Goal describing protection that did not exist. A comment is a claim, not evidence.
+  3. *When a checklist exists, tick it against the code.* =wire-protocol.org= listed three validations; two were implemented; nobody had checked.
+  4. *Ask what a test would have to assert to distinguish the two cases.* If the answer is "nothing observable", that is the defect, not a testing gap.
 - *Lockfile released on process death*: =flock= is automatically released by the kernel when the process exits (even kill -9). No stale lockfile cleanup needed.
 - *reuse_address=false is essential*: With =true=, multiple stores bind to the same port and clients get randomly routed. Set =false= so the OS rejects duplicate binds.
 - *Field propagation discipline*: Adding a field to a data struct (Hook, Timer, etc.) requires coordinated updates across 12+ locations: struct definition, JSON serialization struct, legacy struct, add/addFull method, load method, saveLocked, deepCopy helper, free/freeCopy helper, protocol message struct, server handler, client struct+methods, CLI handler. Missing any one causes silent data loss or distant compile errors.

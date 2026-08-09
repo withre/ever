@@ -131,11 +131,12 @@ Measured on this hardware (ZFS, both the dataset the live store uses and =/tmp=,
 
 So durability costs about *0.41 ms per append* and a *130-160x* throughput reduction. Reproduce with =zig build bench -- --filter log_append=; the benchmark predates this note.
 
-Three consequences worth knowing before trading it away:
+*The decision is that durability stays on* (owner, 2026-08-09, on the strength of these numbers). The ceiling is therefore something to raise, not to trade away. Four things follow, three of them defects:
 
-- *The ceiling is store-wide, not per-client.* =Log.append= holds =Log.mutex= across the fsync, so concurrent publishers serialise behind each other's disk sync. Ten publishers get ~2,400/sec between them, not each.
-- *There is no group commit.* Every append pays its own fsync. One sync covering a batch is how a JetStream-class system avoids making users choose, and it is the fix if the ceiling ever binds — not switching sync off.
-- *A failed sync is silent.* =seg.file.sync(self.io) catch {}= — the append still returns its offset and still reports success. The caller is told "durable" on the path where durability failed.
+- *The ceiling is store-wide, not per-client.* =Log.append= holds =Log.mutex= across the fsync, so publishers serialise behind each other's disk sync. Measured: 1 publisher 2,340/sec, 8 publishers 2,409/sec *between them*. Adding publishers adds nothing.
+- *There is no group commit, and that is the whole gap.* One sync covering a batch is measured at 31,700 appends/sec for a batch of 16 and 203,000 for 1024, against 2,389 for a batch of 1 — and under concurrency the batch forms from publishers already waiting, so it costs no added latency. The apparent durability-versus-throughput choice is an artefact of this missing feature. Owned by =v0.1/log-group-commit.org=.
+- *A failed sync is silent.* =seg.file.sync(self.io) catch {}= — the append still returns its offset and reports success, five lines after the *write* failure is correctly propagated. Owned by =v0.1/sync-failure-reporting.org=.
+- *The directory entry is never synced, and this one has no owner.* =createSegment= creates a =.log= file and nothing ever fsyncs the containing directory — =file.sync= appears exactly once in the tree, on the record path. On a filesystem that does not journal the create alongside the data (ext4 =data=ordered=, xfs), a power cut can lose a newly created segment *and every record fsynced into it*. ZFS, which is what this machine runs, logs the create in the same intent-log stream and is very likely safe — which is the problem: *the guarantee currently depends on a filesystem property Ever does not state, does not check, and cannot rely on elsewhere*. Recorded here rather than specced; it needs a decision before Ever claims durability on arbitrary storage.
 
 Historical note, because a decision was once made on a wrong number: publish latency was for a time believed to be ~42 ms and attributed to fsync. It was the TCP delayed-ACK stall from writing a frame in two syscalls (=protocol-frame-single-write.org=). The same publish now round-trips in 0.62 ms with sync unchanged. *Re-measure before believing any claim in this project that blames publish latency on the disk.*
 

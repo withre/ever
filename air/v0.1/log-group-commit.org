@@ -1,0 +1,106 @@
+#+title: One fsync Should Cover More Than One Append
+#+state: ready
+#+FILETAGS: :store:core:performance:
+
+* Summary
+=Log.append= holds =Log.mutex= across its =fsync=, so every append pays for its own disk sync and publishers serialise behind each other's. Measured: the whole store sustains ~2,350 appends/sec *no matter how many publishers there are* — one gets 2,340/sec, eight get 2,409/sec between them. Durability is being kept (the owner's decision, on the strength of the 0.41 ms measurement), so the ceiling now has to be raised rather than traded away. One =fsync= covering a batch does it: measured, a batch of 16 gives *31,700 appends/sec, 13×*, while still syncing ~2,000 times a second. And the batch does not have to be waited for — under concurrency it forms from the publishers already queued, so the added latency is zero.
+
+* Motivation
+
+** The ceiling is the store's, not the client's
+
+=Log.append= takes =Log.mutex= at entry and releases it at exit; the =fsync= is inside. Measured with =sync_on_append = true=, publishers each appending 400 records:
+
+| Publishers | Total appends/sec | Per publisher |
+|------------+-------------------+---------------|
+|          1 |             2,340 |         2,340 |
+|          2 |             2,384 |         1,192 |
+|          4 |             2,327 |           582 |
+|          8 |             2,409 |           301 |
+
+*The total is flat.* Adding publishers adds no throughput at all; each simply receives 1/N of the same number. This is what a single global serialisation point looks like from outside, and it is the shape the owner asked Ever to look at.
+
+** What batching is worth, measured rather than modelled
+
+The obvious arithmetic — "one 418 µs sync amortised over N appends" — assumes the sync cost is constant in the batch size. It is not: a bigger transaction has more dirty data to flush. So it was measured. 4,096 appends, syncing once per batch of N:
+
+| Batch | Appends/sec | Per append | fsyncs/sec |
+|-------+-------------+------------+------------|
+|     1 |       2,389 |   418.5 us |      2,389 |
+|     2 |       5,037 |   198.5 us |      2,518 |
+|     4 |       9,483 |   105.4 us |      2,371 |
+|     8 |      17,396 |    57.5 us |      2,174 |
+|    16 |      31,699 |    31.5 us |      1,981 |
+|    32 |      52,234 |    19.1 us |      1,632 |
+|    64 |      77,619 |    12.9 us |      1,213 |
+|   128 |     111,998 |     8.9 us |        875 |
+|   256 |     148,449 |     6.7 us |        580 |
+|   512 |     184,199 |     5.4 us |        360 |
+|  1024 |     202,973 |     4.9 us |        198 |
+
+Two things to read off it. First, *the device sustains roughly 2,000-2,500 syncs per second almost independently of how much each one carries*, up to about a batch of 16 — which is exactly why batching works and why the naive model understates it. Second, the return is steep early and flattens: 16 buys 13×, 128 buys 47×, 1024 buys 85× and is within 60-70% of the no-durability ceiling (287,000-386,000/sec).
+
+** The batch is free under concurrency
+
+This is the part that decides the design. The concurrency table above is not an unrelated measurement — *it is the case group commit exists for*. With eight publishers, eight records are written and eight syncs are performed. With group commit those eight are one sync, because they were already waiting.
+
+So a leader/follower scheme adds *no* latency: the first writer to arrive syncs immediately, and whoever arrives during that sync forms the next batch. Batch size self-tunes to (arrival rate × sync duration). At the measured 8-publisher arrival rate against a 418 µs sync, roughly 8 records accumulate per window, which the table prices at ~17,400/sec — a *7× improvement over the measured 2,409/sec with no added delay for anybody and no change whatsoever to the guarantee*.
+
+A single publisher forms batches of one and sees today's behaviour exactly. Nobody waits for a batch that has not formed.
+
+** Why this is not a durability trade
+
+Every record is still on disk before its offset is reported. What changes is that a record may be synced *in company*. That is the distinction between group commit and the =sync_on_append = false= proposal that was withdrawn: one preserves the guarantee and shares its cost, the other discards it. The binary choice was an artefact of a missing feature.
+
+* Goals
+- Concurrent publishers add throughput instead of dividing it.
+- No added latency for a publisher that arrives alone.
+- The guarantee is unchanged: =publish= returns an offset only once that record is durable.
+- The improvement is demonstrated by the concurrency table above moving, not by a microbenchmark.
+
+* Non-Goals
+- Weakening durability, including any "sync every N ms" mode. That is the trade the owner declined; this document exists because it is unnecessary.
+- Making =sync_on_append= configurable. Separate question, and after this it is much less interesting. (Recorded in =architecture.org=: today there is no flag, env var or config file for it at all.)
+- The =readBatch= / =append= race and the manager-mutex scope (=log-read-append-serialization.org=). *Sequencing note*: that document may change what lock =append= takes, and this one changes what =append= does while holding it. Whichever lands second must re-run the concurrency table, because both change the same critical section.
+- Reporting a failed sync (=sync-failure-reporting.org=). Group commit makes it more urgent — one failed sync then affects every waiter in the batch, not one caller — but the fix is independent and smaller, and should not wait for this.
+- Batching at the protocol level (a multi-record publish request). Complementary and separate: this reduces syncs per record for publishers that already exist, without any client change.
+
+* Proposal
+
+Leader/follower group commit inside =Log=, with no waiting:
+
+1. A writer takes the mutex, writes its record into the active segment, and records the file offset its record ends at.
+2. If no sync is in progress, it becomes the *leader*: it publishes the highest end-offset it is responsible for, releases the mutex, and calls =fsync=.
+3. Writers arriving while a sync is in flight write their records under the mutex as usual, then *wait* to be told that a sync covering their end-offset has completed.
+4. When the leader's sync returns, every waiter whose end-offset is at or below the synced point is released. If writers accumulated past that point, one of them becomes the next leader.
+
+The condition-variable machinery for step 3 already exists in the tree and is already used for exactly this shape of wait: =std.Io.Condition= over =std.Io.Mutex=, as =TopicManager.append_epoch= uses for subscriber wakeups (=subscribe-notify-on-append.org=). A "synced up to" watermark plus a condition variable is the same pattern applied to a different predicate.
+
+** The ordering property that must hold
+
+A record's offset may only be returned to its caller once a sync has covered *that record's* end-offset. Not "a sync has completed" — one that started before the record was written proves nothing about it. This is the single correctness rule of the design and it is the one an implementation gets wrong: the waiter must compare against a monotonically increasing synced-watermark, not against a boolean or a generation counter that could have been set by an earlier sync.
+
+** What happens on failure
+
+If the leader's sync fails, *every* waiter in that batch is affected, and none of them may be told their record is durable. That is a strictly larger blast radius than today's one-caller-per-sync, and it is why =sync-failure-reporting.org= should land first or alongside: this design cannot be correct while the failure is discarded.
+
+* Design Details
+
+** Files expected to change
+- =src/store/store.zig= — =Log.append= splits into "write under the mutex" and "wait for a sync covering my offset"; a synced-watermark field and a condition variable; leader selection.
+- =src/tests/integration.zig= — tests below.
+- =air/context/architecture.org= — the durability section's numbers change and its "there is no group commit" line stops being true.
+
+** Testing
+- *The concurrency table is the acceptance test.* Publishers 1/2/4/8 against a fixed record count: total throughput must rise with publisher count instead of staying flat. Today's numbers are the negative control and they are in this document.
+- *A lone publisher is not slowed.* Single-publisher throughput must stay within noise of 2,340/sec. This is the assertion that catches a design that waits for a batch to form.
+- *Durability, not just speed.* A test that the offset is not returned before a sync covering it completed — most cheaply by instrumenting the synced watermark and asserting the ordering, since the honest version (pull the power) is not available.
+- *Failure propagation*, once =sync-failure-reporting.org= lands: a failing sync must fail every waiter in its batch and no others.
+- ReleaseFast as well as Debug: this is concurrency, and the repository note is explicit that races may only appear in release builds.
+
+** Prior art worth reading before implementing
+Group commit is old and well-understood — it is how PostgreSQL's WAL, SQLite's WAL, and JetStream's file store all avoid making users choose between durability and throughput. The leader/follower shape above is the standard one. This is a known problem with a known answer, and the measurements here exist to size it, not to discover it.
+
+* History
+- 2026-08-09: Drafted. Assigned to Ever by the owner — "Publisher and fsync discussion needs to be taken look at, single global lock doesn't sound good" — after the durability measurement showed the 2,400/sec ceiling was real and store-wide. Both tables measured on a store built from this tree; the concurrency one is what makes the global-lock claim concrete, and the batch one is what prices the fix.
+- 2026-08-09: State: draft → ready.

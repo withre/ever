@@ -1,0 +1,103 @@
+#+title: A Failed fsync Must Not Report Success
+#+state: ready
+#+FILETAGS: :store:core:protocol:bug:
+
+* Summary
+=Log.append= discards the result of its =fsync=: =if (self.config.sync_on_append) seg.file.sync(self.io) catch {};=. The append then returns its offset and the publisher is told the event is stored. Five lines earlier, the failure of the *write* is handled properly — the position is popped and the error returned. So within one function, the failure of getting bytes into the file is reported and the failure of getting them onto the disk is not. Now that durability is a kept property rather than a declined one, that asymmetry is the difference between a guarantee and the appearance of one.
+
+* Motivation
+
+** The two halves, five lines apart
+
+#+begin_src zig
+try seg.positions.append(self.allocator, seg.size);
+seg.file.writePositionalAll(self.io, encoded, seg.size) catch |err| {
+    _ = seg.positions.pop();
+    return err;                                   // <- the write failing is reported
+};
+
+if (self.config.sync_on_append) seg.file.sync(self.io) catch {};   // <- the sync failing is not
+
+seg.size += rec_size;
+self.next_offset = offset + 1;
+return offset;                                    // <- success, either way
+#+end_src
+
+There is no logging, no counter, no degraded flag. A store whose disk is failing its syncs is indistinguishable, from every interface Ever offers, from one that is healthy.
+
+** Why the weight changed
+
+While =sync_on_append = false= was on the table this was a smaller matter: a user who has declined durability is not misled by not receiving it. The owner has now decided to keep durability — "Durability is a serious addition I'd like to take" — which makes it a promise the store makes on every publish. *A guarantee that degrades silently is worse than one a user knowingly declined, because the user now believes they have it*, and will size their recovery plan accordingly.
+
+** It is the third instance of a shape this codebase keeps producing
+
+- =ack= replied =ack_ok= and stored nothing (=ack-opcode-removal.org=).
+- The opcode dispatch had an =else= arm that read as the unknown-opcode guard and was unreachable, while the spec listed a validation step that was never written (=protocol-unknown-opcode.org=).
+- =readBatch='s doc comment instructs callers to serialise via a mutex that excludes nothing (=log-read-append-serialization.org=).
+- And this: the durable half of a durable write, failing silently.
+
+In every case the *visible* half of a two-part guarantee is the half that works, and the invisible half is the one that is missing — which is precisely why none of them were found by using the system. The general rule is recorded in =implementation-guide.org=; this document is one instance and does not try to own the pattern.
+
+** What group commit does to it
+
+=log-group-commit.org= makes one sync cover many records. A discarded failure then mis-reports *every waiter in the batch* rather than one caller, so that design cannot be correct while this line stands. This document should land first or alongside; it is much the smaller change.
+
+* Goals
+- A publish whose durability could not be established does not report unqualified success.
+- The distinction between "not written", "written but not durable" and "durable" is available to a caller that cares, and to an operator looking at the store.
+- A single transient sync failure does not silently persist as a wrong belief for the life of the process.
+
+* Non-Goals
+- Group commit (=log-group-commit.org=).
+- Making =sync_on_append= configurable. When it is off, no durability was promised and there is nothing to mis-report.
+- Retry policy for a failing device. Naming the failure is the first step; deciding whether to retry, degrade or refuse is design work this document should do, but tuning it is not.
+- =HookTable.saveLocked() catch {}= (four sites) and the hook cursor swallow. Same family, different subsystem, already noted in =multi-process-access.org=, and genuinely within the at-least-once contract in a way this is not.
+
+* Proposal
+
+The decision this document has to make is not "propagate the error" — it is *what a failed sync actually means*, because neither obvious answer is honest:
+
+- Returning an error implies nothing was written. Untrue: the record is in the file and =rebuildIndex= will find it at the next start. A caller that retries on error will duplicate the event, and a caller that treats the error as "did not happen" will be wrong in the common case where the machine does not then lose power.
+- Returning success implies durability. Untrue by construction.
+
+So the honest report is a third thing: *written, not confirmed durable*. Three shapes, to be chosen with the owner rather than assumed:
+
+*A. A distinct error that names the state.* =error.WrittenNotSynced=, carrying the offset. The caller learns the event exists at offset N and that its durability is unconfirmed, and can decide. Cost: a new error on a very hot path, and every caller must handle it — including the HTTP edge and the CLI, which today collapse errors.
+
+*B. Success plus a durability flag on the response.* =PublishResponse= gains =durable: bool = true=. Additive, no existing client breaks, and the offset still comes back — which matches the truth, since the event does exist. A client that cares reads the flag; one that does not is no worse off than today. This is the option that fits the wire protocol's existing habits best.
+
+*C. Fail the store, not the call.* A sync failure marks the store degraded: subsequent publishes are refused and =ever status= says why. Correct for a genuinely failing disk and much too violent for a transient error.
+
+*B as the reporting mechanism plus a store-level counter and a log line* looks like the smallest honest answer, with C's degraded mode reserved for repeated failures. But this is the part to argue before implementing, not after.
+
+** Whatever is chosen, two things are not optional
+- *It must be visible without a client.* An operator should be able to see that syncs are failing — a counter in =ever status= alongside the segment and event counts. A per-call flag that nobody reads is the same silence with more steps.
+- *It must not be discarded again.* The =catch {}= should not be replaced by a =catch |err| { log; }= that leaves the caller none the wiser.
+
+* Design Details
+
+** Files expected to change
+- =src/store/store.zig= — =Log.append= stops discarding the sync result; a store-level failure counter.
+- =src/store/topic.zig= — =publish= carries the outcome outward.
+- =src/protocol/message.zig= — =PublishResponse=, if option B.
+- =src/net/server.zig=, =src/net/http.zig= — both publish edges.
+- =src/store/status.zig= — the counter, so it is visible without a client.
+- =air/context/architecture.org= — the durability section currently records the swallow as a known defect; it becomes a description of the reporting instead.
+
+** Testing
+The obstacle is that a real =fsync= failure is hard to provoke, and a test that cannot fail proves nothing. Options, in order of preference:
+
+- *Fault injection at the seam.* =TopicManager= already carries =test_fail_marker_append= for exactly this purpose — a test-only flag that forces a failure at a chosen point (=publish-input-validation.org= used it). A =test_fail_sync= flag of the same shape makes the failure path testable without a hostile filesystem, and the precedent for the technique is in the tree.
+- *A read-only or full filesystem* in a temp dir. More faithful, much fussier, and =fsync= failure semantics vary by filesystem.
+- Assert the *reporting*, not the failure: with injection, one publish must produce the chosen signal, the counter must increment, and =ever status= must show it.
+
+A negative control is available and should be used: on today's tree the injected failure changes nothing observable at all, which is the defect stated as a test.
+
+* Open Questions
+1. Is the offset still returned on a failed sync? (This document argues yes — the event exists — but it is the crux of option A versus B.)
+2. After how many consecutive failures does a store refuse writes rather than flag them?
+3. Does =fetch= need to expose durability per event, or is publish-time reporting enough? (Probably enough: a reader cannot act on it.)
+
+* History
+- 2026-08-09: Drafted. Found while measuring what =fsync= costs for the durability decision. Raised in weight by that decision going the other way: the owner is keeping durability, so a silent degradation now falsifies a promise the store makes rather than one it never made. Filed separately from =log-group-commit.org= because it is independently implementable, much smaller, and should not wait on a large design — and because group commit turns one mis-reported caller into a whole batch of them, so it needs this first.
+- 2026-08-09: State: draft → ready.
