@@ -160,22 +160,9 @@ test "integration: status server probe flips true then false" {
     var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
     defer tm.deinit();
 
-    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
-    const port: u16 = 30000 + pid_part;
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-
-    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
-
-    var reachable = false;
-    var attempts: u32 = 0;
-    while (attempts < 50) : (attempts += 1) {
-        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
-            reachable = true;
-            break;
-        }
-        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
-    }
+    var ts = try TestServer.start(&tm);
+    const port = ts.port;
+    const reachable = ever.status.probeServer(io, "127.0.0.1", port, 200);
     try testing.expect(reachable);
 
     var status = ever.status.StoreStatus{
@@ -193,10 +180,7 @@ test "integration: status server probe flips true then false" {
     try testing.expect(std.mem.indexOf(u8, json_running, "\"reachable\": true") != null);
     try testing.expect(std.mem.indexOf(u8, json_running, "\"lock_held\": false") != null);
 
-    server.shutdown_requested.store(true, .release);
-    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
-    thread.join();
-    server.shutdown();
+    ts.stop();
 
     const after_shutdown = ever.status.probeServer(io, "127.0.0.1", port, 50);
     try testing.expect(!after_shutdown);
@@ -266,27 +250,8 @@ test "integration: status over TCP reports live stats and matches offline scan" 
     _ = try tm.publish("status.alpha", null, "a3");
     _ = try tm.publish("status.beta", null, "b1");
 
-    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
-    const port: u16 = 31000 + pid_part;
-    var server = try ever.net.Server.init(allocator, io, &tm, .{
-        .address = "127.0.0.1",
-        .port = port,
-        .data_dir = data_dir,
-    });
-    defer server.deinit();
-
-    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
-
-    var reachable = false;
-    var attempts: u32 = 0;
-    while (attempts < 50) : (attempts += 1) {
-        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
-            reachable = true;
-            break;
-        }
-        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
-    }
-    try testing.expect(reachable);
+    var ts = try TestServer.startWithConfig(&tm, .{ .data_dir = data_dir });
+    const port = ts.port;
 
     // Query status over the wire — no local filesystem access on this path.
     var server_status: ever.client.StatusResult = undefined;
@@ -324,10 +289,7 @@ test "integration: status over TCP reports live stats and matches offline scan" 
     try testing.expectEqual(@as(usize, 0), st.hooks.len); // no hook table attached
 
     // Stop the server.
-    server.shutdown_requested.store(true, .release);
-    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
-    thread.join();
-    server.shutdown();
+    ts.stop();
 
     // With the server stopped, connecting fails — the CLI maps this to the
     // endpoint-naming error and exit 1.
@@ -1065,28 +1027,9 @@ test "integration: after_offset cursor over TCP round-trips displayed offsets" {
     const g2 = try tm.publish("coher.t", null, "{\"n\":2}");
     const g3 = try tm.publish("coher.t", null, "{\"n\":3}");
 
-    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
-    const port: u16 = 32000 + pid_part;
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
-    defer {
-        server.shutdown_requested.store(true, .release);
-        _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
-        thread.join();
-        server.shutdown();
-    }
-
-    var attempts: u32 = 0;
-    var reachable = false;
-    while (attempts < 50) : (attempts += 1) {
-        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
-            reachable = true;
-            break;
-        }
-        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
-    }
-    try testing.expect(reachable);
+    var ts = try TestServer.start(&tm);
+    defer ts.stop();
+    const port = ts.port;
 
     var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
     defer client.deinit();
@@ -1169,25 +1112,13 @@ test "integration: hook logs distinguishes no-such-hook from no-executions" {
     const empty_envp: [0:null]?[*:0]const u8 = .{};
     var hd = ever.hooks.HookDaemon.init(allocator, &ht, &tm, &empty_envp);
 
-    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
-    const port: u16 = 33000 + pid_part;
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
+    // Tables attached before the accept loop can observe them, which is why
+    // this one builds the server itself instead of calling `start`.
+    const server = try TestServer.create(&tm, .{});
     server.setHookTable(&ht);
     server.setHookDaemon(&hd);
-
-    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
-
-    var reachable = false;
-    var attempts: u32 = 0;
-    while (attempts < 50) : (attempts += 1) {
-        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
-            reachable = true;
-            break;
-        }
-        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
-    }
-    try testing.expect(reachable);
+    var ts = try TestServer.startOwned(server);
+    const port = ts.port;
 
     // Known hook, no executions → empty-success, not an error.
     {
@@ -1260,10 +1191,7 @@ test "integration: hook logs distinguishes no-such-hook from no-executions" {
         _ = std.os.linux.rmdir(subdir_z.ptr);
     }
 
-    server.shutdown_requested.store(true, .release);
-    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
-    thread.join();
-    server.shutdown();
+    ts.stop();
 }
 
 // ── Hook list legibility tests (air/v0.1/hook-list-legibility.org) ──────────
@@ -1563,23 +1491,8 @@ test "integration: every opcode byte is answered, not fatal" {
     defer tm.deinit();
     try tm.createTopic("opcode.survivor");
 
-    const pid_part: u16 = @intCast(@mod(std.os.linux.getpid(), 20000));
-    const port: u16 = 34000 + pid_part;
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-
-    const thread = try std.Thread.spawn(.{}, runServerForTest, .{&server});
-
-    var reachable = false;
-    var attempts: u32 = 0;
-    while (attempts < 50) : (attempts += 1) {
-        if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
-            reachable = true;
-            break;
-        }
-        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
-    }
-    try testing.expect(reachable);
+    var ts = try TestServer.start(&tm);
+    const port = ts.port;
 
     {
         const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
@@ -1617,10 +1530,7 @@ test "integration: every opcode byte is answered, not fatal" {
         try testing.expect(std.mem.indexOf(u8, frame.body, "opcode.survivor") != null);
     }
 
-    server.shutdown_requested.store(true, .release);
-    _ = ever.status.probeServer(io, "127.0.0.1", port, 50); // wake accept loop
-    thread.join();
-    server.shutdown();
+    ts.stop();
 }
 
 // ── Fetch seeks to its cursor (air/v0.1/subscribe-fetch-seek.org) ───────────
@@ -1815,30 +1725,6 @@ test "integration: threads waiting on the store lock burn no CPU" {
 // them worth having: two on latency, one on idle cost, one on the race that
 // is the only bug this design can actually have.
 
-const NotifyHarness = struct {
-    tm: *TopicManager,
-    server: *ever.net.Server,
-    thread: std.Thread,
-    port: u16,
-
-    fn start(tm: *TopicManager, server: *ever.net.Server, port: u16) !NotifyHarness {
-        const thread = try std.Thread.spawn(.{}, runServerForTest, .{server});
-        var attempts: u32 = 0;
-        while (attempts < 100) : (attempts += 1) {
-            if (ever.status.probeServer(io, "127.0.0.1", port, 50)) break;
-            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 10_000_000 }, null);
-        } else return error.ServerNeverCameUp;
-        return .{ .tm = tm, .server = server, .thread = thread, .port = port };
-    }
-
-    fn stop(self: *NotifyHarness) void {
-        self.server.shutdown_requested.store(true, .release);
-        _ = ever.status.probeServer(io, "127.0.0.1", self.port, 50); // wake accept
-        self.thread.join();
-        self.server.shutdown();
-    }
-};
-
 /// A blocking fetch run on its own thread, recording when it was served.
 const BlockedFetcher = struct {
     port: u16,
@@ -1879,10 +1765,8 @@ test "integration: a publish wakes a blocked subscriber immediately" {
     defer tm.deinit();
     try tm.createTopic("notify.topic");
 
-    const port: u16 = 35000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    var h = try NotifyHarness.start(&tm, &server, port);
+    var h = try TestServer.start(&tm);
+    const port = h.port;
 
     var f = BlockedFetcher{ .port = port, .topic = "notify.topic", .from = 0, .block_ms = 30_000 };
     const ft = try std.Thread.spawn(.{}, BlockedFetcher.run, .{&f});
@@ -1912,10 +1796,8 @@ test "integration: blocked subscribers look once, not ten times a second" {
     defer tm.deinit();
     try tm.createTopic("idle.topic");
 
-    const port: u16 = 36000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    var h = try NotifyHarness.start(&tm, &server, port);
+    var h = try TestServer.start(&tm);
+    const port = h.port;
 
     var fetchers: [4]BlockedFetcher = undefined;
     var threads: [4]std.Thread = undefined;
@@ -1980,10 +1862,8 @@ test "integration: a publish racing the wait is never slept through" {
     defer tm.deinit();
     try tm.createTopic("race.topic");
 
-    const port: u16 = 37000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    var h = try NotifyHarness.start(&tm, &server, port);
+    var h = try TestServer.start(&tm);
+    const port = h.port;
 
     // Same window as the unit test above, but end to end, so the assertion
     // covers the server reading its baseline *before* the fetch rather than
@@ -2013,10 +1893,8 @@ test "integration: shutdown does not wait out a subscriber's block window" {
     defer tm.deinit();
     try tm.createTopic("bye.topic");
 
-    const port: u16 = 38000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    var h = try NotifyHarness.start(&tm, &server, port);
+    var h = try TestServer.start(&tm);
+    const port = h.port;
 
     // A subscriber that asked to block for a minute. Parking made this the
     // one property replacing a poll with a wait takes away, so shutdown has
@@ -2090,10 +1968,8 @@ test "integration: a response is not held for the peer's delayed ACK" {
     var i: u64 = 0;
     while (i < 400) : (i += 1) _ = try tm.publish("nagle.topic", null, "0123456789012345678901234567890123456789");
 
-    const port: u16 = 39000 + @as(u16, @intCast(@mod(std.os.linux.getpid(), 20000)));
-    var server = try ever.net.Server.init(allocator, io, &tm, .{ .address = "127.0.0.1", .port = port });
-    defer server.deinit();
-    var h = try NotifyHarness.start(&tm, &server, port);
+    var h = try TestServer.start(&tm);
+    const port = h.port;
 
     const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
     const ip_address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
