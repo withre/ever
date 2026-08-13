@@ -1,5 +1,5 @@
 #+title: Deterministic Server Startup and Shutdown for Tests
-#+state: ready
+#+state: complete
 #+FILETAGS: :testing:core:
 
 * Summary
@@ -136,4 +136,21 @@ Spawning =ever start= would sidestep the library defect entirely. It also makes 
 - existing integration tests pass unchanged in behaviour after moving to the harness
 
 * History
+- 2026-08-12: Implemented. =shutdown()= now self-connects before closing the listener, =Config.port = 0= binds an ephemeral port reported by =boundPort()=, connections accepted after the flag is set are dropped, and =TestServer= replaces every hand-rolled start/stop in =src/tests/integration.zig= (including =NotifyHarness=). Suite 146/146.
+
+** Design Divergence
+
+Three things shipped differently from the text above.
+
+*** =shutdown()= waits for the accept loop before closing the listener
+The document's ordering is set flag → self-connect → close listener → drain. Closing the listener straight after the self-connect races the loop, which dereferences =net_server= on every iteration: the wake-up returns =accept()=, but nothing orders the loop's exit against the close. There is now an =accept_loop_active= flag and a bounded (2s) wait between the self-connect and the close, so the listener is only freed once the loop is out of it. Bounded rather than unbounded because a wedged accept loop must degrade to the old behaviour, not deadlock =shutdown()=.
+
+*** The post-shutdown drop has no test that fails without it
+The document presents dropping post-shutdown connections as a defect that joining makes reachable — a handler outliving the loop and writing into a freed server. With the accept-loop wait above, =shutdown()= drains *after* the loop has exited, so any handler it spawned is already counted and the drain waits for it; removing the drop leaves the suite at 44/44 green. The drop is implemented anyway, because serving a request after the server stopped serving is wrong on its own terms, but its coverage is indirect and should not be assumed.
+
+*** =start= exposes =create= / =startOwned= as well
+=TestServer.start(tm)= is the documented entry point, but the hook-logs test must attach a hook table and daemon before the accept loop can observe them. Splitting allocation (=create=) from starting (=startOwned=) serves that without a second harness.
+
+*** Negative control
+Each part was verified by unfixing it. Removing the self-connect from =shutdown()= hangs all five lifecycle tests while the signal-path test still passes; making =unblockAccept= read =config.port= instead of =boundPort()= hangs them too, including the signal path, since an ephemeral bind leaves the configured value naming no listener. The settle step is load-bearing: before it was added, "start and stop twice" passed against the unfixed tree because the readiness probe's connection was still queued in the backlog.
 - 2026-08-05: Drafted and promoted to ready. Prompted by an end-to-end test that hung at 0% CPU holding both its listeners; diagnosis showed the only working unblock path was reachable exclusively from the signal handler, making correct shutdown impossible for tests and for embedded consumers alike.
