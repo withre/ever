@@ -46,6 +46,11 @@ pub const Server = struct {
     config: Config,
     net_server: ?net.Server,
     shutdown_requested: std.atomic.Value(bool),
+    /// True from just before the accept loop starts until `run()` returns.
+    /// `shutdown()` waits on this before closing the listener: the loop
+    /// dereferences `net_server` on every iteration, so closing it under a
+    /// running loop is a use-after-free rather than a cancellation.
+    accept_loop_active: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32),
     /// Milliseconds since epoch at `init` — used to compute status uptime.
     start_time: i64,
@@ -62,6 +67,7 @@ pub const Server = struct {
             .config = config,
             .net_server = null,
             .shutdown_requested = std.atomic.Value(bool).init(false),
+            .accept_loop_active = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
             .start_time = getMilliTimestamp(),
         };
@@ -92,6 +98,9 @@ pub const Server = struct {
         const ip4 = try net.Ip4Address.parse(self.config.address, self.config.port);
         const address: net.IpAddress = .{ .ip4 = ip4 };
         self.net_server = try address.listen(self.io, .{ .reuse_address = false });
+
+        self.accept_loop_active.store(true, .release);
+        defer self.accept_loop_active.store(false, .release);
 
         while (!self.shutdown_requested.load(.acquire)) {
             const stream = self.net_server.?.accept(self.io) catch |err| switch (err) {
@@ -130,8 +139,47 @@ pub const Server = struct {
         _ = std.os.linux.sigaction(.TERM, &act, null);
     }
 
+    /// Wake a thread blocked in `accept()` by connecting to our own listener
+    /// and dropping the connection immediately. The accept loop returns with
+    /// that throwaway stream, re-tests `shutdown_requested` and breaks.
+    ///
+    /// This is the only mechanism that reliably returns a blocked `accept()`:
+    /// closing the listening socket out from under the accepting thread does
+    /// not wake it on Linux. It lives here — rather than in `signalHandler`,
+    /// which used to hold the only copy — so that *every* caller of
+    /// `shutdown()` gets a stoppable server, not only one stopped by a signal.
+    ///
+    /// Raw syscalls only, no allocation and no locks: `socket()`, `connect()`
+    /// and `close()` are async-signal-safe, so the signal handler calls this
+    /// directly.
+    fn unblockAccept(self: *const Server) void {
+        const port = self.config.port;
+        if (port == 0) return;
+
+        const fd_rc = std.os.linux.socket(2, 1, 0); // AF_INET, SOCK_STREAM
+        const fd_i: isize = @bitCast(fd_rc);
+        if (fd_i < 0) return;
+        const fd: i32 = @intCast(fd_rc);
+
+        var addr: [16]u8 = undefined;
+        @memset(&addr, 0);
+        addr[0] = 2; // AF_INET
+        addr[1] = 0;
+        addr[2] = @intCast(port >> 8);
+        addr[3] = @intCast(port & 0xFF);
+        addr[4] = 127;
+        addr[5] = 0;
+        addr[6] = 0;
+        addr[7] = 1;
+        _ = std.os.linux.connect(fd, @ptrCast(&addr), 16);
+        _ = std.os.linux.close(fd);
+    }
+
     /// Signal the server to stop accepting connections, close the listener,
     /// and wait for in-flight connections to drain (up to 5 seconds).
+    ///
+    /// Safe to call from any thread, and the accept loop is guaranteed to
+    /// return — so the caller may join the thread running `run()`.
     pub fn shutdown(self: *Server) void {
         self.shutdown_requested.store(true, .release);
         // Blocking fetches are parked on the publication epoch, not on a
@@ -139,6 +187,23 @@ pub const Server = struct {
         // Without this every subscriber waits out its full block_ms and the
         // drain below gives up on it.
         self.topic_manager.wakeAllWaiters();
+
+        // Order matters. The self-connect needs a listener to connect to, so
+        // it has to happen *before* the listener is closed; closing first (as
+        // this used to) leaves a blocked `accept()` with nothing to wake it.
+        self.unblockAccept();
+
+        // And the listener cannot be closed until the loop is out of it: the
+        // loop reads `net_server` each iteration, so freeing it from here is a
+        // race, not a cancellation. Bounded, because a wedged accept loop must
+        // not turn shutdown into a deadlock — if the wait expires the close
+        // below is the last resort it always was.
+        var accept_wait_ms: u32 = 0;
+        while (self.accept_loop_active.load(.acquire) and accept_wait_ms < 2000) {
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null); // 1ms
+            accept_wait_ms += 1;
+        }
+
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
 
         // Wait for in-flight connections to finish (max 5 seconds)
@@ -885,23 +950,11 @@ fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
         s.shutdown_requested.store(true, .release);
         // Make a dummy connection to ourselves to unblock accept().
         // connect()+close() are async-signal-safe. The accept loop will
-        // see shutdown_requested and break out cleanly.
-        const fd = std.os.linux.socket(2, 1, 0); // AF_INET, SOCK_STREAM
-        const fd_i: isize = @bitCast(fd);
-        if (fd_i >= 0) {
-            var addr: [16]u8 = undefined;
-            @memset(&addr, 0);
-            addr[0] = 2; // AF_INET
-            addr[1] = 0;
-            addr[2] = @intCast(s.config.port >> 8);
-            addr[3] = @intCast(s.config.port & 0xFF);
-            addr[4] = 127;
-            addr[5] = 0;
-            addr[6] = 0;
-            addr[7] = 1;
-            _ = std.os.linux.connect(@intCast(fd), @ptrCast(&addr), 16);
-            _ = std.os.linux.close(@intCast(fd));
-        }
+        // see shutdown_requested and break out cleanly. The handler no
+        // longer owns that mechanism — it shares `shutdown()`'s — but it
+        // still cannot call `shutdown()` itself, which sleeps and prints
+        // while draining.
+        s.unblockAccept();
     }
 }
 
