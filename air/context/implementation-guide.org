@@ -265,7 +265,8 @@ Behaviours that cost an implementer real time and are not discoverable by readin
 
 *** Store internals
 
-- =TopicManager.mutex= is a *non-reentrant spinlock*. Any public method that locks deadlocks if called from inside a locked section — which is why the =*Locked= entry-point variants exist. Validation that needs manager state must either take a =*Locked= path or be pure and run before the lock.
+- =TopicManager.mutex= is *non-reentrant*. Any public method that locks deadlocks if called from inside a locked section — which is why the =*Locked= entry-point variants exist. Validation that needs manager state must either take a =*Locked= path or be pure and run before the lock.
+  (Corrected: an earlier version of this entry called it a *spinlock*, transcribed from a worker's learnings report without checking. At =main= both =TopicManager= and =Log= use =std.Io.Mutex=, which parks; only =HookTable= and =ProcessTable= still use =std.atomic.Mutex=. The non-reentrancy is the part that matters and is unchanged. A learnings report is testimony, not evidence — verify before writing it into context as fact.)
 - *Empty-valued events are internal markers* and are filtered from every read path. This was documented before it was ever filed as a defect: see the doc comment on =TopicIndex.non_marker_count=, which names user publishes with empty values as a historical quirk. Reading that comment is faster than rediscovering the behaviour.
 - *Input guards are not retroactive.* =publish= now rejects reserved keys and empty values, but events already on disk are unchanged and =rebuildIndex= still reads them exactly as before. Guards stop new writes; they do not clean up or reinterpret old ones, and no migration exists.
 
