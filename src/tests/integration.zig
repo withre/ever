@@ -138,6 +138,19 @@ const TestServer = struct {
     }
 };
 
+/// Wait until a freshly-probed server's accept loop is genuinely parked in
+/// `accept()`.
+///
+/// Readiness does not establish that on its own: the probe's connection can
+/// still be sitting in the listen backlog, and then a `stop()` is returned by
+/// that queued connection rather than by the wake-up self-connect — so the
+/// test passes whether or not `shutdown()` can wake a blocked `accept()`.
+/// Measured, not assumed: against an unfixed tree "start and stop twice"
+/// passed until this settle was added, and hung afterwards.
+fn settleIntoAccept() void {
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null);
+}
+
 // ── Status Server Probe ─────────────────────────────────────────────────────
 
 test "integration: status server probe flips true then false" {
@@ -2138,6 +2151,7 @@ test "integration: a server can be started and stopped twice in one test" {
     var first = try TestServer.start(&tm);
     const first_port = first.port;
     try testing.expect(first_port != 0);
+    settleIntoAccept();
     first.stop();
 
     // The second start is the assertion. A harness that skipped the join
@@ -2148,6 +2162,7 @@ test "integration: a server can be started and stopped twice in one test" {
     defer second.stop();
     try testing.expect(second.port != 0);
     try testing.expect(ever.status.probeServer(io, "127.0.0.1", second.port, 200));
+    settleIntoAccept(); // the deferred stop must face a blocked accept too
 }
 
 test "integration: two concurrent servers get different ephemeral ports" {
@@ -2167,6 +2182,7 @@ test "integration: two concurrent servers get different ephemeral ports" {
     try testing.expect(a.port != b.port);
     try testing.expect(ever.status.probeServer(io, "127.0.0.1", a.port, 200));
     try testing.expect(ever.status.probeServer(io, "127.0.0.1", b.port, 200));
+    settleIntoAccept();
 }
 
 test "integration: a test that stops a server keeps running" {
@@ -2192,7 +2208,7 @@ test "integration: a test that stops a server keeps running" {
         const offset = try client.publish("lifecycle.topic", null, "before stop");
         try testing.expect(offset >= 0);
     }
-    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null);
+    settleIntoAccept();
 
     ts.stop();
 
@@ -2210,7 +2226,7 @@ test "integration: stop returns quickly with no client attached" {
     defer tm.deinit();
 
     var ts = try TestServer.start(&tm);
-    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null); // settle into accept()
+    settleIntoAccept();
 
     const t0 = nowNanos();
     ts.stop();
@@ -2235,6 +2251,7 @@ test "integration: stop returns within the drain bound with an idle client" {
     // its handler is parked in `readFrame` — an unread socket is exactly what
     // the drain cannot hurry.
     _ = try client.publish("idle.client.topic", null, "hello");
+    settleIntoAccept();
 
     const t0 = nowNanos();
     ts.server.shutdown();
@@ -2278,7 +2295,7 @@ test "integration: the signal path still stops the server" {
     }
 
     var ts = try TestServer.startOwned(server);
-    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null); // settle into accept()
+    settleIntoAccept();
 
     // The CLI's stop sequence: the handler returns the accept loop, `run()`
     // exits, and only then does main call `shutdown()` to drain. Moving the
