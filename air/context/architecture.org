@@ -32,6 +32,24 @@ Ever is a single-binary event storage system. One store process, many client pro
 - *Timers* (planned): =ever timer add --every 5m <topic> <payload>= — scheduled publishing
 - Separation: timers are "when", hooks are "what", events are the glue
 
+*** Scope: what belongs in the store
+
+Ever is a simple, fast, single-node event store that intends to be a credible JetStream alternative. Those pull in opposite directions, so the line is drawn by *capability, not feature parity*:
+
+- *If a client can build it correctly on top of the log, it does not belong in the store.* Replay from an offset, filtering, fan-out to several consumers, retry policy — all of these are client code over an ordered durable log, and adding them as store features buys nothing but surface.
+- *If a client cannot build it correctly without store support, it does belong.* The test is whether the client version has a race, requires a scan the store already has an index for, or needs coordination across processes. Notification on append qualified — a client could only poll. Atomic claim for work distribution qualifies. Deduplication qualifies, since the store already holds the index.
+- *Prefer mechanisms over policies.* One notification primitive serves every delivery pattern; a retention policy engine serves the cases someone enumerated.
+
+The JetStream comparison is a statement about *what becomes possible*, not about matching its configuration surface. Feature-for-feature parity would cost exactly the simplicity that makes this worth building.
+
+*** Evaluating an outside proposal
+
+Reports from consumers are valuable and are usually derived from a *pinned* revision, which is what makes their citations verifiable. It also means the defect may already be gone. Before evaluating the proposal:
+
+1. *Check the claim against current =main=.* Several performance defects reported against an older base — the 100 ms subscription poll and the two-write Nagle stall among them — were already fixed.
+2. *Check what the argument rests on.* A performance argument built on a cost that is currently present will favour whichever design avoids paying it, which is not the same as favouring the better design. The argument expires when the cost does.
+3. *Then* judge it on the scope rule above.
+
 ** Architecture Diagram
 
 #+begin_src
