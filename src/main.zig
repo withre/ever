@@ -266,61 +266,11 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
     if (follow) {
-        // Two cursor modes: `--after-offset` tracks the last delivered
-        // event's *global* offset (resume strictly after it); `--from` /
-        // default keeps the topic-local skip-count arithmetic.
-        var offset = from_offset;
-        var after_cursor = after_offset;
-        var did_initial = false;
-        var emitted: u64 = 0;
-        while (true) {
-            const remaining: u32 = if (max_count > emitted) @intCast(max_count - emitted) else 0;
-            if (remaining == 0 and did_initial) break;
-            const fetch_count: u32 = if (remaining > 0) remaining else max_count;
-            var result = if (after_cursor) |after|
-                client.fetchAfter(
-                    if (!is_pattern) topic_name else null,
-                    if (is_pattern) topic_name else null,
-                    after,
-                    if (!did_initial) fetch_count else @min(100, fetch_count),
-                    if (!did_initial) 0 else 5000,
-                ) catch |err| switch (err) {
-                    error.ServerError => exitFlushed(ctx, 1),
-                    else => return err,
-                }
-            else if (!did_initial)
-                (if (is_pattern) client.fetchPattern(topic_name, offset, fetch_count) else client.fetch(topic_name, offset, fetch_count)) catch |err| switch (err) {
-                    error.ServerError => exitFlushed(ctx, 1),
-                    else => return err,
-                }
-            else
-                client.fetchBlocking(
-                    if (!is_pattern) topic_name else null,
-                    if (is_pattern) topic_name else null,
-                    offset,
-                    @min(100, fetch_count),
-                    5000,
-                ) catch |err| switch (err) {
-                    error.ServerError => exitFlushed(ctx, 1),
-                    else => return err,
-                };
-            defer result.deinit();
-            for (result.events) |event| {
-                try printEvent(allocator, ctx.stdout, event, mode, topic_name);
-                try ctx.stdout.flush();
-                emitted += 1;
-                if (emitted >= max_count) break;
-            }
-            if (result.events.len > 0) {
-                if (after_cursor != null) {
-                    after_cursor = result.events[result.events.len - 1].offset;
-                } else {
-                    offset += result.events.len;
-                }
-            }
-            did_initial = true;
-            if (emitted >= max_count) break;
-        }
+        var sink: StdoutSink = .{ .allocator = allocator, .ctx = ctx, .mode = mode, .topic_name = topic_name };
+        followLoop(&client, &sink, topic_name, is_pattern, from_offset, after_offset, max_count) catch |err| switch (err) {
+            error.ServerError => exitFlushed(ctx, 1),
+            else => return err,
+        };
     } else {
         var result = (if (after_offset) |after|
             client.fetchAfter(
@@ -344,6 +294,71 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 try ctx.stdout.flush();
             }
         }
+    }
+}
+
+/// Prints each followed event to the CLI's stdout, flushing per event so a
+/// pipe reader sees it when it happened, not at a buffer boundary.
+const StdoutSink = struct {
+    allocator: std.mem.Allocator,
+    ctx: *cli.Context,
+    mode: PrintMode,
+    topic_name: []const u8,
+
+    fn emit(self: *StdoutSink, event: ever.client.Event) !void {
+        try printEvent(self.allocator, self.ctx.stdout, event, self.mode, self.topic_name);
+        try self.ctx.stdout.flush();
+    }
+};
+
+/// The follow phase of `ever sub --follow`, extracted from `handleSub` so its
+/// contract is testable: `client` provides the four fetch methods of
+/// `ever.client.Client`, `sink` receives each event in order. Errors
+/// propagate; the caller decides how they exit.
+///
+/// `max_count` bounds the *initial catch-up batch only* — once following,
+/// the loop runs until interrupted, as SKILL.md promises ("--follow never
+/// exits on its own"). It returns only by error
+/// (air/v0.1/sub-follow-ignores-max.org).
+fn followLoop(client: anytype, sink: anytype, topic_name: []const u8, is_pattern: bool, from_offset: u64, after_offset: ?u64, max_count: u32) !void {
+    // Two cursor modes: `--after-offset` tracks the last delivered
+    // event's *global* offset (resume strictly after it); `--from` /
+    // default keeps the topic-local skip-count arithmetic.
+    var offset = from_offset;
+    var after_cursor = after_offset;
+    var did_initial = false;
+    while (true) {
+        // 100 caps a single follow-phase fetch, not the stream.
+        const fetch_count: u32 = if (!did_initial) max_count else 100;
+        const block_ms: u32 = if (!did_initial) 0 else 5000;
+        var result = if (after_cursor) |after|
+            try client.fetchAfter(
+                if (!is_pattern) topic_name else null,
+                if (is_pattern) topic_name else null,
+                after,
+                fetch_count,
+                block_ms,
+            )
+        else if (!did_initial)
+            (if (is_pattern) try client.fetchPattern(topic_name, offset, fetch_count) else try client.fetch(topic_name, offset, fetch_count))
+        else
+            try client.fetchBlocking(
+                if (!is_pattern) topic_name else null,
+                if (is_pattern) topic_name else null,
+                offset,
+                fetch_count,
+                block_ms,
+            );
+        defer result.deinit();
+        for (result.events) |event| try sink.emit(event);
+        if (result.events.len > 0) {
+            if (after_cursor != null) {
+                after_cursor = result.events[result.events.len - 1].offset;
+            } else {
+                offset += result.events.len;
+            }
+        }
+        did_initial = true;
     }
 }
 
@@ -1811,7 +1826,7 @@ const app = cli.App{
             .flags = &.{
                 .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
                 .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
-                .{ .name = "max", .default = "100", .description = "Max events" },
+                .{ .name = "max", .default = "100", .description = "Max events in the initial batch; ignored once following" },
                 .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
                 .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values", .conflicts = &.{"json"} },
                 .{ .name = "json", .takes_value = false, .description = "Output full event objects as NDJSON", .conflicts = &.{"json-values"} },
@@ -2497,4 +2512,122 @@ test "pub payload: oversize diagnostic names the size and the limit" {
     // The limit prints without a pointless ".0".
     try std.testing.expectEqualStrings("16 MB", formatMegabytes(&limit_buf, max_stdin_payload));
     try std.testing.expectEqualStrings("0 MB", formatMegabytes(&size_buf, 0));
+}
+
+// ── sub --follow vs --max (air/v0.1/sub-follow-ignores-max.org) ─────────────
+
+/// A scripted stand-in for `ever.client.Client`, covering the four fetch
+/// methods `followLoop` calls. Each call consumes the next scripted reply;
+/// running off the end returns `error.ScriptExhausted`, so a loop that
+/// fetches more than the script expects fails loudly rather than spinning.
+const ScriptedClient = struct {
+    const Reply = anyerror![]const ever.client.Event;
+    const Call = struct { blocking: bool, max_count: u32, block_ms: u32 };
+
+    script: []const Reply,
+    next: usize = 0,
+    calls: [16]Call = undefined,
+    ncalls: usize = 0,
+
+    const Result = struct {
+        events: []const ever.client.Event,
+        fn deinit(_: *Result) void {}
+    };
+
+    fn reply(self: *ScriptedClient, call: Call) anyerror!Result {
+        if (self.ncalls < self.calls.len) self.calls[self.ncalls] = call;
+        self.ncalls += 1;
+        if (self.next >= self.script.len) return error.ScriptExhausted;
+        const r = self.script[self.next];
+        self.next += 1;
+        return .{ .events = try r };
+    }
+
+    fn fetch(self: *ScriptedClient, topic: []const u8, offset: u64, max_count: u32) anyerror!Result {
+        _ = topic;
+        _ = offset;
+        return self.reply(.{ .blocking = false, .max_count = max_count, .block_ms = 0 });
+    }
+
+    fn fetchPattern(self: *ScriptedClient, pattern: []const u8, offset: u64, max_count: u32) anyerror!Result {
+        _ = pattern;
+        _ = offset;
+        return self.reply(.{ .blocking = false, .max_count = max_count, .block_ms = 0 });
+    }
+
+    fn fetchBlocking(self: *ScriptedClient, topic: ?[]const u8, pattern: ?[]const u8, offset: u64, max_count: u32, block_ms: u32) anyerror!Result {
+        _ = topic;
+        _ = pattern;
+        _ = offset;
+        return self.reply(.{ .blocking = true, .max_count = max_count, .block_ms = block_ms });
+    }
+
+    fn fetchAfter(self: *ScriptedClient, topic: ?[]const u8, pattern: ?[]const u8, after_offset: u64, max_count: u32, block_ms: u32) anyerror!Result {
+        _ = topic;
+        _ = pattern;
+        _ = after_offset;
+        return self.reply(.{ .blocking = true, .max_count = max_count, .block_ms = block_ms });
+    }
+};
+
+const CountingSink = struct {
+    count: u64 = 0,
+    last_offset: ?u64 = null,
+
+    fn emit(self: *CountingSink, event: ever.client.Event) !void {
+        self.count += 1;
+        self.last_offset = event.offset;
+    }
+};
+
+fn eventRange(buf: []ever.client.Event, first: u64) []const ever.client.Event {
+    for (buf, 0..) |*e, i| e.* = .{ .offset = first + i, .timestamp = 0, .key = null, .value = "x" };
+    return buf;
+}
+
+test "sub --follow: default --max never ends the follow (SKILL.md:167)" {
+    // The 101st event is where the old loop exited 0. The follow must print
+    // it and fetch again — error.TestDone is the proof it was still going.
+    var backlog: [100]ever.client.Event = undefined;
+    var late: [1]ever.client.Event = undefined;
+    const script = [_]ScriptedClient.Reply{
+        eventRange(&backlog, 0), // initial catch-up: the full default batch
+        eventRange(&late, 100), // the 101st event, published later
+        error.TestDone, // the loop asked again: still following
+    };
+    var client = ScriptedClient{ .script = &script };
+    var sink = CountingSink{};
+    try std.testing.expectError(error.TestDone, followLoop(&client, &sink, "t", false, 0, null, 100));
+    try std.testing.expectEqual(@as(u64, 101), sink.count);
+    try std.testing.expectEqual(@as(u64, 100), sink.last_offset.?);
+}
+
+test "sub --follow --max 5: bounds the initial batch only" {
+    // 20 events already in the topic: --max 5 caps what the catch-up asks
+    // for, and the follow phase then streams everything after it, backlog
+    // and new alike, with the per-fetch cap of 100 — not with --max.
+    var backlog: [5]ever.client.Event = undefined;
+    var rest: [15]ever.client.Event = undefined;
+    var more: [2]ever.client.Event = undefined;
+    const script = [_]ScriptedClient.Reply{
+        eventRange(&backlog, 0),
+        eventRange(&rest, 5),
+        eventRange(&more, 20),
+        error.TestDone,
+    };
+    var client = ScriptedClient{ .script = &script };
+    var sink = CountingSink{};
+    try std.testing.expectError(error.TestDone, followLoop(&client, &sink, "t", false, 0, null, 5));
+    try std.testing.expectEqual(@as(u64, 22), sink.count);
+
+    try std.testing.expectEqual(@as(usize, 4), client.ncalls);
+    // The initial fetch carried --max and did not block…
+    try std.testing.expect(!client.calls[0].blocking);
+    try std.testing.expectEqual(@as(u32, 5), client.calls[0].max_count);
+    // …and the follow-phase fetches ignore it.
+    for (client.calls[1..4]) |call| {
+        try std.testing.expect(call.blocking);
+        try std.testing.expectEqual(@as(u32, 100), call.max_count);
+        try std.testing.expectEqual(@as(u32, 5000), call.block_ms);
+    }
 }
