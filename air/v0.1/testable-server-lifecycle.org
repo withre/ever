@@ -82,9 +82,11 @@ Read it with =getsockname= on the listener socket after =listen= succeeds. This 
 
 One helper in the test module, used by every integration test that needs a server:
 
+The harness must own the =Server= *by pointer*, heap-allocated. The accept-loop thread holds a =*Server=, so a struct returned by value moves the server out from under a running thread. =start()= still returns a =TestServer= by value; the =Server= itself does not live in it.
+
 #+begin_src zig
 const TestServer = struct {
-    server: ever.net.Server,
+    server: *ever.net.Server,   // heap-allocated: the accept thread holds this pointer
     thread: std.Thread,
     port: u16,
 
@@ -99,6 +101,19 @@ const TestServer = struct {
 #+end_src
 
 =start= must *wait for genuine readiness* rather than sleeping a fixed interval, and must give up with a clear failure rather than looping forever. =stop= must join the thread — that is the assertion that shutdown actually worked, and it is what turns a silent leak into a visible failure.
+
+* Constraints Established By The First Attempt
+
+These are not open questions. Each was found by implementing this document once, against an older base, and each is a requirement rather than a discovery for whoever implements it now.
+
+** =stop()= must join, and the join cannot be bounded
+Zig's =std.Thread= has no timed join. The only bounded alternative is to *not* join, which this document rejects on purpose: an unjoined thread may still hold the port when the next test binds, and the hang is the signal. So the join is deliberately unbounded, and a regression in =shutdown()= hangs the suite rather than leaking quietly. "Timeouts belong in the harness" applies to =start=, which can name the phase that timed out; it cannot apply to =stop=.
+
+** A connection accepted after shutdown has begun must be dropped, not handled
+This is a real defect and joining is what makes it reachable. The self-connect that wakes =accept()= is an ordinary connection: the accept loop hands it to a detached handler thread, which outlives the loop and keeps writing to the server's =active_connections=. An owner that joins and then frees — which is exactly what the harness does, and what this document asks for — gets a *use-after-free*. The loop must close the stream and break when the shutdown flag is already set. The accept model and the threading model are otherwise unchanged.
+
+** "Stops promptly" with an idle client means the 5s drain
+An idle connection cannot be read out from under its handler, so stopping while a client is attached waits out the drain this document deliberately keeps. The test must assert that =shutdown()= *returns* within a bound (under 8s), not that it returns quickly — and must close the client before the harness frees the server, since the handler writes to the server until its socket goes away.
 
 * Design Details
 
