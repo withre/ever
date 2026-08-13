@@ -149,6 +149,19 @@ pub const Server = struct {
                 else => { if (self.shutdown_requested.load(.acquire)) break; return err; },
             };
 
+            // Drop, do not serve, anything that arrives once shutdown has
+            // begun. The wake-up self-connect is an ordinary connection: hand
+            // it to a detached handler and that handler outlives the loop,
+            // still writing to `active_connections` after an owner that
+            // joined this thread has freed the server. Joining is what makes
+            // that use-after-free reachable, so the drop is part of being
+            // joinable rather than a separate policy.
+            if (self.shutdown_requested.load(.acquire)) {
+                var s = stream;
+                s.close(self.io);
+                break;
+            }
+
             // Enforce max_connections limit
             const current = self.active_connections.load(.acquire);
             if (current >= self.config.max_connections) {
