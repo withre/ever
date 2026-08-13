@@ -82,9 +82,31 @@ A subscriber resumes from =max(last_event_offset + 1, scan_watermark)=. When eve
 
 =hook-scan-cursor-and-lag.org= P1 changes =fetchPatternByOffset= to return the watermark it already computes. This document needs exactly that value and should not duplicate the change; if this lands first it must implement P1's return-value change in a way P1 can adopt unaltered, and say so in both documents.
 
+** A blocking fetch whose scan comes up empty
+
+This is the case the feature exists for and it must be decided here, not by whoever implements it.
+
+Today =handleFetch=, on an empty result, frees the slice and parks on =waitForAppend=, then loops and rescans *from the same =after== — nothing moved it. Populating =scan_watermark= without touching that loop delivers the watermark to a quiet subscriber only when =block_ms= expires, and every intermediate wake re-walks the same growing range. Both halves of the benefit are lost: the client gets no cheap cursor until the window ends, and the server keeps paying O(log) per wake.
+
+*The decision: keep parking, and advance a server-side watermark on each wake.* =handleFetch= holds its own cursor across the wakes of a single blocking fetch, advances it past whatever each empty scan ruled out, and reports the final value in =scan_watermark= whenever it does reply — on a match or at =block_ms=.
+
+Why not the alternative — reply immediately with =events = []= and the moved watermark: it changes what a blocking fetch *means*. =block_ms= would become "longest silence" rather than "longest wait for a match", and every foreign publish burst would cost a round trip and hand a script an empty reply it did not ask for. That is a user-visible change to a primitive, traded for a benefit the server-side version already delivers. It remains available later as an opt-in request flag if a client ever wants progress reports; it should not be the default and it should not arrive by accident.
+
+The server-side cost is fixed immediately and where it is incurred. The only client-visible change is that an empty =fetch_ok= at =block_ms= now carries a =scan_watermark= worth persisting.
+
 ** Honesty about what a client may assume
 
 The watermark says *examined*, not *delivered*. If a fetch stops early because it filled =max_count=, the watermark is the offset after the last delivered event, not the head — otherwise a client would skip events it was never sent. The current implementation already has this distinction and comments on it: on filling the buffer it deliberately does not advance its local cursor past undelivered events. That behaviour is correct and the watermark must preserve it.
+
+That rule is about undelivered *matches*. The complementary rule is about examined *non-matches*: the watermark may legitimately exceed =events[last].offset + 1= by up to the ≤16-entry chunk slack that =hook-scan-cursor-and-lag.org= P1 documents, and a client should prefer the watermark over the last delivered offset when both are present.
+
+Read side by side those two pull opposite ways, so the sentence that reconciles them is the one to implement against:
+
+#+begin_quote
+The watermark may pass offsets that were examined and ruled out, and may never pass a match that was not delivered.
+#+end_quote
+
+The test plan below calls the no-skip assertion "the assertion that catches the tempting wrong implementation". This sentence catches the *other* one: clamping the watermark to the last delivered offset whenever anything was delivered. That is safe, it passes the no-skip test, and it quietly restores the growing rescan in the mixed case — matches early in the range with a long ruled-out tail behind them.
 
 * Design Details
 
