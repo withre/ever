@@ -862,7 +862,16 @@ pub const HookDaemon = struct {
     /// Reap any terminated children with WNOHANG. Updates process table.
     fn reapChildren(self: *HookDaemon) void {
         while (true) {
-            const StatusPtr = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn".params[1].type.?;
+            // Type.Fn.params ([]Param{.type}) became .param_types ([]?type) during
+            // 0.17-dev (absent at dev.607, present by dev.1441; the renaming
+            // release is unfetchable, so detect the field rather than compare
+            // versions, per ba15d44). Note the element is already ?type in the
+            // new shape -- there is no .type member to reach through.
+            const FnInfo = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn";
+            const StatusPtr = if (@hasField(@TypeOf(FnInfo), "param_types"))
+                FnInfo.param_types[1].?
+            else
+                FnInfo.params[1].type.?;
             const Status = @typeInfo(StatusPtr).pointer.child;
             var status: Status = 0;
             const WNOHANG: u32 = 1;
