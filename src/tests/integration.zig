@@ -26,6 +26,118 @@ fn freeEvents(events: []Event) void {
     allocator.free(events);
 }
 
+// ── Server harness (air/v0.1/testable-server-lifecycle.org) ─────────────────
+//
+// One way to stand up a server in a test: ephemeral port, wait for genuine
+// readiness, stop by joining. Every hand-rolled variant of this got at least
+// one of the three wrong — a pid-derived port that collides across the three
+// test binaries, a readiness poll whose ceiling was picked per test, and a
+// thread that was never joined, so the listener outlived the test that
+// created it.
+
+/// A running server owned by a test.
+///
+/// Holds the `Server` *by pointer*, heap-allocated: the accept-loop thread
+/// holds a `*Server`, so keeping it inline would move the server out from
+/// under a running thread the moment the harness value itself is moved
+/// (returned from `start`, stored in an array, captured by a closure).
+const TestServer = struct {
+    server: *ever.net.Server,
+    thread: std.Thread,
+    port: u16,
+
+    /// Bind an ephemeral port, start accepting, and return once the server is
+    /// genuinely reachable — not once it has been spawned.
+    fn start(tm: *TopicManager) !TestServer {
+        return startWithConfig(tm, .{});
+    }
+
+    /// As `start`, for a test that needs a non-default `data_dir` or
+    /// connection limit. `address` and `port` are overridden: the whole point
+    /// is that a test never names a port.
+    fn startWithConfig(tm: *TopicManager, config: ever.net.Config) !TestServer {
+        return startOwned(try create(tm, config));
+    }
+
+    /// Allocate and initialise a server without starting it — the hook and
+    /// timer tests attach their tables before the accept loop may observe
+    /// them. Hand the result straight to `startOwned`.
+    fn create(tm: *TopicManager, config: ever.net.Config) !*ever.net.Server {
+        var cfg = config;
+        cfg.address = "127.0.0.1";
+        cfg.port = 0; // ask the OS; `boundPort()` reports what we got
+        const server = try allocator.create(ever.net.Server);
+        errdefer allocator.destroy(server);
+        server.* = try ever.net.Server.init(allocator, io, tm, cfg);
+        return server;
+    }
+
+    /// Take ownership of a prepared server and start it. On failure the
+    /// server is released, so a caller that got here never has to unwind it.
+    fn startOwned(server: *ever.net.Server) !TestServer {
+        errdefer {
+            server.deinit();
+            allocator.destroy(server);
+        }
+        const thread = try std.Thread.spawn(.{}, runServerForTest, .{server});
+
+        // Two phases, reported separately: a server that never binds and a
+        // server that binds but never answers are different failures, and a
+        // test author reading "timed out" deserves to know which one.
+        var port: u16 = 0;
+        var waited_ms: u32 = 0;
+        while (waited_ms < 2000) : (waited_ms += 5) {
+            port = server.boundPort();
+            if (port != 0) break;
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 5_000_000 }, null);
+        }
+        if (port == 0) {
+            std.debug.print("TestServer.start: listener never bound within 2s\n", .{});
+            server.shutdown();
+            thread.join();
+            return error.ServerNeverBound;
+        }
+
+        waited_ms = 0;
+        while (waited_ms < 2000) : (waited_ms += 5) {
+            if (ever.status.probeServer(io, "127.0.0.1", port, 50)) {
+                return .{ .server = server, .thread = thread, .port = port };
+            }
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 5_000_000 }, null);
+        }
+        std.debug.print("TestServer.start: bound port {d} never accepted within 2s\n", .{port});
+        server.shutdown();
+        thread.join();
+        return error.ServerNeverAccepted;
+    }
+
+    /// Stop, join, and release. `defer` it; safe to call once.
+    ///
+    /// Close any client the test opened *first*: a connection handler writes
+    /// to the server until its socket goes away, and the 5s drain gives up on
+    /// an idle one rather than reading it out from under the handler.
+    ///
+    /// The join is deliberately unbounded and deliberately not optional: it is
+    /// the assertion that `shutdown()` actually returned the accept loop. An
+    /// unjoined thread can still hold the port when the next test binds, so a
+    /// regression here has to hang this suite rather than leak quietly into a
+    /// consumer's. `std.Thread` has no timed join, and bounding it would mean
+    /// not joining.
+    fn stop(self: *TestServer) void {
+        self.server.shutdown();
+        self.thread.join();
+        self.release();
+    }
+
+    /// Free the server after the accept thread has been joined. Split out for
+    /// the one test that stops the server by another route (the signal path)
+    /// and still has to release it.
+    fn release(self: *TestServer) void {
+        self.server.deinit();
+        allocator.destroy(self.server);
+    }
+};
+
 // ── Status Server Probe ─────────────────────────────────────────────────────
 
 test "integration: status server probe flips true then false" {
@@ -2007,4 +2119,173 @@ test "integration: a response is not held for the peer's delayed ACK" {
     try testing.expect(worst_ms < 15);
 
     h.stop();
+}
+
+// ── Server lifecycle (air/v0.1/testable-server-lifecycle.org) ───────────────
+//
+// The defect these cover: `shutdown()` set a flag and closed the listener but
+// never returned the thread blocked in `accept()`, so the only caller that
+// could stop a server was the signal handler. Every test here stops a server
+// and keeps going; before the fix each of them hangs at 0% CPU rather than
+// failing.
+
+test "integration: a server can be started and stopped twice in one test" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    var first = try TestServer.start(&tm);
+    const first_port = first.port;
+    try testing.expect(first_port != 0);
+    first.stop();
+
+    // The second start is the assertion. A harness that skipped the join
+    // would leave the accept thread holding the listener, and this would
+    // either bind a fresh port while the old one leaked or, on the same
+    // port, fail outright — `listen` here uses reuse_address = false.
+    var second = try TestServer.start(&tm);
+    defer second.stop();
+    try testing.expect(second.port != 0);
+    try testing.expect(ever.status.probeServer(io, "127.0.0.1", second.port, 200));
+}
+
+test "integration: two concurrent servers get different ephemeral ports" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    var a = try TestServer.start(&tm);
+    defer a.stop();
+    var b = try TestServer.start(&tm);
+    defer b.stop();
+
+    // Not merely different numbers: both are live listeners at the same time,
+    // which is what a pid-derived port could not guarantee.
+    try testing.expect(a.port != 0 and b.port != 0);
+    try testing.expect(a.port != b.port);
+    try testing.expect(ever.status.probeServer(io, "127.0.0.1", a.port, 200));
+    try testing.expect(ever.status.probeServer(io, "127.0.0.1", b.port, 200));
+}
+
+test "integration: a test that stops a server keeps running" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("lifecycle.topic");
+
+    var ts = try TestServer.start(&tm);
+
+    // Force the accept loop to be *genuinely blocked* before stopping, or
+    // this test asserts nothing: if `stop()` lands before the loop reaches
+    // `accept()`, the wake-up connection is queued in the backlog and the
+    // loop never blocks — it passes with or without the fix.
+    //
+    // A completed request round-trip proves the loop finished an iteration
+    // (it spawned the handler that answered), and the settle gives it time to
+    // re-enter `accept()`, where there is nothing left for it to do.
+    {
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", ts.port);
+        defer client.deinit();
+        const offset = try client.publish("lifecycle.topic", null, "before stop");
+        try testing.expect(offset >= 0);
+    }
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null);
+
+    ts.stop();
+
+    // Everything below is the actual regression: unfixed, control never
+    // arrives here — the suite hangs at 0% CPU inside `stop()`.
+    try testing.expect(!ever.status.probeServer(io, "127.0.0.1", ts.port, 200));
+    const offset = try tm.publish("lifecycle.topic", null, "after stop");
+    try testing.expect(offset > 0);
+}
+
+test "integration: stop returns quickly with no client attached" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    var ts = try TestServer.start(&tm);
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null); // settle into accept()
+
+    const t0 = nowNanos();
+    ts.stop();
+    const elapsed_ms = @divTrunc(nowNanos() - t0, 1_000_000);
+
+    // Nothing to drain, so this is the wake-up round trip and a join. The
+    // bound is loose because the assertion is "not the 5s drain, and not
+    // forever", not a latency measurement.
+    try testing.expect(elapsed_ms < 1000);
+}
+
+test "integration: stop returns within the drain bound with an idle client" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("idle.client.topic");
+
+    var ts = try TestServer.start(&tm);
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", ts.port);
+    // One completed request, so the connection is genuinely established and
+    // its handler is parked in `readFrame` — an unread socket is exactly what
+    // the drain cannot hurry.
+    _ = try client.publish("idle.client.topic", null, "hello");
+
+    const t0 = nowNanos();
+    ts.server.shutdown();
+    const elapsed_ms = @divTrunc(nowNanos() - t0, 1_000_000);
+
+    // An idle connection cannot be read out from under its handler, so this
+    // waits out the 5s drain by design. The assertion is that `shutdown()`
+    // *returns*, not that it returns fast. The suite therefore prints
+    // "Shutdown: 1 connections did not drain within 5s." here on success;
+    // that line is this test working, not a failure.
+    try testing.expect(elapsed_ms < 8000);
+
+    // Close the client before the server is freed: its handler thread writes
+    // to `active_connections` until its socket goes away, and closing alone
+    // only *lets* it exit — the second `shutdown()` is what waits for it.
+    // Without that wait this test reports "write after free" rather than a
+    // hang, which is the same defect wearing different clothes.
+    client.deinit();
+    ts.thread.join();
+    ts.server.shutdown();
+    ts.release();
+}
+
+test "integration: the signal path still stops the server" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    const server = try TestServer.create(&tm, .{});
+    server.installSignalHandlers();
+    defer {
+        // Leave no handler pointing at a server this test is about to free.
+        const dfl = std.os.linux.Sigaction{
+            .handler = .{ .handler = std.os.linux.SIG.DFL },
+            .mask = std.os.linux.sigemptyset(),
+            .flags = 0,
+        };
+        _ = std.os.linux.sigaction(.INT, &dfl, null);
+        _ = std.os.linux.sigaction(.TERM, &dfl, null);
+    }
+
+    var ts = try TestServer.startOwned(server);
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 250_000_000 }, null); // settle into accept()
+
+    // The CLI's stop sequence: the handler returns the accept loop, `run()`
+    // exits, and only then does main call `shutdown()` to drain. Moving the
+    // self-connect into `shutdown()` must not have cost the handler its own
+    // route out — it cannot call `shutdown()`, which sleeps and prints.
+    try std.posix.raise(.TERM);
+    ts.thread.join();
+    ts.server.shutdown();
+    ts.release();
 }
