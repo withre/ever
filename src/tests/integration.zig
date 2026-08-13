@@ -1086,6 +1086,93 @@ test "integration: after_offset cursor over TCP round-trips displayed offsets" {
     }
 }
 
+// ── Pattern fetch refuses topic-local offsets ───────────────────────────────
+//
+// (air/v0.1/pattern-fetch-rejects-offset.org) `FetchRequest.offset` is a
+// per-topic skip count; applied to every topic a pattern matches it is a
+// number no client can compute a next value for, because the response
+// interleaves topics. The server now refuses the combination outright
+// rather than answering something no cursor can be built from.
+
+test "integration: pattern fetch with a topic-local offset is refused" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("pat.a");
+    try tm.createTopic("pat.b");
+    _ = try tm.publish("pat.a", null, "a1");
+    const g_b1 = try tm.publish("pat.b", null, "b1");
+    const g_a2 = try tm.publish("pat.a", null, "a2");
+
+    var ts = try TestServer.start(&tm);
+    const port = ts.port;
+
+    {
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", port);
+        defer client.deinit();
+
+        const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", port);
+        const ip_address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
+        const stream = try ip_address.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        const cfd = stream.socket.handle;
+
+        // pattern + offset != 0, no after_offset: refused, with the reply
+        // naming the cursor that does work.
+        {
+            try writeRawFrame(cfd, @intFromEnum(ever.protocol.MessageType.fetch), "{\"pattern\":\"pat.\",\"offset\":1}");
+            const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;
+            defer allocator.free(frame.body);
+            try testing.expectEqual(ever.protocol.MessageType.error_response, frame.msg_type);
+            const parsed = try ever.protocol.decodeBody(ever.protocol.ErrorResponse, allocator, frame.body);
+            defer parsed.deinit();
+            try testing.expectEqual(ever.protocol.ErrorCode.bad_request, parsed.value.code);
+            try testing.expectEqualStrings(
+                "offset is a per-topic skip count and is undefined for a pattern; resume a pattern with after_offset",
+                parsed.value.message,
+            );
+        }
+
+        // pattern + offset == 0 keeps working: "from the beginning of every
+        // matching topic" is well-defined and is what `sub <prefix>` and a
+        // follow's first fetch rely on.
+        {
+            var all = try client.fetchPattern("pat.", 0, 10);
+            defer all.deinit();
+            try testing.expectEqual(@as(usize, 3), all.events.len);
+        }
+
+        // pattern + after_offset + offset != 0: after_offset wins, as its
+        // doc-comment has always said. Sent raw because the client enforces
+        // exclusivity and cannot produce this frame.
+        {
+            var buf: [128]u8 = undefined;
+            const body = try std.fmt.bufPrint(&buf, "{{\"pattern\":\"pat.\",\"offset\":5,\"after_offset\":{d}}}", .{g_b1});
+            try writeRawFrame(cfd, @intFromEnum(ever.protocol.MessageType.fetch), body);
+            const frame = (try ever.protocol.readFrame(allocator, cfd)) orelse return error.TestUnexpectedResult;
+            defer allocator.free(frame.body);
+            try testing.expectEqual(ever.protocol.MessageType.fetch_ok, frame.msg_type);
+            const parsed = try ever.protocol.decodeBody(ever.protocol.FetchResponse, allocator, frame.body);
+            defer parsed.deinit();
+            try testing.expectEqual(@as(usize, 1), parsed.value.events.len);
+            try testing.expectEqual(g_a2, parsed.value.events[0].offset);
+        }
+
+        // exact topic + offset != 0 is untouched: topic-local skip counts on
+        // a single topic are meaningful and used.
+        {
+            var skipped = try client.fetch("pat.a", 1, 10);
+            defer skipped.deinit();
+            try testing.expectEqual(@as(usize, 1), skipped.events.len);
+            try testing.expectEqualStrings("a2", skipped.events[0].value);
+        }
+    }
+
+    ts.stop();
+}
+
 // ── Hook Logs over TCP ──────────────────────────────────────────────────────
 //
 // Server-side split from air/v0.1/hook-logs-json.org: an unknown hook ID is

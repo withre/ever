@@ -340,6 +340,15 @@ pub const Server = struct {
         defer parsed.deinit();
         const req = parsed.value;
 
+        // `offset` is a per-topic skip count. Applied to every topic a
+        // pattern matches ("skip the first N of each") it is a number no
+        // client can compute a next value for -- the response interleaves
+        // topics and the client only knows how many events it received in
+        // total. Refuse the combination rather than answer something no
+        // cursor can be built from. (air/v0.1/pattern-fetch-rejects-offset.org)
+        if (req.pattern != null and req.after_offset == null and req.offset != 0)
+            return sendError(self.allocator, fd, protocol.ErrorCode.bad_request, "offset is a per-topic skip count and is undefined for a pattern; resume a pattern with after_offset");
+
         // Blocking fetch: wait for an append, not for a timer.
         //
         // The epoch is read *before* each look for events, so an append that

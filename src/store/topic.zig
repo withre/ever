@@ -660,8 +660,10 @@ pub const TopicManager = struct {
             while (topic_iter.next()) |entry| {
                 if (!matchTopic(pattern, entry.key_ptr.*)) continue;
                 // Same seek as `fetch`, per matching topic: `start` is applied
-                // to each topic independently, which is the behaviour this
-                // function already had.
+                // to each topic independently. Callers pass 0; the server
+                // refuses anything else, because a per-topic skip count over
+                // an interleaved response is a cursor no client can advance
+                // (air/v0.1/pattern-fetch-rejects-offset.org).
                 const from = entry.value_ptr.firstIndexForSkip(start);
                 const duped = try allocator.dupe(u64, entry.value_ptr.offsets.items[from..]);
                 try batches.append(allocator, .{ .offsets = duped });
