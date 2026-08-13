@@ -17,6 +17,8 @@ const TimerTable = timers_mod.TimerTable;
 
 pub const Config = struct {
     address: []const u8 = "127.0.0.1",
+    /// TCP port to bind. 0 means "any free port" — ask `boundPort()` once
+    /// `run()` has bound to learn which one the OS assigned.
     port: u16 = 7890,
     max_connections: u32 = 1024,
     /// Data directory the store is serving from. Reported verbatim in the
@@ -45,6 +47,15 @@ pub const Server = struct {
     timer_table: ?*TimerTable,
     config: Config,
     net_server: ?net.Server,
+    /// Port actually bound, published by `run()` and read via `boundPort()`.
+    /// Atomic because the accept loop writes it while other threads (a test
+    /// harness, `shutdown()`, the signal handler) read it.
+    bound_port: std.atomic.Value(u16),
+    /// Address the self-connect in `unblockAccept` dials. Taken from the
+    /// listener itself, with the wildcard address mapped to loopback.
+    /// Written before `bound_port` is published and read after, so the
+    /// release store on `bound_port` is what makes it visible.
+    self_connect_ip: [4]u8,
     shutdown_requested: std.atomic.Value(bool),
     /// True from just before the accept loop starts until `run()` returns.
     /// `shutdown()` waits on this before closing the listener: the loop
@@ -66,6 +77,8 @@ pub const Server = struct {
             .timer_table = null,
             .config = config,
             .net_server = null,
+            .bound_port = std.atomic.Value(u16).init(0),
+            .self_connect_ip = .{ 127, 0, 0, 1 },
             .shutdown_requested = std.atomic.Value(bool).init(false),
             .accept_loop_active = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
@@ -91,6 +104,33 @@ pub const Server = struct {
     /// Release server resources (closes the listener socket).
     pub fn deinit(self: *Server) void {
         if (self.net_server) |*s| { s.deinit(self.io); self.net_server = null; }
+        self.bound_port.store(0, .release);
+    }
+
+    /// The port this server is listening on. Equals `config.port` unless that
+    /// was 0, in which case it is the port the OS assigned. Valid only after
+    /// `run()` has bound; 0 before that.
+    pub fn boundPort(self: *const Server) u16 {
+        return self.bound_port.load(.acquire);
+    }
+
+    /// Read back the address the listener actually got and publish it, so a
+    /// caller that asked for port 0 can find the server and `unblockAccept`
+    /// has something to dial. Called once, immediately after `listen`.
+    fn publishBoundAddress(self: *Server) void {
+        var sa: std.os.linux.sockaddr.in = undefined;
+        var sa_len: std.os.linux.socklen_t = @sizeOf(std.os.linux.sockaddr.in);
+        const rc = std.os.linux.getsockname(self.net_server.?.socket.handle, @ptrCast(&sa), &sa_len);
+        if (std.os.linux.errno(rc) != .SUCCESS) {
+            // Only an ephemeral bind actually needs the syscall; for an
+            // explicit port the config value is already the answer.
+            self.bound_port.store(self.config.port, .release);
+            return;
+        }
+        // A server bound to the wildcard address is reachable on loopback,
+        // and 0.0.0.0 is not a sensible connect() target.
+        if (sa.addr != 0) self.self_connect_ip = @bitCast(sa.addr);
+        self.bound_port.store(std.mem.bigToNative(u16, sa.port), .release);
     }
 
     /// Start the accept loop. Blocks until `shutdown()` is called.
@@ -98,6 +138,7 @@ pub const Server = struct {
         const ip4 = try net.Ip4Address.parse(self.config.address, self.config.port);
         const address: net.IpAddress = .{ .ip4 = ip4 };
         self.net_server = try address.listen(self.io, .{ .reuse_address = false });
+        self.publishBoundAddress();
 
         self.accept_loop_active.store(true, .release);
         defer self.accept_loop_active.store(false, .release);
@@ -153,8 +194,15 @@ pub const Server = struct {
     /// and `close()` are async-signal-safe, so the signal handler calls this
     /// directly.
     fn unblockAccept(self: *const Server) void {
-        const port = self.config.port;
+        // The bound port, not the configured one: with `config.port = 0` the
+        // configured value names no listener at all, so reading the config
+        // here would silently stop waking `accept()` for exactly the
+        // ephemeral-port callers this exists to serve. Zero here means the
+        // listener is not up yet, and a loop that has not entered `accept()`
+        // sees the flag on its next iteration anyway.
+        const port = self.boundPort();
         if (port == 0) return;
+        const ip = self.self_connect_ip;
 
         const fd_rc = std.os.linux.socket(2, 1, 0); // AF_INET, SOCK_STREAM
         const fd_i: isize = @bitCast(fd_rc);
@@ -167,10 +215,10 @@ pub const Server = struct {
         addr[1] = 0;
         addr[2] = @intCast(port >> 8);
         addr[3] = @intCast(port & 0xFF);
-        addr[4] = 127;
-        addr[5] = 0;
-        addr[6] = 0;
-        addr[7] = 1;
+        addr[4] = ip[0];
+        addr[5] = ip[1];
+        addr[6] = ip[2];
+        addr[7] = ip[3];
         _ = std.os.linux.connect(fd, @ptrCast(&addr), 16);
         _ = std.os.linux.close(fd);
     }
@@ -991,4 +1039,18 @@ test "Server init and deinit" {
     var server = try Server.init(std.testing.allocator, io, &tm, .{});
     defer server.deinit();
     try std.testing.expect(!server.shutdown_requested.load(.acquire));
+}
+
+test "Server reports no bound port before run" {
+    // A caller that asked for an ephemeral port must be able to tell "not
+    // bound yet" from a real port, otherwise it races the accept loop and
+    // connects to whatever happens to own port 0's answer.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    var server = try Server.init(std.testing.allocator, io, &tm, .{ .port = 0 });
+    defer server.deinit();
+    try std.testing.expectEqual(@as(u16, 0), server.boundPort());
 }
