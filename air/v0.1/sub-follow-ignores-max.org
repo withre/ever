@@ -1,0 +1,53 @@
+#+title: sub --follow Should Follow Until Killed, as SKILL.md Already Promises
+#+state: ready
+#+FILETAGS: :cli:subscriber:bug:
+
+* Summary
+=SKILL.md= makes a one-sentence guarantee about =sub --follow=, and the code breaks it at the hundredth event. ~SKILL.md:167~:
+
+#+begin_quote
+=--follow= never exits on its own — kill with Ctrl-C or a signal.
+#+end_quote
+
+=--max= defaults to =100= (~src/main.zig:1814~) and =handleSub='s follow loop breaks when =emitted >= max_count= (~src/main.zig:277-278~, ~:312~, ~:322~), so =ever sub t --follow= silently exits 0 after the hundredth event. The workaround is =--max 4294967295=, which nobody types unprompted and which also inflates the /initial/ fetch's =max_count= (~:285~). Proposed: =--max= bounds the initial catch-up batch only; once =did_initial= is true the loop runs until interrupted. The documentation is right and the code changes to match it, not the reverse.
+
+/Who is asking./ Reverie (=withre/reverie=), whose round-10 blind review (B4, 2026-08-09) found its own documented operator line "follows indefinitely" false against this code. Originally bundled into =pattern-fetch-rejects-offset.org=; split out 2026-08-13 because it is separable there and Ever's convention is one independently shippable feature per document. Read at ever =origin/main= =3991190c611e= (2026-08-09); line references at that commit, and no file under =src/= differs between it and =6552ad3cc6c0=, today's tip.
+
+* Motivation
+
+** A documented guarantee, not an ergonomic preference
+
+This is not "the default is surprising". A sentence in Ever's own user documentation states a behaviour — /never exits on its own/ — and the code exits 0, on the ordinary path, with default flags. Ever's =implementation-guide.org= (at =6552ad3cc6c0=) has already named this shape permanently: /the visible half of a two-part guarantee is the half that gets implemented/ — "from outside a working one and a broken one are identical", and its detection rule 2 is "read every comment that asserts a guarantee and find the line that provides it … A comment is a claim, not evidence." ~SKILL.md:167~ is such a claim, in the document users read first; the streaming is the visible half, the /never exits/ is the half that is missing. Every instance in that guide's table was found by reading rather than by use, and so was this one.
+
+** What the exit looks like from outside
+
+A supervisor runs =ever sub <project>.impl. --follow= and pipes it somewhere. At event 100 the process exits 0 — the exit code of success — and the pipeline keeps running with a dead source. Nothing distinguishes "the topic went quiet" from "the subscriber left", which is exactly why the =SKILL.md= sentence exists: a follower that can exit on its own is a follower you have to babysit.
+
+* Goals
+- =ever sub <topic-or-pattern> --follow= with default flags runs until interrupted, making ~SKILL.md:167~ true.
+- =--max= keeps meaning what it says for every non-follow =sub=, and bounds the initial catch-up batch of a follow.
+- No change to exit codes, to =--after-offset= resumption, or to what is printed.
+
+* Non-Goals
+- A bounded follow. If one is wanted, that is a separate =--count= flag as =wait= already has — additive, and not this document.
+- The pattern-offset semantics of the same loop. That is =pattern-fetch-rejects-offset.org=, which this document was split from; either lands without the other.
+- Changing ~SKILL.md:167~ to match the code. That is the other way to close the contradiction, and the wrong one: the sentence describes the tool people believe they are using.
+
+* Proposal
+In =handleSub='s follow path, =--max= bounds the initial catch-up batch only: the =emitted >= max_count= breaks (~src/main.zig:277-278~, ~:312~, ~:322~) apply only while =did_initial= is false, and once following the loop runs until interrupted. The =@min(100, fetch_count)= cap on follow-phase fetches (~:285~, ~:297-306~) stays — it bounds a single fetch, not the stream. Help text for =--max= (~:1814~) becomes "max events in the initial batch; ignored once following". ~SKILL.md:167~ is already correct and does not change.
+
+** Interim, and if declined
+Reverie's documents carry the =--max 4294967295= workaround meanwhile and would drop it the day this lands. If declined, ~SKILL.md:167~ has to change instead — the sentence and the code cannot both stay — and every pipeline over =sub --follow= keeps needing the workaround or a restart loop.
+
+* Design Details
+
+** Files expected to change
+- =src/main.zig= — the three break conditions and the =--max= help text.
+- =SKILL.md= — nothing; the point is that its sentence becomes true.
+
+** Testing
+- /The guarantee, as a test/: publish 101 events to a topic a default-flags =sub t --follow= is following; assert the 101st is printed and the process is still alive. Fails on the current tree, which exits 0 at 100 — that failure is the negative control.
+- /=--max= still means something/: =sub t --max 5= (no =--follow=) prints 5 and exits; =sub t --follow --max 5= on a topic with 20 existing events prints 5 of the backlog, then everything published after it.
+
+* History
+- 2026-08-13: Split out of =pattern-fetch-rejects-offset.org= (where it was added 2026-08-09 on Reverie's round-10 blind review, B4) per [[file:../../../../reviews/upstream-ever-review.org][reviews/upstream-ever-review.org]] C4, and strengthened by the same review: ~SKILL.md:167~ read at =3991190c611e= and quoted above — the contradiction with the code is what turns this from ergonomics into a broken documented guarantee, the "visible half of a two-part guarantee" shape Ever's =implementation-guide.org= names at =6552ad3cc6c0=. =handleSub= re-read at =3991190c611e=. Worker =reverie-upfix=.

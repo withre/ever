@@ -1,0 +1,180 @@
+#+title: =Client= as a Library Citizen: No Printing, and Errors That Keep the Server's Code
+#+state: ready
+#+FILETAGS: :client:protocol:embedder:
+
+* Summary
+=ever.client.Client= is exported from =root.zig= as library API and is what a program links to talk to a store it did not open. Every one of its request methods handles a server =error_response= the same way: =handleErrorResponse= parses the body, *prints the message to stderr with =std.debug.print=*, discards the =code=, and returns the single tag =error.ServerError=. That is the right output on the right stream for the =ever= CLI — Ever's own =stdout-stderr-split.org= classified these two prints as "correctly stderr" — and it is the wrong layer: a library that writes to a descriptor its caller owns, and an error the caller cannot tell a 404 from a 500 by. Two changes, both small: the library prints nothing (the CLI prints, once, in =main.zig=); and a server error reaches the caller with its =code= and =message= intact, connection loss being one named condition distinct from it. About 40 lines of =client.zig= and one helper in =main.zig= replacing 24 identical =error.ServerError => exitFlushed(ctx, 1)= arms; no wire change; the CLI's visible behaviour byte-identical.
+
+/Who is asking./ Reverie (=withre/reverie=). A second Reverie window on a live session is a client of the first window's listener and holds *two stock =Client= values* constructed around unix streams it connected itself (its [[file:../../../../air/v0.1/configuration-and-bootstrap.org][air/v0.1/configuration-and-bootstrap.org]] A7; [[file:../../../../air/v0.1/threat-model.org][air/v0.1/threat-model.org]] fact 3 is why the struct-literal construction works: =Client= is ={ allocator, io, stream }= with no invariant beyond the stream being connected). That window owns a terminal in raw mode with a live frame on screen, and its rule is "never stderr under raw mode" — so the first =error_response= it meets tears the display with a line it did not write. And three of its specified behaviours switch on /which/ error came back: an extension's state write meeting *404* is dropped and logged ([[file:../../../../air/v0.1/extension-api.org][air/v0.1/extension-api.org]]); a publish meeting *500 "publish failed"* is how an attached window learns the store is unwritable and shows /store not writable/ ([[file:../../../../air/v0.1/failure-model.org][air/v0.1/failure-model.org]] class 6, [[file:../../../../air/v0.1/event-sourced-message-queue.org][air/v0.1/event-sourced-message-queue.org]]); a *dropped connection* is /owner lost/ and prompts take-over (configuration-and-bootstrap A11). With stock =Client= at this commit all three arrive as =error.ServerError= or =error.ConnectionClosed= after stderr has already been written. Reverie's round-10 blind review found this (B3, =reviews/round-10/blind.org= there) and offered the owner a forty-line Reverie-side client over =ever.protocol= as the no-ask alternative; he declined the stopgap in favour of asking — /"As Ever becomes a library to use, stock client path seems most sane -- any changes needed on Ever will land there before the impl starts in Reverie (unless Ever side is against the change), so there is no stopgap measure needed for now"/ (his D49, 2026-08-09). Read at ever =origin/main= =3991190c611e= (2026-08-09); every line reference below is at that commit.
+
+* Motivation
+
+** What is there now
+
+The one error path every request method shares (~src/net/client.zig:164-173~):
+
+#+begin_src zig
+/// Parse an error_response frame body and print a useful message, then return error.
+fn handleErrorResponse(self: *Client, body: []const u8) error{ServerError} {
+    const parsed = protocol.decodeBody(protocol.ErrorResponse, self.allocator, body) catch {
+        std.debug.print("error: server returned an error (could not parse details)\n", .{});
+        return error.ServerError;
+    };
+    defer parsed.deinit();
+    std.debug.print("error: {s}\n", .{parsed.value.message});
+    return error.ServerError;
+}
+#+end_src
+
+=protocol.ErrorResponse= is ={ code: u16, message: []const u8 }= (~src/protocol/message.zig:136-139~) and the server sends five codes (=ErrorCode=, ~:436-442~: 400, 404, 409, 413, 500). =parsed.value.code= is read by nothing; =parsed.value.message= lives until the =defer= and is seen only by stderr.
+
+Every request method reaches it the same way — =publish= (~:198-221~) is representative:
+
+#+begin_src zig
+try protocol.writeFrame(self.fd(), .publish, body);
+
+const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
+    return error.ConnectionClosed;
+defer self.allocator.free(frame.body);
+
+if (frame.msg_type == .error_response) return self.handleErrorResponse(frame.body);
+if (frame.msg_type != .publish_ok) return error.UnexpectedResponse;
+#+end_src
+
+Fifteen call sites, one per request shape: =publish= ~:214~, =doFetch= ~:267~ (behind =fetch= / =fetchPattern= / =fetchBlocking= / =fetchAfter=), =createTopic= ~:326~, =deleteTopic= ~:341~, the =registerHook*= family ~:401~, =removeHook= ~:420~, =listHooks= ~:432~, =listTopics= ~:493~, =addTimer= ~:543~, =removeTimer= ~:558~, =listTimers= ~:570~, =hookPs= ~:615~, =hookLogs= ~:653~, =status= ~:677~, =timerInfo= ~:751~. These two =std.debug.print= calls are the only writes to a standard stream anywhere under =src/net/client.zig=, =src/protocol/= or the store's read paths (=git grep std.debug.print= at this commit: =server.zig:152='s shutdown-drain line and the hook/timer daemons' log lines are the others, none reachable from =Client=).
+
+*What a caller can distinguish today*, reading the inferred error sets: =error.ServerError= (any of the five codes, text already gone to stderr); =error.ConnectionClosed= (=readFrame= returned =null= — which it does for a clean EOF /and/ for a read error mid-header or mid-body, ~src/protocol/message.zig:391~, ~:405-408~, so a reset during the reply is already folded into this, which for a client is the right fold); =error.UnexpectedResponse=; and, from =writeFrame= before any reply, =error.BrokenPipe= / =error.ConnectionResetByPeer= / =error.Unexpected= (~:453-458~) — the /same/ condition as =ConnectionClosed= (the peer is gone) under three more names depending on which syscall noticed first. Plus =readFrame='s =UnsupportedVersion= / =MessageTooLarge= / =IncompleteHeader= / =IncompleteBody= and allocation and JSON errors passing through =try=.
+
+*And the CLI is written against the print, which is why the print is there.* =main.zig= handles a server error in twenty-four places and every one is the same arm (~src/main.zig:231~, ~:288~, ~:293~, ~:304~, ~:334~, ~:471~, … ~:1434~):
+
+#+begin_src zig
+) catch |err| switch (err) {
+    error.ServerError => exitFlushed(ctx, 1),
+    else => return err,
+};
+#+end_src
+
+— exit 1 and say nothing, because the library already said it. So the message a user reads on =ever pub nosuch x= (=error: topic not found=) is produced inside =Client.publish=, and moving it is a two-file change or the CLI goes silent.
+
+** Why it matters to a consumer that is not Reverie
+
+- *Any program embedding =Client= inherits output it did not ask for on a stream it may be using.* A daemon with structured logging gets an unstructured =error: …= line interleaved into its log; a TUI gets its screen torn; a test harness asserting on stderr gets noise; a program that redirected fd 2 to a file it parses gets a line in a format it does not control. =std.debug.print='s own doc-comment says what it is for — /"Writes to stderr, ignoring errors. This is a low-level debugging primitive that bypasses the =Io= interface … Alternatively, use the higher-level =std.log= or =Io.lockStderr= to integrate with the application's chosen =Io= implementation"/ (=lib/std/debug.zig= at Zig =0.17.0-dev.1282=, the snapshot Reverie's probes ran on; the wording at Ever's own pin may differ, the intent has not) — so a =Client= that took an =io= at =connect= and then bypasses it to print is off-idiom by std's lights as well as by a library's; and =bench.zig=, Ever's other in-tree =Client= consumer (~src/bench.zig:279~, ~:340~, ~:348~), only avoids meeting it because a benchmark against a healthy store never sees an =error_response=.
+- *The code is the protocol's whole error vocabulary, and the client throws it away.* The server distinguishes /you asked wrong/ (400), /no such topic/ (404), /already exists ∕ deleted/ (409), /too large/ (413) and /I failed/ (500) on purpose (=publish-input-validation.org=, =topic-management.org=); the HTTP interface preserves the distinction as status codes; only the native client collapses it. A consumer that wants to create-if-missing on 404, back off on 500 and report 400 as its own bug — the ordinary shape of a client — cannot, short of parsing English it was never handed.
+- *"Connection lost" under four names is a switch statement every consumer writes slightly wrong.* =ConnectionClosed= from the read side, =BrokenPipe= / =ConnectionResetByPeer= / =Unexpected= from the write side: the CLI's =else => return err= arm turns the latter three into a Zig error trace on a user's terminal today (kill a store between =ever sub --follow='s fetches at the right moment), which is a small CLI bug of its own with the same fix.
+- *It is the last thing between =client-library.org='s stated goal and the code*: "Clean API following Zig idioms (allocator parameter, error unions, deinit)". Error unions that carry the information, and no side effects the signature does not admit, /are/ the idiom.
+
+* Goals
+- No function reachable from =ever.client.Client= writes to stdout or stderr. (=grep -c 'std.debug.print\|std.log' src/net/client.zig= is =0=, and stays so by review.)
+- A server =error_response= reaches the caller with *both* fields of =ErrorResponse= recoverable: the =code= as something a =switch= can branch on, the =message= as bytes the caller may print or drop.
+- Loss of the connection — EOF or reset while reading the reply, =EPIPE= / =ECONNRESET= while writing the request — is *one* named error, distinct from a server error and from a protocol violation (=UnexpectedResponse=, =UnsupportedVersion=, =MessageTooLarge=, =Incomplete*=).
+- The =ever= CLI's user-visible behaviour is unchanged byte for byte: the same =error: <message>= line on stderr, the same exit status 1, for every command — now printed by =main.zig=.
+- Constructing a =Client= around a stream the caller connected itself (a unix socket, an already-accepted fd in a test) stays supported — today by struct literal, which is fine; if the struct ever gains private state, by a =Client.init(allocator, io, stream)= beside =connect=.
+
+* Non-Goals
+- Reconnection, backoff, or any retry policy in the library. The caller decides; this ask only makes the decision possible.
+- Changing =ErrorResponse= on the wire, or the set of codes the server sends.
+- Making =readFrame= / =writeFrame= =std.Io= operations (cancelable, vectored through =io=). Worth doing one day for every consumer on =std.Io.Threaded=; larger, separate, and not needed for this. /Noted for embedders meanwhile: a =Client= parked in a blocking fetch is not interrupted by =Io= cancelation, because =readFrame= is a raw =posix.read= that retries =EINTR=; =Stream.shutdown(io, .both)= on its stream from another task makes the read return 0, =readFrame= return =null=, and the call return the connection-lost error — the same trick Ever's own =Server.shutdown= cannot use on its detached threads and Reverie's dispatch does use on its connection tasks./
+- A unix-socket =connect= variant. Reverie builds the stream itself and needs nothing; a =connectUnix(path)= would be a kindness to the next embedder and is not asked for here.
+- Localising or restructuring the message text. It stays the server's sentence.
+
+* Proposal
+
+Two shapes for the error, either of which meets the goals; Reverie has a mild preference for the second and no stake in the choice.
+
+** (a) Retain the last server error on the =Client=; keep =error.ServerError=
+
+#+begin_src zig
+pub const ServerErrorInfo = struct { code: u16, message: []u8 };   // message owned by client.allocator
+
+pub const Client = struct {
+    allocator: Allocator,
+    io: Io,
+    stream: net.Stream,
+    /// Set when a request returns error.ServerError; cleared (and freed) at the start of the
+    /// next request and in deinit. `code == 0` with a fixed message when the body did not parse.
+    last_error: ?ServerErrorInfo = null,
+
+    pub fn lastError(self: *const Client) ?ServerErrorInfo { return self.last_error; }
+
+    fn handleErrorResponse(self: *Client, body: []const u8) error{ServerError} {
+        self.clearLastError();
+        const parsed = protocol.decodeBody(protocol.ErrorResponse, self.allocator, body) catch {
+            self.last_error = .{ .code = 0, .message = self.allocator.dupe(u8, "server returned an error (could not parse details)") catch &.{} };
+            return error.ServerError;
+        };
+        defer parsed.deinit();
+        self.last_error = .{ .code = parsed.value.code, .message = self.allocator.dupe(u8, parsed.value.message) catch &.{} };
+        return error.ServerError;
+    }
+#+end_src
+
+No call site in =client.zig= changes; every signature is unchanged; =deinit= frees =last_error=. The pattern is std's own for "an error tag plus details the tag cannot carry" (=std.json.Diagnostics=, =std.zig.Ast= errors, =std.http.Client='s response status beside its error set). Cost: one optional field, one =dupe= on the error path only, ≈20 lines.
+
+** (b) Map the code onto the error set, and retain the message as in (a)
+
+#+begin_src zig
+pub const ServerError = error{ BadRequest, NotFound, Conflict, TooLarge, Internal, ServerError };
+
+fn handleErrorResponse(self: *Client, body: []const u8) ServerError {
+    // ... retain last_error exactly as in (a), then:
+    return switch (code) {
+        protocol.ErrorCode.bad_request => error.BadRequest,
+        protocol.ErrorCode.not_found  => error.NotFound,
+        protocol.ErrorCode.conflict   => error.Conflict,
+        protocol.ErrorCode.too_large  => error.TooLarge,
+        protocol.ErrorCode.internal   => error.Internal,
+        else                          => error.ServerError,   // a code this client predates, or an unparseable body
+    };
+}
+#+end_src
+
+The caller's =switch= then reads like the protocol — =error.NotFound => createThenRetry()=, =error.Internal => backOff()= — with =lastError()= there for whoever wants the text. Cost over (a): the six-member set and the fifteen methods' inferred error sets widening by five tags, which is invisible to a caller using =try= and one more arm for a caller who switched on =error.ServerError= exhaustively (in-tree: only =main.zig=, changed below anyway). Reverie's three cases (404, 500, connection lost) become three arms with no field read, which is the mild preference.
+
+** Connection loss under one name (both shapes)
+
+Fold the write-side names into the read-side one at the point of the write, in one private helper the fifteen methods call instead of =protocol.writeFrame= directly:
+
+#+begin_src zig
+fn send(self: *Client, msg_type: protocol.MessageType, body: []const u8) error{ConnectionClosed, Unexpected}!void {
+    protocol.writeFrame(self.fd(), msg_type, body) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return error.ConnectionClosed,
+        else => |e| return e,
+    };
+}
+#+end_src
+
+=readFrame='s =null= already means "peer gone, however it went" and keeps mapping to =error.ConnectionClosed=. Whether the tag is spelled =ConnectionClosed= (today's) or =ConnectionLost= is Ever's call; keeping today's spelling changes no caller.
+
+** The CLI prints, once
+
+=main.zig= gains one helper beside =exitFlushed= (~src/main.zig:45~):
+
+#+begin_src zig
+/// The library no longer prints server errors; the CLI does, in the words the server sent.
+fn serverError(ctx: *const cli.Context, client: *const ever.client.Client) noreturn {
+    if (client.lastError()) |e| diag(ctx, "error: {s}\n", .{e.message})
+    else diag(ctx, "error: server returned an error\n", .{});
+    exitFlushed(ctx, 1);
+}
+#+end_src
+
+and the twenty-four =error.ServerError => exitFlushed(ctx, 1)= arms become =error.ServerError => serverError(ctx, &client)= under (a), or list (b)'s six tags in the same arm. While there, =error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{})= replaces the error-trace a mid-follow store exit produces today. Output for every existing case is byte-identical: same words (they were always the server's), same stream (=diag= is stderr), same exit code.
+
+** Interim, and if declined
+/Interim:/ nothing on Reverie's side — by its owner's D49 the attached window is specified against stock =Client= and stays so, on the expectation that this lands (or is refused) before Reverie's implementation starts; Reverie's documents name this ask where they say "stock =Client=" and build no wrapper meanwhile. /If declined:/ Reverie writes the forty-line client its round-10 review priced as option (a) — its own request/reply loop over =ever.protocol.writeFrame= / =readFrame= / =decodeBody= returning ={ code, message }= and printing nothing — for the attached window's two connections only, and keeps stock =Client= wherever a terminal is not in raw mode. That is cheap for Reverie and leaves every other embedder where this section started, which is the argument for doing it here instead.
+
+* Design Details
+
+** Files expected to change
+- =src/net/client.zig= — =last_error= + =lastError()= + =clearLastError()=; =handleErrorResponse= stores instead of prints (and, under (b), maps); private =send= folding write-side disconnects; =deinit= frees the retained message; doc-comments on the public methods name the error tags they return.
+- =src/main.zig= — =serverError(ctx, &client)=; twenty-four arms; the =ConnectionClosed= arm.
+- =SKILL.md= / =README.org= — if either documents =Client= for programmatic use, one paragraph on the error contract.
+- Nothing in =src/protocol/=, =src/net/server.zig= or =src/net/http.zig=.
+
+** Testing
+- /Library:/ over a =socketpair= (or a =Server= on an ephemeral port, as =integration-testing.org='s harness already does), have the peer answer a =publish= with =error_response {404, "topic not found"}=; assert the call returns =error.ServerError= (a) ∕ =error.NotFound= (b), =lastError().?.code == 404=, =lastError().?.message= equals the sent text, and a following successful call clears it. Close the peer before replying; assert =error.ConnectionClosed=. Close the peer before the request is written (write side); assert the /same/ tag. An =error_response= whose body is not JSON → =error.ServerError= with =code == 0=.
+- /No printing:/ asserted the cheap way — the test binary's stderr is empty across the cases above (run under the build's test step with stderr captured), and =grep std.debug.print src/net/client.zig= in review. A library test that has to capture its own stderr to prove a negative is the smell this ask removes; once removed, the grep is enough.
+- /CLI regression:/ =integration-testing.org='s existing cases for =pub= to a missing topic, =topic create= twice, =sub= on a deleted topic — same stderr text, same exit 1. =sub --follow= against a store killed mid-follow → =error: connection to the store was lost=, exit 1, no trace.
+
+* History
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask, on its owner's decision D49 after its round-10 blind review (B3) found the attached window's stock =Client= printing to stderr under raw mode and flattening the code three of its documents branch on; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=: ~src/net/client.zig:164-173~ and its fifteen call sites, ~src/protocol/message.zig:136-139~ / ~:389-419~ / ~:446-463~, ~src/main.zig:45-56~ and the twenty-four =error.ServerError= arms, ~src/bench.zig:279,340,348~; =air/v0.1/stdout-stderr-split.org= and =client-library.org= at the same commit for Ever's own prior words on these two prints and on the API's intended idiom.

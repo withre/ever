@@ -1,0 +1,129 @@
+#+title: A Pattern Fetch With a Topic-Local Offset Should Be Refused, Not Mis-Paged
+#+state: ready
+#+FILETAGS: :protocol:subscriber:cli:bug:
+
+* Summary
+=FetchRequest.offset= is a topic-local skip count. On a /pattern/ request =fetchPattern= applies it to every matching topic independently — "skip the first N of each" — which is a number no client can compute a correct next value for, because the response interleaves topics and the client only knows how many events it received in total. Ever's own =sub <pattern> --follow= (default cursor) does the naive thing, =offset += result.events.len=, and silently drops events as soon as more than one topic matches. The field's doc-comment and =fetchPattern='s own comment both say what it does; nothing says it is unusable. Refuse it: a pattern request with =offset != 0= and no =after_offset= answers =bad_request= naming =after_offset= as the cursor to use, and =sub --follow= on a pattern switches to =after_offset= after its first batch. One condition in =handleFetch=, a few lines in =main.zig=.
+
+/Who is asking./ Reverie (=withre/reverie=), which found it while auditing which of Ever's fetch shapes its folds may use ([[file:../../../../air/v0.1/ever-fit-assessment.org][reverie air/v0.1/ever-fit-assessment.org]], /Two smaller data-model observations/). Reverie itself is unaffected — it reads patterns by =after_offset= only — so this is here purely on the "would it make Ever better for someone who is not us" test: it would, for everyone who has ever typed =ever sub something. --follow=. Read at ever =origin/main= =3991190c611e= (2026-08-09); line references at that commit.
+
+* Motivation
+
+** What is there now
+
+The field says what it is (~src/protocol/message.zig:91-104~):
+
+#+begin_src zig
+pub const FetchRequest = struct {
+    topic: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
+    /// Topic-local skip count: skip the first `offset` non-marker events
+    /// (NOT a global log offset).
+    offset: u64 = 0,
+    /// Global-offset cursor: resume strictly after this global log offset —
+    /// the value printed as `[topic:offset]` and carried in event bodies.
+    /// When set, the server ignores `offset` (clients enforce exclusivity;
+    /// this rule keeps the protocol total).
+    after_offset: ?u64 = null,
+    ...
+#+end_src
+
+=handleFetch= routes a pattern without =after_offset= to =fetchPattern= (~src/net/server.zig:231-235~), and =fetchPattern= says what it does with =start= (~src/store/topic.zig:660-667~):
+
+#+begin_src zig
+while (topic_iter.next()) |entry| {
+    if (!matchTopic(pattern, entry.key_ptr.*)) continue;
+    // Same seek as `fetch`, per matching topic: `start` is applied
+    // to each topic independently, which is the behaviour this
+    // function already had.
+    const from = entry.value_ptr.firstIndexForSkip(start);
+#+end_src
+
+"Which is the behaviour this function already had" is the tell: =subscribe-fetch-seek.org= preserved the semantics faithfully while making them fast, and nobody was asked whether the semantics were worth preserving.
+
+** Ever's own CLI trips on it
+
+=sub --follow= without =--after-offset= keeps a single =offset= and advances it by the number of events printed, pattern or not (~src/main.zig:272~, ~:297-306~, ~:314-319~):
+
+#+begin_src zig
+var offset = from_offset;
+...
+    client.fetchBlocking(if (!is_pattern) topic_name else null, if (is_pattern) topic_name else null,
+                         offset, @min(100, fetch_count), 5000)
+...
+if (result.events.len > 0) {
+    if (after_cursor != null) { after_cursor = result.events[result.events.len - 1].offset; }
+    else { offset += result.events.len; }
+}
+#+end_src
+
+Two topics under one prefix are enough. /Reasoned from the source above at =3991190c611e=; reproduced with an installed =ever= binary of unrecorded provenance (reports =0.1.0=, predates =--after-offset=) against a private store on port 7961 with its own =--data-dir=, 2026-08-10, the live store never addressed:/
+
+#+begin_example
+$ ever pub probe.a a1; ever pub probe.b b1; ever pub probe.a a2
+$ ever sub probe. --follow &                      # prints a1 a2 b1  -> offset = 3
+$ ever pub probe.b b2; ever pub probe.b b3; ever pub probe.b b4; ever pub probe.a a3
+[probe.a:2] {"n":"a1"}
+[probe.a:4] {"n":"a2"}
+[probe.b:3] {"n":"b1"}
+[probe.b:7] {"n":"b4"}                            # b2, b3, a3 never printed
+#+end_example
+
+After the first batch =offset= is 3, so the next fetch skips three from =probe.a= (which has two, then three — =a3= is the third and is skipped) and three from =probe.b= (=b1 b2 b3= skipped, =b4= delivered, =offset= becomes 4, and now four are skipped from each). No error anywhere; a supervisor following =<project>.impl.= this way sees some workers' events and not others', depending on arrival order. =SKILL.md= steers users to =--after-offset= for resumption, which is why the fleet mostly does not hit this — but the default is the broken one, and =sub <prefix> --from N= without =--follow= has the same per-topic meaning with no warning (=warnBeyondEnd= is exact-topic only, ~src/main.zig:398~).
+
+** Why refuse rather than define
+
+A pattern skip count /could/ be given a meaning — "skip the first N of the merged, offset-ordered stream" — but that costs a k-way merge on a path that is currently a concatenation, to support a cursor shape that =after_offset= already does better (it is what the merged stream is ordered by). The cheap, honest change is to stop accepting a request whose answer no client can use.
+
+* Goals
+- A =FetchRequest= with =pattern= set, =after_offset= null and =offset != 0= is answered =error_response= / =bad_request= with a message that names =after_offset=.
+- =offset == 0= with a pattern keeps working: it is "from the beginning of every matching topic", which is well-defined and is what =sub <prefix>= and =sub <prefix> --follow='s first fetch rely on.
+- =ever sub <pattern> --follow= never loses an event: after its initial fetch it resumes by the global offset of the last event it printed.
+- =ever sub <pattern> --from N= (N > 0) fails at the CLI with the same guidance instead of returning a per-topic answer.
+
+* Non-Goals
+- Merged global ordering for =fetchPattern=. =fetchPatternByOffset= via =after_offset= already delivers it.
+- Removing =FetchRequest.offset=. Exact-topic skip counts are meaningful and used.
+- Deprecating =Client.fetchPattern(pattern, offset, …)=. It stays; with =offset != 0= it now surfaces the server's 400, which is the point.
+
+* Proposal
+
+** Server: one condition
+In =handleFetch=, after decode and before resolution (~src/net/server.zig:216~):
+
+#+begin_src zig
+if (req.pattern != null and req.after_offset == null and req.offset != 0)
+    return sendError(self.allocator, fd, protocol.ErrorCode.bad_request,
+        "offset is a per-topic skip count and is undefined for a pattern; resume a pattern with after_offset");
+#+end_src
+
+The doc-comment on =offset= gains "rejected on pattern requests unless zero", and =fetchPattern='s comment loses "which is the behaviour this function already had" in favour of "callers pass 0; the server refuses anything else".
+
+/The softer alternative/, if refusing feels too sharp for a field that has shipped: ignore =offset= on pattern requests (treat as 0) and say so in the doc-comment. Reverie prefers the refusal — an ignored parameter is another silent wrong answer, just a less harmful one — but either closes the CLI bug once the CLI change below lands.
+
+** CLI: pattern follow resumes by global offset
+In both follow loops, when =is_pattern= and =after_cursor == null=, seed =after_cursor= from the last event of the initial (offset-0) fetch instead of advancing =offset=; subsequent iterations then take the existing =fetchAfter= branch. For =sub <pattern> --from N= with N > 0, =fatal= with the same sentence the server would send, before connecting. =HttpServer= serves exact topics only (~src/net/http.zig:323~) and needs nothing.
+
+/The =--follow=/=--max= item that was bundled here (added 2026-08-09 on Reverie's round-10 blind review, B4) is its own document now — [[file:sub-follow-ignores-max.org][sub-follow-ignores-max.org]], split out 2026-08-13: one independently shippable change per document, and it earned its own filing when review found it contradicts a documented guarantee (=SKILL.md:167=) rather than merely surprising a user./
+
+** Interim, and if declined
+Nothing on Reverie's side either way; its folds never send =offset= with a pattern. If declined, Ever's =sub <prefix> --follow= keeps the behaviour above and =SKILL.md= should at least say "always pass =--after-offset= when following a pattern".
+
+* Design Details
+
+** Files expected to change
+- =src/net/server.zig= — the condition.
+- =src/protocol/message.zig= — doc-comment.
+- =src/store/topic.zig= — =fetchPattern= comment.
+- =src/main.zig= — the two follow loops; the =--from= guard for patterns; help text for =--from= on =sub= ("exact topics only").
+- =SKILL.md= — one line under =sub=.
+
+** Testing
+- /Server/: pattern + =offset = 1= → 400 with the message; pattern + =offset = 0= → unchanged; pattern + =after_offset= + =offset = 5= → unchanged (=after_offset= wins, as documented); exact topic + =offset = 1= → unchanged.
+- /CLI regression, the transcript above as a test/: two topics, interleaved publishes after a pattern follow has started; assert every published value is printed exactly once. Fails on the current tree — that failure is the negative control.
+
+* History
+- 2026-08-13: The separable =--follow=/=--max= item moved to its own document, =sub-follow-ignores-max.org=, on review ([[file:../../../../reviews/upstream-ever-review.org][reviews/upstream-ever-review.org]] C4) — one independently shippable feature per document, Ever's own convention. Two citation ranges corrected (~topic.zig:659~→~:660~, ~main.zig:299~→~:297~; the quoted text was correct in both). Worker =reverie-upfix=.
+- 2026-08-09 (later): One separable CLI line added under /Proposal/ on Reverie's round-10 blind review B4 — =--follow= stops honouring =--max= (default 100) once following — after that review found Reverie's documented operator line "follows indefinitely" false at =3991190c611e=; =handleSub= re-read at that commit. Worker =reverie-serve10=.
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=. The per-topic semantics were first noted by Reverie's ever-fit-assessment (2026-08-07, "=--from 1= drops one event from /each/ topic", measured); the =sub --follow= consequence was reasoned from =main.zig= at this commit.
+- 2026-08-10: The =sub --follow= consequence reproduced with an older installed binary against a private store, transcript above — corroboration by an independent path, not a run of this commit.

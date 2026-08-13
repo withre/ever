@@ -1,0 +1,102 @@
+#+title: The Held-Lock Message Should Name the Holder, Not Tell You to Delete the Lock
+#+state: ready
+#+FILETAGS: :orchestrator:cli:store:bug:
+
+* Summary
+When =ever.lock= is held, =ever start= says "another Ever store is already running on 'D'. Remove ever.lock if stale." An advisory =flock= is released by the kernel when its last holder dies, so a held lock is a /live/ process essentially always — and if the user follows the advice while that process is alive, =rm= then =ever start= creates a new file at the same path, takes an uncontended lock on a /different inode/, and two stores run on one directory, each holding a valid lock, neither able to see the other. The message is dangerous exactly when it is obeyed and inapplicable exactly when it is safe. Two changes: after =flock= succeeds, =fstat= the fd and =stat= the path and refuse if they name different inodes (someone swapped the file under a live holder); and when =flock= fails, say that a live process holds the directory and never suggest deleting anything.
+
+/Who is asking./ Reverie (=withre/reverie=), which measured all of this on 2026-08-04 while deciding whether its own harness could safely hold a lock, and concluded then that "this is an Ever change worth making regardless of what Reverie does, and it belongs upstream" — [[file:../../../../air/v0.1/multi-instance-and-fork.org][reverie air/v0.1/multi-instance-and-fork.org]], /Locks: the kernel already does the cleanup/ and /T4 is a defect in Ever's guidance, not in Ever's lock/. Nothing in Reverie depends on it. Read at ever =origin/main= =3991190c611e= (2026-08-09); line references at that commit.
+
+* Motivation
+
+** What is there now
+
+~src/main.zig:1517-1526~:
+
+#+begin_src zig
+const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
+    std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir});
+defer lock_file.close(io);
+
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
+if (lock_result != 0) {
+    std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir});
+}
+#+end_src
+
+This is the only sentence a user is ever shown about the lock, and it contains one diagnosis ("already running") and one remedy ("remove if stale") that contradict each other.
+
+** Measured: when is an =flock= stale, and what does removing the file do
+
+Reverie's experiments, Linux, the real primitive, each holder an explicit pid under a kill-guard (multi-instance-and-fork, 2026-08-04):
+
+| Test | Setup                                                                | Result                                                    |
+|------+----------------------------------------------------------------------+-----------------------------------------------------------|
+| T2   | holder takes =flock(LOCK_EX)=, =kill -9=, no cleanup, retry          | *acquired* — the kernel released it                       |
+| T5a  | holder forks a child that inherits the fd, =kill -9= the parent only | *busy* — the lock outlives the holder, =fdinfo= names a dead pid |
+| T5c  | fd is =O_CLOEXEC=, child =execve=s, =kill -9= the parent             | *acquired*                                                |
+| T6   | =kill -STOP= the holder                                              | *busy*, indefinitely                                      |
+| T4   | =rm= the lock file under a *live* holder, then acquire               | *acquired, on a new inode, alongside the first holder*    |
+
+T2 says a crashed =ever start= never leaves a stale lock. T5c says Ever's own hook children cannot strand it either — =createFile= opens =O_CLOEXEC= (Zig's default; observed on a running store as =flags: 02100002= in =/proc/<pid>/fdinfo=) and =HookDaemon= reaches =/bin/sh= by =execve=. So the population of "stale" locks a user of =ever start= can meet is: T5a (an embedder that forked without exec — not Ever's binary) and T6 (a stopped or wedged store, which is not stale, it is stuck). In every realistic case the holder is alive.
+
+T4 is what the message tells that user to do. After =rm=, the original store's fd still refers to the unlinked inode and still holds its lock; the path now resolves to nothing; =createFile= makes a fresh inode; =flock= on it is uncontended. Both processes then pass every check they have and write one directory — the two-writer corruption =multi-process-access.org= describes, reached by following instructions.
+
+** Why the identity check as well as the message
+
+Fixing the message stops Ever /recommending/ T4; it does not stop T4. Anything that replaces =ever.lock= between a live holder's =open= and a newcomer's =open= — a user who remembers the old advice, a cleanup script, a restore from backup — produces the same two-inode state, and the newcomer cannot tell. The newcomer /can/ tell whether the file it locked is still the file at the path: =fstat(fd)= and =stat("ever.lock")= agree on =(st_dev, st_ino)= iff nobody swapped it in between. That does not detect a holder on an already-unlinked inode (nothing can, short of scanning =/proc/*/fdinfo=), but it converts "swap then start" from silent success into a refusal, and it costs two syscalls once at startup.
+
+* Goals
+- The held-lock message states that a live process holds the directory, says how to find it (=ever status --data-dir D=, =fuser D/ever.lock=), and contains no instruction to delete anything. Naming the holder's pid in the message is offered separately below and is not load-bearing.
+- After a successful =flock=, =startServer= verifies the locked fd and the path name the same inode and refuses to start otherwise, with a message that says the lock file was replaced while another process may hold the old one.
+- =ever status= keeps reporting =lock_held= as today.
+
+* Non-Goals
+- Leases, timeouts, or liveness checks on the holder. T6 (a stopped holder keeps the lock forever) is correct =flock= behaviour and out of scope; the message can mention it.
+- Moving the lock into the library. That is =embedded-store-marker.org=; if it lands first, this change moves with the code into =Log.init= unchanged.
+- Portability beyond Linux for naming the pid (the optional =describeLockHolder= below, if taken at all). Best-effort; the message degrades to not naming it.
+
+* Proposal
+
+** The check
+
+#+begin_src zig
+if (lock_result != 0) {
+    std.process.fatal(
+        "data directory '{s}' is held by a live process. An flock is released automatically when its holder exits, " ++
+        "so this is not a stale file: stop that process, or use `ever status --data-dir {s}` / `fuser {s}/ever.lock` to find it. " ++
+        "Do not delete ever.lock — that starts a second store on the same data.",
+        .{ actual_data_dir, actual_data_dir, actual_data_dir });
+}
+// Acquired. Make sure the file we hold is still the file at the path.
+const fd_st = try lock_file.stat(io);
+const path_st = dir.statFile(io, "ever.lock") catch
+    std.process.fatal("ever.lock vanished after locking '{s}'; another process may hold the previous lock file. Refusing to start.", .{actual_data_dir});
+if (fd_st.inode != path_st.inode) // and device, if Stat exposes it at this std revision
+    std.process.fatal("ever.lock in '{s}' was replaced after locking; another process may hold the previous one. Refusing to start.", .{actual_data_dir});
+#+end_src
+
+The load-bearing change is exactly this: removing "Remove ever.lock if stale", and the inode comparison. An =fstat=, a =stat= and a better sentence — no new machinery, and =fuser= in the message already tells the user how to get the pid with a tool the store does not have to carry.
+
+** Offered separately, and only if Ever wants it: naming the pid
+The message above says "a live process" without naming it. A =describeLockHolder= could: =fcntl(F_OFD_GETLK)= does not report =flock= holders, so on Linux the practical source is =/proc/locks= matched by the lock file's =(dev, ino)= — a dozen lines of parsing, in a store that currently has no =/proc= text handling — returning "pid N" to splice into the message, degrading to the sentence above where it fails. Reverie asks for the check and the message /without/ it, and this paragraph exists so that declining the parser is not mistaken for declining the ask.
+
+** Interim, and if declined
+Nothing changes in Reverie's /code/. But one thing should be said plainly, because it makes this ask more urgent rather than less: under Reverie's D38 (proposed, pending coordination with Ever), Reverie itself takes =flock(LOCK_EX)= on =<session-dir>/store/ever.lock= for its owner's lifetime — so every live Reverie session becomes a directory where =ever start= prints this message, and an operator who obeys its second sentence runs T4 against Reverie's own session store. Reverie's documents already draw the conclusion (reverie =ever-zig-library=, the D38 revision): "Reverie holding the lock makes it /more/ likely a user meets that sentence, which is a reason to press ask I, not to avoid the lock." Reverie's own "session directory is held" failure already names the live holder (it has an endpoint file to read it from) and offers to attach, never to delete (reverie =interface-design=). If Ever declines, the ACE stack's operators keep a message that grows /more/ dangerous as Reverie ships, and that Reverie's documents will keep citing as the example of a remedy that is dangerous precisely when it looks necessary.
+
+* Design Details
+
+** Files expected to change
+- =src/main.zig= — =startServer= as above (or =src/store/store.zig= if =embedded-store-marker.org= (a) has moved the lock).
+- =SKILL.md= — the troubleshooting line for "already running", rewritten to match.
+
+** Testing
+- /Message/: hold the lock in a helper process; run =ever start=; assert exit ≠ 0, stderr contains "held by" and does not contain "Remove ever.lock" — the proposed message itself says "this is not a stale file", so the assertion is on the remedy, not the word.
+- /T4 as a test/: helper holds the lock; test unlinks =ever.lock= and creates a new one /between/ a second starter's =open= and its identity check (inject with a test-only hook, or race it in a loop with a bounded budget and accept probabilistic coverage); assert the second starter refuses. Without injection, the deterministic form is: open, unlink+recreate from the test, then run the check function directly on the stale fd — assert mismatch detected.
+- /Happy path/: no holder → starts; second =ever start= → refused with the new message; first exits → second starts. Unchanged from today except the text.
+
+* History
+- 2026-08-13: Two corrections on review ([[file:../../../../reviews/upstream-ever-review.org][reviews/upstream-ever-review.org]] C3, C5). The =/proc/locks= =describeLockHolder= moved out of the Proposal into an explicitly optional section — the reduced form (an =fstat=, a =stat=, a better sentence) is the ask, offered before being asked to shrink it. And /Interim, and if declined/ stops saying "nothing changes on Reverie's side": Reverie's own =ever-zig-library= concludes that D38 makes /more/ users meet the sentence this document exists to remove, which strengthens the ask and costs Ever nothing extra — the fix is unchanged. Worker =reverie-upfix=.
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e= (the message is at ~src/main.zig:1525~; Reverie's 2026-08-04 document cites it at ~:1026~ against an older base — same text). The lock table is Reverie's measurement (multi-instance-and-fork T2/T4/T5/T6, 2026-08-04, Linux); the =O_CLOEXEC= observation was of a running =ever start= that day. The =describeLockHolder= route via =/proc/locks= is proposed, not prototyped.

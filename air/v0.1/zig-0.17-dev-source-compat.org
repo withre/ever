@@ -1,0 +1,103 @@
+#+title: One Reflection Line Keeps Ever From Compiling on Any Obtainable 0.17-dev
+#+state: ready
+#+FILETAGS: :core:orchestrator:testing:
+
+* Summary
+=HookDaemon.reapChildren= derives =waitpid='s status type by reflection — the feature-detection =ba15d44= introduced so the source would not be "pinned to one dev snapshot". The reflection API it detects /with/ then moved: =std.builtin.Type.Fn.params: []const Param= became =std.lang.Type.Fn.param_types: []const ?type= somewhere after Ever's pinned =0.17.0-dev.607= and no later than =dev.857=. Under any Zig from there on, that one line is a compile error, and ziglang.org no longer serves the =dev.607= tarball, so a newcomer cannot get the toolchain at which it is not. Feature-detect the field name too. One line becomes three; nothing else in the tree needs touching for =dev.857= through =dev.1282=.
+
+/Who is asking./ Reverie (=withre/reverie=), which met it as the whole distance between "Ever links out of tree" and "Ever embeds out of tree": a consumer that only names =ever.client= compiles at =3991190c611e= unpatched, and one that names =ever.net.Server= does not, because =Server= reaches =killChildrenForHook= → =reapChildren= through =handleUnregisterHook= whether or not a hook table is ever attached. Reverie's owner has decided that both projects share one zignix toolchain pin moving with Zig master (D11, 2026-08-09), so this is also the ask that lets the two repositories agree on a compiler. /And, to be straight about Reverie's own exposure:/ later the same day Reverie chose to own its accept loop and dispatch over =ever.protocol= (D5b, for a two-listener port gate), so its v0.1 build links =ever.protocol=, =TopicManager= and =Client=, never names =Server=, and compiles at =3991190c611e= unpatched. Reverie is therefore no longer blocked by this line. It asks anyway, because everyone who does name =Server= is, because at older pins the parse-class break in the same file stops /every/ consumer, and because a shared toolchain pin is meaningless while Ever's own tree does not build at it. Read at ever =origin/main= =3991190c611e= (2026-08-09). Evidence: Reverie's =spikes/ever-t1/README.org= (/Result at the pin, unpatched — classified/ and /Result with a one-line patched copy/) via [[file:../../../../air/v0.1/ever-zig-library.org][reverie air/v0.1/ever-zig-library.org]]'s 2026-08-09 History; the 404 was re-derived independently in [[file:../../../../reviews/evidence-base-2026-08-09.org][reviews/evidence-base-2026-08-09.org]].
+
+* Motivation
+
+** What is there now
+
+~src/store/hooks.zig:863-869~ at =3991190c611e= — the only =.params[= in =src/= (=git grep -n -F '.params[' 3991190c611e -- src=):
+
+#+begin_src zig
+fn reapChildren(self: *HookDaemon) void {
+    while (true) {
+        const StatusPtr = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn".params[1].type.?;
+        const Status = @typeInfo(StatusPtr).pointer.child;
+        var status: Status = 0;
+        const WNOHANG: u32 = 1;
+        const pid_raw = std.os.linux.waitpid(-1, &status, WNOHANG);
+#+end_src
+
+Under =0.17.0-dev.1282+c0f9b51d8= (and =dev.857+2b2b85c5f=; both checked in their =lib/std/lang.zig=, ~:807~ and ~:771~ respectively, where the field is =param_types: []const ?type=):
+
+#+begin_example
+src/store/hooks.zig:865:78: error: no field named 'params' in struct 'lang.Type.Fn'
+            const StatusPtr = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn".params[1].type.?;
+                                                                             ^~~~~~
+referenced by:
+    killChildrenForHook: src/store/hooks.zig:819:30
+    handleUnregisterHook: src/net/server.zig:388:35
+#+end_example
+
+The =referenced by= chain is why an embedder meets it: Zig analyses lazily, =Server.handleFrame='s switch names =handleUnregisterHook= (~src/net/server.zig:179~), which calls =hd.killChildrenForHook= inside an =if (self.hook_daemon)= (~:387-389~) — a /runtime/ null, so the callee is analysed regardless. A binary that uses only =TopicManager=, or only =client=, never analyses =reapChildren= and builds fine at the same commit; Reverie's T1 has all three side by side.
+
+** Why nobody in Ever has seen it
+
+=build.zig.zon= declares =.minimum_zig_version = "0.17.0-dev.607+456b2ec07"= and =nix/zig.nix= pins the same snapshot as "the toolchain this project is verified to build and test against". At =dev.607= the field is presumably still =params= and everything is green. But:
+
+#+begin_example
+$ curl -sI https://ziglang.org/builds/zig-x86_64-linux-0.17.0-dev.607+456b2ec07.tar.xz | head -1
+HTTP/2 404
+#+end_example
+
+(2026-08-09; ziglang.org prunes old master builds, and =nix-store --realise= of the =dev.607= derivation fails on the same fetch.) So the verified toolchain exists only in Nix stores that already have it. Anyone who clones Ever fresh — a new contributor, CI on a new runner, a downstream — gets whatever master build is current, and that build rejects line 865. =nix/zig.nix='s own comment anticipates the shape ("The development line can change behaviour underneath us … bump deliberately, alongside running the build"); this is the bump being forced from outside.
+
+** Why feature-detect rather than just rename
+
+Renaming =params[1].type.?= to =param_types[1].?= fixes every obtainable toolchain and breaks =dev.607= for whoever still has it cached — including, until it bumps, Ever's own =flake.nix=. =ba15d44='s stated policy is the right one: "Where the difference is a type or decl that may move again, feature-detect it at comptime rather than hard-coding the current spelling". Applying the policy to the line that embodies it costs two more lines and lets the pin move whenever Ever chooses rather than in the same commit.
+
+* Goals
+- =zig build= and =zig build test= pass at Ever's currently pinned =dev.607= /and/ at a current master snapshot (=dev.1282= or whatever zignix carries when this lands), from one source tree.
+- A consumer that names =ever.net.Server= compiles out of tree under the same range. (Reverie's T1a is the ready-made check: it passes against a copy with exactly this patch and fails without it. Reverie keeps it for that purpose even though its own build no longer takes that shape.)
+- =nix/zig.nix= / =build.zig.zon= move to a snapshot ziglang.org still serves — in this change or the next, Ever's choice — so "verified toolchain" is one a newcomer can obtain.
+
+* Non-Goals
+- Chasing every 0.17-dev API move pre-emptively. This is the one that bites today; =ba15d44='s approach handles the next one when it arrives.
+- Making =Server= stop compiling hook code for embedders that never attach a hook table. That is a real nicety (=embedder-handler-seam.org= mentions it under shape (b)) and a much larger change; not this.
+- Supporting 0.16. Retired by =d7effa09edc7= and not reopened.
+
+* Proposal
+
+The patch Reverie's T1 ran green with, minus its probe comment:
+
+#+begin_src diff
+--- a/src/store/hooks.zig
++++ b/src/store/hooks.zig
+@@ -862,7 +862,10 @@
+     fn reapChildren(self: *HookDaemon) void {
+         while (true) {
+-            const StatusPtr = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn".params[1].type.?;
++            // Type.Fn.params ([]Param{.type}) became .param_types ([]?type) during 0.17-dev
++            // (present by dev.857). Detect rather than pick, per ba15d44.
++            const FnInfo = @typeInfo(@TypeOf(std.os.linux.waitpid)).@"fn";
++            const StatusPtr = if (@hasField(@TypeOf(FnInfo), "param_types")) FnInfo.param_types[1].? else FnInfo.params[1].type.?;
+             const Status = @typeInfo(StatusPtr).pointer.child;
+#+end_src
+
+Both branches are comptime; the untaken one is not analysed, so neither toolchain sees the other's spelling. If Ever would rather not reflect at all, =var status: u32 = 0;= with the =@bitCast= that =ba15d44= already applies to the result is the zero-cleverness alternative — at the cost of re-pinning the source to whichever integer type =waitpid= takes this month, which is what the reflection was there to avoid.
+
+** What Reverie verified and what it did not
+/Verified/ (T1, 2026-08-09, x86_64-linux, =dev.1282=): with exactly this patch applied to an unpacked =git archive 3991190c611e=, an out-of-tree consumer builds =TopicManager= + =net.Server= + =client=, round-trips a record embedded and over the socket, observes =waitForAppend= waking a blocked fetch 0.9 ms after an in-process publish, and =ever sub= from an installed CLI reads the embedded port. No second error appeared behind the first anywhere =Server= reaches. /Not verified/: Ever's own =zig build test= at =dev.1282= with the patch (Reverie built Ever as a dependency, not as a project — the integration suite was not run); behaviour at =dev.607= (unobtainable); behaviour at =dev.1441= (not installed where T1 ran; =dev.857= already has =param_types=, so the same result is expected, not shown).
+
+** Interim, and if declined
+Reverie's build does not name =Server= (D5b — its own dispatch over =ever.protocol=, =embedder-handler-seam.org='s shape (c)) and therefore never compiles =reapChildren=; it needs nothing here to proceed. Its T1a probe keeps the =net.Server= half as the check that this line has landed. What it will not do is carry a patched Ever, for the fork-maintenance reasons its =ever-zig-library= /Alternatives/ record. If Ever declines /and/ keeps =dev.607=, the two projects cannot share a toolchain and D11's "zignix for both" does not hold; Reverie would say so and pin its own snapshot.
+
+* Design Details
+
+** Files expected to change
+- =src/store/hooks.zig= — the three lines.
+- =build.zig.zon=, =nix/zig.nix= — the snapshot bump, when Ever chooses; =flake.lock= follows.
+- Nothing in =air/context/=; =nix/zig.nix='s comment already describes the policy this applies.
+
+** Testing
+- =zig build test --summary all= in Debug, ReleaseSafe, ReleaseFast at the new snapshot — the repository's standing rule for anything near =hooks.zig=.
+- The same at =dev.607= from a Nix store that still has it, once, to show the =else= branch is live; after the snapshot bump that branch is dead code by design and can go with the next cleanup.
+- Optional, cheap, and the thing that would have caught this: a CI job on "latest master zignix serves" beside the pinned one, allowed to fail, watched.
+
+* History
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=; the error text, the patch and the passing run are Reverie's T1 (=spikes/ever-t1/README.org=, x86_64-linux, Zig =0.17.0-dev.1282+c0f9b51d8=); =param_types= confirmed present in =lib/std/lang.zig= of both =dev.857= and =dev.1282= from their Nix store paths; the =dev.607= 404 observed by T1 and re-derived the same day by a second Reverie worker.

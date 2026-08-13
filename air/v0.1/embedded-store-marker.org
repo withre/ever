@@ -1,0 +1,112 @@
+#+title: Expose ever.lock's Acquisition as a Library Call, and Keep the CLI Honouring It
+#+state: ready
+#+FILETAGS: :store:orchestrator:cli:bug:
+
+* Summary
+The only thing that stops two processes writing one data directory is the =flock= on =ever.lock=, and it is taken in =main.zig='s =startServer= — above the library. A process that embeds Ever through =TopicManager.init= takes nothing /unless it re-implements those eleven lines by hand/, against a filename, a flag pair and a release rule that are the CLI's private convention. An embedder that does so is protected today; an embedder that does not — the natural reading of a library whose =init= takes a =Config= with no lock field — meets =multi-process-access.org='s "case that will actually happen": =ever start --data-dir <that directory>= finds no contention, succeeds, and two processes assign the same offsets. Move the acquisition below the library boundary: =store.Config= gains =exclusive: bool=, =Log.init= takes and holds =ever.lock= when it is set, =startServer= deletes its own block and passes the flag. One field, one moved block, one error; the file, the primitive and the CLI's behaviour are unchanged, and the interlock between an embedder and the CLI becomes Ever's contract instead of the embedder's imitation.
+
+/Who is asking./ Reverie (=withre/reverie=), whose default topology is exactly the embedded shell =multi-process-access.org= imagines: a TUI process opens the store through the library, serves the port itself, and never runs =HookDaemon= (it forks =/bin/sh= from a raw-mode terminal). Read at ever =origin/main= =3991190c611e= (2026-08-09); line references at that commit. Reverie's side: [[file:../../../../air/v0.1/ever-zig-library.org][reverie air/v0.1/ever-zig-library.org]] (/One writer per directory/ rule 2 and its 2026-08-09 revision, /A second Reverie on a held directory/, Test Plan T3a/T3b) and [[file:../../../../air/reverie-foundations.org][reverie-foundations.org]] ask-index row F.
+
+/What changed in this ask, and why it got smaller (2026-08-09)./ Its first draft asked for "a marker the CLI checks, or the =flock= taken by the library under a config flag" and described Reverie-against-=ever start= as an open hole. Reverie's owner then observed (his D38, recorded as /proposed, pending coordination with Ever/: "It sounds like the Reverie to take ever.lock is one good solution, but I'm open to suggestions") that the CLI already refuses on one thing an embedder can hold — =ever.lock= itself, since =flock= is symmetric — and Reverie's document found that its own sentence to the contrary (~a lock Reverie takes cannot fix this~) had confused a lock of Reverie's own with Ever's. So the hole is closable from Reverie's side today, the (b) marker-file shape below is withdrawn as unnecessary, and what is left to ask is the part only Ever can do: make the acquisition an API.
+
+* Motivation
+
+** What is there now
+
+The lock (~src/main.zig:1517-1528~):
+
+#+begin_src zig
+const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
+    std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir});
+defer lock_file.close(io);
+
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
+if (lock_result != 0) {
+    std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir});
+}
+
+var topic_manager = try ever.topic.TopicManager.init(allocator, io, dir, .{});
+#+end_src
+
+=TopicManager.init= (~src/store/topic.zig:162-180~) and =Log.init= (~src/store/store.zig:119-129~) take an already-open =Dir= and a =Config{ max_segment_size, sync_on_append }= (~src/store/store.zig:102-105~) and touch no lock. =grep -n flock= over =src/store/= and =src/net/= at this commit finds one other use: =status.zig='s =checkLockHeld= (~src/store/status.zig:376-391~), which /probes/ the lock and releases it — detection, exported to library consumers as =StoreStatus.lock_held=, but not exclusion.
+
+** What happens to an embedder that does not copy those lines, in Ever's own words
+
+=multi-process-access.org=, /The case that will actually happen: hooks on an embedded store/:
+
+#+begin_quote
+1. =ever start= takes =flock(LOCK_EX|LOCK_NB)= and *succeeds*, because the embedded store took no lock — the flock lives in =startServer=, above the library. There is no contention and therefore no warning.
+2. The daemon builds its index once at init and never refreshes. …
+4. The embedding process appends. The daemon's index never advances …
+5. No hook ever fires. =ever hook list= shows the hooks, =ever hook ps= shows no failures, the server logs look healthy.
+#+end_quote
+
+That document stops at "no hook fires". It is worse: the daemon also /serves/, so the first =ever pub= to it calls =Log.append= with the daemon's =next_offset= and the daemon's =seg.size= (~src/store/store.zig:141~, ~:169-170~), both frozen at its init, and =writePositionalAll= lands on top of whatever the embedder wrote since. =multi-process-access.org= says this too, one section earlier ("Writers destroy each other … it is what two writers do on their first concurrent append"); it just does not connect it to the =ever start= story.
+
+** What happens to an embedder that does copy them
+
+It works — which is the finding that shrank this ask, and also the argument for it. Reverie's owner instance will (D38, proposed) =createFile("ever.lock", .{ .read = true, .truncate = false })= in its store directory and hold =flock(LOCK_EX | LOCK_NB)= on it for its lifetime (through =std.Io.File.tryLock(io, .exclusive)=, which is that =flock= on =Io.Threaded=). Then, at =3991190c611e= with no Ever change, =ever start --data-dir <that directory>= reaches ~src/main.zig:1524-1525~ and exits with =another Ever store is already running on '…'. Remove ever.lock if stale.= before =TopicManager.init= runs; and =ever status --data-dir= reports the directory held, truthfully, because =checkLockHeld='s probe now fails. /Reasoned from the source above and from =flock(2)='s semantics (locks attach to the open file description; a second non-blocking =LOCK_EX= on the same inode fails with =EWOULDBLOCK= whoever holds the first); Reverie has run the primitive to exhaustion in its own lock experiments ([[file:../../../../air/v0.1/multi-instance-and-fork.org][reverie air/v0.1/multi-instance-and-fork.org]] T2–T5) but has not yet run this exact pair, there being no Reverie binary; its T3a is the test that will./
+
+*So why ask for anything.* Because what the embedder copied is not an interface. The filename =ever.lock=, the choice of =flock= over =fcntl= record locks, =LOCK_NB=, and "released when the fd closes" are decisions inside =startServer=; nothing in =root.zig= exports them, =printDataDirListing= special-cases the name (~src/main.zig:1470~) as an implementation detail, and =SKILL.md='s one line on it — "The store acquires a lockfile (=ever.lock=) — only one store per data directory" (~SKILL.md:133~) — describes it as a property of /the store/, which is exactly what a reader of the library would assume and exactly what the library does not do. An embedder that hard-codes them is coupled to =main.zig= — a file it does not link — and the coupling fails /silently/: if Ever renames the file, or moves to =fcntl= (whose locks do not conflict with =flock='s on Linux), or starts taking the lock on the first segment instead, the embedder's =flock= keeps succeeding, =ever start='s keeps succeeding, and step 1 of the quoted sequence is back with nobody told. A =Config= field is what turns "the CLI and this embedder happen to agree today" into "the library guarantees they agree".
+
+** Why not wait for =multi-process-access.org=
+
+Because its Piece 3 as drafted does not close this on its own, and the rest of it is unowned. Piece 3 makes concurrency a /per-opener/ choice — =Concurrency.single_process= or =.shared= in =TopicManager= config, "the CLI's =store start= keeps its =flock= and selects =single_process=". Unless =single_process= /is/ the =flock= — which is this ask — an embedder that selects it still leaves nothing the CLI collides with. If Piece 3 lands with =single_process= meaning "take =ever.lock=", this document is satisfied by it and should be closed as a duplicate; it is written separately because it is small, independent of Pieces 1 and 2, and useful the day it lands.
+
+* Goals
+- An embedder gets =startServer='s exclusion by setting one =Config= field, not by re-implementing =startServer='s locking; =ever start --data-dir D= then exits non-zero naming =D= when that embedder is alive, exactly as it does today against another =ever start=.
+- =startServer= takes its lock through the same field, so there is one acquisition path in the tree and the CLI cannot drift from the library.
+- =ever status --data-dir D= reports the directory as held in that case (=lock_held= true) — which the direct-=flock= interim already achieves and the field must not break.
+- =ever start= on a directory nobody holds, and two =ever start= on one directory, behave exactly as today.
+
+* Non-Goals
+- Making two openers /safe/. That is =multi-process-access.org= Pieces 1–2. This keeps the unsafe case /loud/ and makes the loudness an API.
+- Distinguishing "held by a server" from "held by an embedder" on the wire, or naming the holder's pid. =flock= gives no pid; =lock-identity-and-stale-message.org= is where the message's honesty is asked for, and it applies to this path unchanged.
+- A marker file (=D/opener= with pid and start time). /Withdrawn 2026-08-09/ — it was this document's shape (b), offered in case Ever wanted the library to stay lock-free; it buys a stale-marker story =flock= does not have, and once the embedder can hold =ever.lock= it buys nothing else.
+- Anything about hooks. The user who wanted hooks on an embedded store still cannot have them; they are told so at =ever start= instead of discovering it from silence.
+
+* Proposal
+
+** The library takes the lock
+
+=store.Config= (and =topic.Config=, which forwards to it) gains
+
+#+begin_src zig
+/// Take `ever.lock` (flock LOCK_EX|LOCK_NB) in Log.init and hold it for the
+/// Log's lifetime. `ever start` sets this; an embedder that is the sole
+/// writer of its directory should too. Init fails with error.StoreLocked
+/// if another opener holds it. The lock belongs to the open file
+/// description: it is released when the Log is deinited or the process
+/// dies, and it is inherited by a child that is forked without exec --
+/// createFile opens O_CLOEXEC, so exec'd children (hooks) are safe.
+exclusive: bool = false,
+#+end_src
+
+=Log.init= does what ~src/main.zig:1517-1526~ does when =exclusive= is set, /before/ =recover()= — so a refused opener never reads segment state it must not trust — and keeps the =File= in the =Log=; =Log.deinit= closes it. =startServer= deletes its own eleven lines and passes =.{ .exclusive = true }=; on =error.StoreLocked= it prints the message (see =lock-identity-and-stale-message.org= for what the message should say). =checkLockHeld= is unchanged. Default =false= keeps every existing library caller's behaviour; Ever may prefer default =true= on the grounds that the unsafe thing should be the one you ask for — Reverie has no stake in the default and would set it explicitly either way.
+
+/The fd-inheritance sentence in the doc-comment is from Reverie's lock experiments/ ([[file:../../../../air/v0.1/multi-instance-and-fork.org][reverie air/v0.1/multi-instance-and-fork.org]], T5a–c, run on Linux against the real primitive): an =flock= survives in any child that inherits the descriptor. Ever is already safe because =createFile= is =O_CLOEXEC= and =HookDaemon= =execve=s; it is worth the sentence for the next embedder.
+
+** Interim, and if declined
+Reverie takes the lock directly — =createFile("ever.lock", …)= + =flock(LOCK_EX | LOCK_NB)= in its owner's startup, held for the owner's life, released at shutdown after its own marker (its owner's D38, proposed 2026-08-09 pending coordination with Ever) — beside, not instead of, its own =<session-dir>/owner= marker, which arbitrates between two /Reverie/ processes and lives outside the Ever directory. With that, =ever start= against a live Reverie session store is refused today and Reverie's T3a is expected to pass against stock Ever. If this ask is declined the interim is permanent, and Reverie's ever-zig-library carries a standing note that its exclusion against Ever's CLI depends on =main.zig='s private lock convention at whatever commit it last read — re-verified at every pin bump, which is exactly the chore a =Config= field would delete.
+
+* Design Details
+
+** Files expected to change
+- =src/store/store.zig= — =Config.exclusive=, the =flock= in =Log.init= before =recover=, the =File= in =Log=, release in =deinit=, =error.StoreLocked=.
+- =src/store/topic.zig= — forward the field.
+- =src/main.zig= — =startServer= loses its lock block and handles =StoreLocked=; =printDataDirListing='s =ever.lock= special case (~:1470~) unchanged.
+- =src/root.zig= — nothing (=store= is already exported); optionally a =pub const lock_file_name= so the name is reachable without being re-typed.
+- =SKILL.md= — embedders: set =exclusive=; users: =ever start= on a directory an application holds is refused, and why.
+
+** Testing
+- Open a =TopicManager= with =exclusive = true= in-process; spawn =ever start --data-dir= on the same directory; assert non-zero exit and the message. /Negative control:/ =exclusive = false=, same spawn — =ever start= succeeds (today's library behaviour, kept reachable).
+- Two in-process =TopicManager.init(.{ .exclusive = true })= on one directory: the second returns =StoreLocked= and has read no segment.
+- =exclusive = false= twice: both succeed (kept for =multi-process-access.org='s future =shared= mode).
+- =ever status --data-dir= against an exclusively-held embedded directory reports held.
+- /Interlock with a hand-rolled holder/ (the interim's shape): a test process that flocks =ever.lock= by name without the field, then =TopicManager.init(.{ .exclusive = true })= in another — =StoreLocked=. This is the test that fails the day the convention moves, which is the point of having it in Ever's tree rather than only in an embedder's.
+
+* History
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=. The failure sequence is Ever's own (=multi-process-access.org=), quoted; the "Piece 3 does not close it" argument is Reverie's (ever-fit-assessment row F, 2026-08-07); the fd-inheritance caution is from Reverie's =flock= experiments (multi-instance-and-fork T5a–c, 2026-08-04), run on Linux against the real primitive.
+- 2026-08-09: Shrunk and retitled after Reverie's round-9 review (blind B3) and its owner's D38 — proposed, pending his coordination with Ever: "It sounds like the Reverie to take ever.lock is one good solution, but I'm open to suggestions". The ask was ~ever start Must Refuse a Directory an Embedded Opener Holds~ with two shapes, (a) library =flock= under a flag and (b) a marker file; re-reading =startServer= at =3991190c611e= showed an embedder holding =ever.lock= itself is refused today (=flock= is symmetric), so (b) is withdrawn, the Interim becomes Reverie's direct =flock=, and what remains is (a) restated as its real value — an API in place of an imitated private convention — with a Motivation section on why the copy works and why it is not an interface, =Log.init= taking the lock /before/ =recover=, and one interlock test added. Worker =reverie-serve9=; nothing here has been seen by Ever.

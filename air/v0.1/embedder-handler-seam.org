@@ -1,0 +1,149 @@
+#+title: Let an Embedder Supply the Store-Touching Handler Bodies
+#+state: dropped
+#+FILETAGS: :core:protocol:store:
+
+* Summary
+=ever.net.Server= takes a caller-owned =*TopicManager= and serves it — which is exactly what makes embedding cheap — but the four handlers that touch the store (=publish=, =create_topic=, =delete_topic=, =fetch=) call the manager directly from a thread per connection, and there is no way for the process that owns the manager to put anything between the wire and those calls. =Server= already has the idiom for optional collaborators (=setHookTable=, =setHookDaemon=, =setTimerTable=); add a fourth setter carrying four optional function pointers, and branch on it at the four call sites. About 40–60 lines of =server.zig=, no protocol change, one null check per request for a store that sets nothing.
+
+/Who is asking./ Reverie (=withre/reverie=), which embeds the library, owns the =TopicManager=, runs its own threads against it, and serves Ever's port from the same process so that =ever sub= works against a live session. It needs its own mutex around every store access (F4 — see =log-read-append-serialization.org=), wants to refuse =delete_topic= from strangers on its port, and could return a scan watermark to its own clients from memory. None of that is expressible today without re-implementing dispatch — /which, to be straight about it, Reverie has since decided to do anyway/ (its owner's decision D5b, 2026-08-09): its port gate is two listeners with two policies, a private unix socket with full access and a TCP port limited to reads and inbox publishes, and =Server.run= listens on IPv4 TCP only (~src/net/server.zig:92-94~), so shape (c) below is Reverie's plan rather than its fallback. The ask stands on the other embedders it would serve, and on Reverie's TCP listener being able to shrink back onto a stock =Server= if it lands. Read at ever =origin/main= =3991190c611e= (2026-08-09); line references are at that commit. Reverie's evidence and pricing are in [[file:../../../../air/v0.1/ever-zig-library.org][reverie air/v0.1/ever-zig-library.org]] (/The seam is needed for four handlers/ and its 2026-08-09 History) and =spikes/ever-t1/README.org= there.
+
+* Motivation
+
+** What is there now
+
+The whole configuration surface of =Server= (~src/net/server.zig:39-83~):
+
+#+begin_src zig
+pub const Server = struct {
+    allocator: Allocator,
+    io: Io,
+    topic_manager: *TopicManager,
+    hook_table: ?*HookTable,
+    hook_daemon: ?*HookDaemon,
+    timer_table: ?*TimerTable,
+    config: Config,
+    ...
+    pub fn init(allocator: Allocator, io: Io, topic_manager: *TopicManager, config: Config) !Server { ... }
+
+    /// Attach a hook table for server-side hook management.
+    pub fn setHookTable(self: *Server, ht: *HookTable) void { self.hook_table = ht; }
+    /// Attach a hook daemon for process table access (hook ps/logs).
+    pub fn setHookDaemon(self: *Server, hd: *HookDaemon) void { self.hook_daemon = hd; }
+    /// Attach a timer table for server-side timer management.
+    pub fn setTimerTable(self: *Server, tt: *TimerTable) void { self.timer_table = tt; }
+#+end_src
+
+Dispatch is one private =switch= (~src/net/server.zig:171-190~), and each store-touching arm calls the manager directly — =handlePublish= at ~:198~:
+
+#+begin_src zig
+const offset = self.topic_manager.publish(req.topic, req.key, req.value) catch |err| return switch (err) { ... };
+#+end_src
+
+likewise =createTopic= at ~:295~, =deleteTopic= at ~:307~, and the four fetch resolutions at ~:231-241~. =run= is thread-per-connection with =detach= (~:112-117~), so those calls arrive on threads the embedder did not create and cannot wrap.
+
+Three things an embedder might reasonably want, and why each is closed:
+
+- /Wrap the manager in a type that takes the embedder's lock./ Not expressible: the field is the concrete =*TopicManager= (~:42~, ~:54~, import at ~:9-10~), Zig has no subtyping, and =handleStatus= reaches into the manager's /fields/ — =tm.topics.keys()=, =tm.deleted_topics=, =tm.log.mutex=, =tm.log.segments= (~:696-722~) — so even a duck-typed generic would need a wide interface. 15 =self.topic_manager.= call sites plus two module-level helpers taking =*TopicManager= (~:814~, ~:867~) — a count at this commit, and it will drift.
+- /Adopt the manager's own mutex instead of wrapping./ =lockForHookRegistration= (~src/store/topic.zig:207~) is public, but =publish= drops that mutex across =log.append= (~src/store/topic.zig:378-379~) and it is non-reentrant, so an embedder holding it cannot call =publish= and not holding it cannot exclude the server's threads.
+- /Reuse the accept loop with a different dispatch./ =handleConnection= and =handleFrame= are private.
+
+So the choices are: everything through Ever's bodies, or nothing through Ever's server.
+
+** Why this is Ever's and not one consumer's
+
+The test Reverie applies before asking Ever for anything is /would this make Ever better for a consumer who is not Reverie/. Three reasons it does:
+
+1. *Any embedder with threads of its own has the F4 problem*, and until =log-read-append-serialization.org= lands the only mitigation is "serialise every store access yourself" — which the served port makes impossible, because the server's connection threads are store accesses the embedder cannot reach. =multi-process-access.org='s "shell running an embedded Ever" is Ever's own scenario, not Reverie's.
+2. *=Server= already chose this shape.* Hooks and timers are optional collaborators wired by setters and null at construction; "a store server" and "a store server that also runs hooks" are one struct with a flag. Handler bodies are the one collaborator that is welded in.
+3. *It costs a store that does not use it one predictable branch per request*, on a path that then does a JSON decode, a hashmap lookup and a =pread=.
+
+The comptime-reach problem is adjacent and worth knowing, though it is /not/ this ask: because the =?*HookTable= slots are null at /runtime/, a consumer that names =Server= compiles every opcode's handler and everything it reaches — =HookDaemon.killChildrenForHook= via =handleUnregisterHook= (~:388~) — which is how an embedder that will never run a hook came to be stopped by a toolchain break in hook-reaping code (=zig-0.17-dev-source-compat.org=). Shape (b) below would fix that too; shape (a) would not, and Reverie is asking for (a) anyway because it is the small one.
+
+* Goals
+- A process that constructs =Server= over its own =TopicManager= can supply the body of =publish=, =create_topic=, =delete_topic= and the /resolution step/ of =fetch=, individually, and have the server's connection threads call those instead of the manager.
+- Framing, decode, error mapping, response encoding, the blocking-fetch wait loop (=appendEpoch= / =waitForAppend=), =topic_events=, and every other opcode stay Ever's and are reused unchanged.
+- =ever start= sets nothing and behaves byte-for-byte as today.
+- No wire change.
+
+* Non-Goals
+- A plugin system, dynamic loading, or handlers for hook/timer/status opcodes. Four functions.
+- Making =Server= generic over a store type (shape (b)). Priced below as the alternative; larger, and it drags =handleStatus= into an interface design.
+- Capability gating in Ever. An embedder that wants to refuse =delete_topic= does it in /its/ =delete_topic= body; Ever learns nothing about policy.
+- Fixing F4. This lets an embedder /work around/ F4 completely; the fix is =log-read-append-serialization.org=.
+
+* Proposal
+
+** Shape (a): a fourth setter — the ask
+
+#+begin_src zig
+/// Store operations an embedder may take over. Any left null falls through
+/// to the TopicManager, so `.{ .ctx = p, .publish = f }` overrides one.
+/// Bodies run on the server's connection threads; making them safe against
+/// the embedder's own threads is the reason this exists and is the
+/// embedder's job.
+pub const Handlers = struct {
+    ctx: *anyopaque,
+    publish: ?*const fn (ctx: *anyopaque, topic: []const u8, key: ?[]const u8, value: []const u8) anyerror!u64 = null,
+    create_topic: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!void = null,
+    delete_topic: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!void = null,
+    /// One *look* of a fetch: resolve `req` to events now, without waiting.
+    /// The server keeps the epoch/wait loop and calls this once per wake.
+    resolve_fetch: ?*const fn (ctx: *anyopaque, allocator: Allocator, req: protocol.FetchRequest) anyerror![]store.Event = null,
+};
+
+handlers: ?Handlers = null,   // beside hook_table / hook_daemon / timer_table
+
+/// Attach embedder-supplied store handlers.
+pub fn setHandlers(self: *Server, h: Handlers) void { self.handlers = h; }
+#+end_src
+
+and at each of the four sites, the existing expression becomes a call to a two-line private helper:
+
+#+begin_src zig
+fn doPublish(self: *Server, topic: []const u8, key: ?[]const u8, value: []const u8) anyerror!u64 {
+    if (self.handlers) |h| if (h.publish) |f| return f(h.ctx, topic, key, value);
+    return self.topic_manager.publish(topic, key, value);
+}
+// handlePublish:  const offset = self.doPublish(req.topic, req.key, req.value) catch |err| return switch (err) { ...same arms... };
+#+end_src
+
+The =catch |err| switch= arms in =handlePublish= / =handleCreateTopic= / =handleDeleteTopic= already end in =else =>=, so widening the error set to =anyerror= changes no mapping: an embedder that returns =error.NotFound= gets Ever's 404, one that returns something Ever does not know gets Ever's 500. In =handleFetch= the four-way resolution (~:231-246~) moves into =doResolveFetch(req)= with the same fall-through, and everything from ~:248~ down — the deadline, =topic_events=, encoding, the park — is untouched. That is why the hook is /resolve/ and not /fetch/: the wait belongs with the epoch, and the epoch belongs to the manager the server already holds.
+
+Size: the struct, one field, one setter, four helpers, four call-site edits. Reverie's estimate from reading the file is 40–60 lines; nothing outside =server.zig=. =HttpServer= has the same direct calls (~src/net/http.zig:323~) and could take the same struct later; not asked here.
+
+** Shape (b): generic =Server= — the alternative, priced so it can be refused knowingly
+
+=pub fn ServerOver(comptime Store: type) type= with =pub const Server = ServerOver(TopicManager)=. Every =self.topic_manager.x(...)= compiles against whatever =Store= provides, an embedder passes a wrapper type, and — the real attraction — an embedder's =Store= that lacks hook/timer methods drops those opcodes at /comptime/, which is the only shape that also removes hook and timer code from an embedder's build. Against it: =handleStatus='s field reach-ins and the two module-level helpers make the implicit interface "these methods /and these fields/", so either =handleStatus= is reworked to go through methods first or the interface is wide and undocumented. Larger diff, touches every handler nominally, and turns a struct into a generic for one consumer's benefit today. Reverie is not asking for it; it is here because a reviewer will think of it.
+
+** Shape (c): no Ever change — what Reverie does if this is declined
+
+=readFrame=, =writeFrame=, =encodeBody=, =decodeBody= and every request/response struct are =pub= in =ever.protocol= (~src/protocol/message.zig:322,389,422,427~). An embedder can write its own accept loop, its own =switch=, the four bodies plus =list_topics= and =status=, and answer everything else with the same =bad_request= the stock =else= arm sends (~src/net/server.zig:188~). By the stock bodies' sizes that is ≈250–300 lines in the embedder, ~80 of them fetch semantics that have already moved once between Ever revisions (=offset= vs =after_offset=, =topic_events=). Nothing forked, nothing to rebase, coupled to the protocol structs at compile time. Reverie's owner recorded this first as the fallback (D11) and, hours later, as the plan (D5b) — not because (a) was refused but because Reverie's gate wants a unix-socket listener beside the TCP one, and per-listener policy is easiest where Reverie owns the accept loop. It remains a worse outcome for Ever than (a) in one specific way: every embedder that takes it is a second implementation of Ever's dispatch semantics that Ever's tests do not cover — Reverie is now one such, and would rather be the last.
+
+* Design Details
+
+** Files expected to change
+- =src/net/server.zig= — as above.
+- =src/root.zig= — nothing; =net= is already exported and =Handlers= rides along.
+- =air/context/architecture.org= — one sentence: the server's store operations are pluggable by an embedder; =ever start= plugs nothing.
+
+** Testing
+- /Fall-through/: construct =Server= without =setHandlers=; the existing integration suite is the regression test and must pass unchanged.
+- /Override/: set only =publish= to a function that records its arguments and returns a fixed offset; publish over a client; assert the recorder saw it and the client got the offset; assert =create_topic= still reached the real manager.
+- /Fetch split/: set =resolve_fetch= to return empty twice then one event; issue a blocking fetch; publish twice to unrelated topics to generate wakes; assert exactly three calls and one delivered event — proves the wait loop stayed the server's.
+- /Error mapping/: an override returning =error.NotFound= yields the same wire error as the manager's =NotFound=.
+
+* History
+- 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=; the three shapes and their sizes are from Reverie's T1 read of =server.zig= at that commit (=spikes/ever-t1/README.org=, /The handler-installation read/), reasoned from source and not built.
+- 2026-08-09: Reverie's owner chose shape (c) for Reverie itself (D5b, the two-listener gate); the /Who is asking/ and shape (c) paragraphs say so. The ask is unchanged and no longer on Reverie's critical path.
+
+* Decision: declined
+
+Declined on the scope rule in =air/context/architecture.org=: *if a client can build it correctly on top of what is already exported, it does not belong in the store.*
+
+It can, and the asker has already done it. =ever.protocol= is public API — =encodeFrame=, =decodeBody=, =writeFrame= are all exported through =root.zig= — so a process that owns its =TopicManager= can own its accept loop and dispatch too, putting whatever it likes between the wire and the store. Reverie's own D5b did exactly that, for a two-listener port gate, and reports it compiles against the pinned tip unpatched. The capability is present; what is absent is a *shortcut* to it.
+
+Why not add the shortcut anyway. =Server= today is a mechanism: it serves a manager the caller owns. A settable handler table turns it into a framework with injection points, and those points become supported API — every future change to =publish=, =create_topic=, =delete_topic= or =fetch= then has to preserve a seam whose only consumers are out of tree. That is surface growth bought with no capability gain, against a store whose stated advantage is being small.
+
+The honest counter-argument, which the asker made: other embedders have the same need and less appetite for owning a dispatch loop. Two things answer it. The public codec is the documented path and it is genuinely short — one =decodeBody=, one switch, one =writeFrame=. And if that path turns out to be too long in practice, the right fix is to make *it* shorter, not to grow =Server= — a small dispatch helper over the codec would serve every embedder without making the server extensible.
+
+Reconsider if an embedder appears that needs interception *and* cannot own its loop. That case is not hypothetical-in-principle, it is simply not the case in front of us, and the asker states plainly that a decline costs them nothing.
