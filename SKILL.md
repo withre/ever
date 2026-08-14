@@ -55,7 +55,8 @@ ever sub agent.tasks                      # exact topic
 ever sub agent.                           # prefix — all agent.* topics (no quoting!)
 ever sub .                                # all topics (no quoting!)
 ever sub 'agent.*.complete'               # wildcard (needs shell quoting)
-ever sub agent.tasks --from 5 --max 10    # offset + limit
+ever sub agent.tasks --from 5 --max 10    # offset + limit (--from is per-topic: rejected on patterns unless 0)
+ever sub agent. --after-offset 41         # resume a pattern strictly after a global offset
 ever sub agent.tasks --follow             # tail-f style: stream new events
 ever sub agent.tasks --json-values        # output just the JSON value
 

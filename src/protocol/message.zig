@@ -92,7 +92,10 @@ pub const FetchRequest = struct {
     topic: ?[]const u8 = null,
     pattern: ?[]const u8 = null,
     /// Topic-local skip count: skip the first `offset` non-marker events
-    /// (NOT a global log offset).
+    /// (NOT a global log offset). Rejected on pattern requests unless zero:
+    /// applied per matching topic it is a number no client can compute a
+    /// next value for — resume a pattern with `after_offset`.
+    /// (air/v0.1/pattern-fetch-rejects-offset.org)
     offset: u64 = 0,
     /// Global-offset cursor: resume strictly after this global log offset —
     /// the value printed as `[topic:offset]` and carried in event bodies.
