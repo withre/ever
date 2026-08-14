@@ -271,13 +271,20 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     }
     const mode: PrintMode = if (json_full) .json else if (json_values) .json_values else .default;
 
+    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
+        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
+    // The server refuses this combination (a per-topic skip count over an
+    // interleaved response is a cursor no client can advance); say so with
+    // the flags' names, before connecting.
+    // (air/v0.1/pattern-fetch-rejects-offset.org)
+    if (is_pattern and from_offset > 0) {
+        fatal(ctx, "error: --from is a per-topic skip count and is undefined for a pattern; resume a pattern with --after-offset\n", .{});
+    }
+
     const addr_info = parseStoreAddress(ctx);
 
     var client = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer client.deinit();
-
-    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
-        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
     if (follow) {
         var sink: StdoutSink = .{ .allocator = allocator, .ctx = ctx, .mode = mode, .topic_name = topic_name };
@@ -370,12 +377,30 @@ fn followLoop(client: anytype, sink: anytype, topic_name: []const u8, is_pattern
         if (result.events.len > 0) {
             if (after_cursor != null) {
                 after_cursor = result.events[result.events.len - 1].offset;
+            } else if (is_pattern) {
+                // The initial offset-0 pattern batch is a per-topic
+                // concatenation, not globally ordered, so a skip count over
+                // it is a cursor no next fetch can use (the server refuses
+                // one) and its *last* element may predate an earlier one.
+                // Resume strictly after the highest global offset delivered;
+                // every later batch comes from the fetchAfter branch, which
+                // is globally ordered. (air/v0.1/pattern-fetch-rejects-offset.org)
+                after_cursor = maxGlobalOffset(result.events);
             } else {
                 offset += result.events.len;
             }
         }
         did_initial = true;
     }
+}
+
+/// Highest global offset in a batch. Needed for the initial pattern fetch,
+/// whose response concatenates per-topic batches — its last element is not
+/// its newest event.
+fn maxGlobalOffset(events: []const ever.client.Event) u64 {
+    var max: u64 = 0;
+    for (events) |e| max = @max(max, e.offset);
+    return max;
 }
 
 /// Emit the "start beyond end of topic" warning (stderr, diagnostic only —
@@ -408,13 +433,18 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         fatal(ctx, "error: --from and --after-offset are mutually exclusive\n", .{});
     }
 
+    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
+        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
+    // Same refusal as `sub`: the server rejects a per-topic skip count on a
+    // pattern. (air/v0.1/pattern-fetch-rejects-offset.org)
+    if (is_pattern and from_offset > 0) {
+        fatal(ctx, "error: --from is a per-topic skip count and is undefined for a pattern; resume a pattern with --after-offset\n", .{});
+    }
+
     const addr_info = parseStoreAddress(ctx);
 
     var client = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer client.deinit();
-
-    const is_pattern = std.mem.indexOfScalar(u8, topic_name, '*') != null or
-        (topic_name.len > 0 and topic_name[topic_name.len - 1] == '.');
 
     var collected: u32 = 0;
     var offset = from_offset;
@@ -466,6 +496,12 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         if (result.events.len > 0) {
             if (after_cursor != null) {
                 after_cursor = result.events[result.events.len - 1].offset;
+            } else if (is_pattern) {
+                // Same cursor switch as followLoop: a pattern's offset-0
+                // batch is a per-topic concatenation; resume strictly after
+                // its highest global offset, not by a skip count the server
+                // refuses. (air/v0.1/pattern-fetch-rejects-offset.org)
+                after_cursor = maxGlobalOffset(result.events);
             } else {
                 offset += result.events.len;
             }
@@ -504,6 +540,11 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         else => return err,
     };
     const next_offset: u64 = probe.events.len;
+    // Patterns resume by global offset from here on: the probe's batch is a
+    // per-topic concatenation whose length is a skip count no next fetch can
+    // use (the server refuses a non-zero pattern offset). Exact topics keep
+    // the topic-local count. (air/v0.1/pattern-fetch-rejects-offset.org)
+    var after_cursor: ?u64 = if (is_pattern and probe.events.len > 0) maxGlobalOffset(probe.events) else null;
     probe.deinit();
 
     diag(ctx, "Watching '{s}' from offset {d}...\n", .{ pattern, next_offset });
@@ -511,7 +552,10 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var offset = next_offset;
     while (true) {
         var result = (if (is_pattern)
-            client.fetchBlocking(null, pattern, offset, 100, 5000)
+            (if (after_cursor) |after|
+                client.fetchAfter(null, pattern, after, 100, 5000)
+            else
+                client.fetchBlocking(null, pattern, 0, 100, 5000))
         else
             client.fetchBlocking(pattern, null, offset, 100, 5000)) catch |err| switch (err) {
             error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &client),
@@ -604,7 +648,11 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             }
         }
 
-        offset += result.events.len;
+        if (is_pattern) {
+            after_cursor = maxGlobalOffset(result.events);
+        } else {
+            offset += result.events.len;
+        }
         if (once) break;
     }
 }
@@ -1859,7 +1907,7 @@ const app = cli.App{
                 .{ .name = "topic", .required = true, .description = "Topic name or pattern" },
             },
             .flags = &.{
-                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
+                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (exact topics only; topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
                 .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
                 .{ .name = "max", .default = "100", .description = "Max events in the initial batch; ignored once following" },
                 .{ .name = "follow", .takes_value = false, .description = "Follow new events" },
@@ -1877,7 +1925,7 @@ const app = cli.App{
             .flags = &.{
                 .{ .name = "count", .default = "1", .description = "Events to wait for" },
                 .{ .name = "timeout", .default = "0", .description = "Timeout in seconds" },
-                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
+                .{ .name = "from", .default = "0", .description = "Skip the first N events of the topic (exact topics only; topic-local count, not a log offset)", .conflicts = &.{"after-offset"} },
                 .{ .name = "after-offset", .value_name = "OFFSET", .description = "Resume strictly after this global log offset (as printed in [topic:offset])", .conflicts = &.{"from"} },
                 .{ .name = "json-values", .takes_value = false, .description = "Print only JSON values" },
             },
@@ -2558,7 +2606,8 @@ test "pub payload: oversize diagnostic names the size and the limit" {
 /// fetches more than the script expects fails loudly rather than spinning.
 const ScriptedClient = struct {
     const Reply = anyerror![]const ever.client.Event;
-    const Call = struct { blocking: bool, max_count: u32, block_ms: u32 };
+    const Method = enum { fetch, fetch_pattern, fetch_blocking, fetch_after };
+    const Call = struct { method: Method, cursor: u64, blocking: bool, max_count: u32, block_ms: u32 };
 
     script: []const Reply,
     next: usize = 0,
@@ -2581,28 +2630,24 @@ const ScriptedClient = struct {
 
     fn fetch(self: *ScriptedClient, topic: []const u8, offset: u64, max_count: u32) anyerror!Result {
         _ = topic;
-        _ = offset;
-        return self.reply(.{ .blocking = false, .max_count = max_count, .block_ms = 0 });
+        return self.reply(.{ .method = .fetch, .cursor = offset, .blocking = false, .max_count = max_count, .block_ms = 0 });
     }
 
     fn fetchPattern(self: *ScriptedClient, pattern: []const u8, offset: u64, max_count: u32) anyerror!Result {
         _ = pattern;
-        _ = offset;
-        return self.reply(.{ .blocking = false, .max_count = max_count, .block_ms = 0 });
+        return self.reply(.{ .method = .fetch_pattern, .cursor = offset, .blocking = false, .max_count = max_count, .block_ms = 0 });
     }
 
     fn fetchBlocking(self: *ScriptedClient, topic: ?[]const u8, pattern: ?[]const u8, offset: u64, max_count: u32, block_ms: u32) anyerror!Result {
         _ = topic;
         _ = pattern;
-        _ = offset;
-        return self.reply(.{ .blocking = true, .max_count = max_count, .block_ms = block_ms });
+        return self.reply(.{ .method = .fetch_blocking, .cursor = offset, .blocking = true, .max_count = max_count, .block_ms = block_ms });
     }
 
     fn fetchAfter(self: *ScriptedClient, topic: ?[]const u8, pattern: ?[]const u8, after_offset: u64, max_count: u32, block_ms: u32) anyerror!Result {
         _ = topic;
         _ = pattern;
-        _ = after_offset;
-        return self.reply(.{ .blocking = true, .max_count = max_count, .block_ms = block_ms });
+        return self.reply(.{ .method = .fetch_after, .cursor = after_offset, .blocking = true, .max_count = max_count, .block_ms = block_ms });
     }
 };
 
@@ -2666,4 +2711,43 @@ test "sub --follow --max 5: bounds the initial batch only" {
         try std.testing.expectEqual(@as(u32, 100), call.max_count);
         try std.testing.expectEqual(@as(u32, 5000), call.block_ms);
     }
+}
+
+// ── sub <pattern> --follow resumes by global offset ─────────────────────────
+// (air/v0.1/pattern-fetch-rejects-offset.org, CLI half)
+
+test "sub --follow on a pattern: resumes by after_offset, not a per-topic skip" {
+    // The initial pattern batch is a per-topic *concatenation*: topic a's
+    // events (global 2, 4) precede topic b's (global 3), so the last
+    // element is not the newest event. The follow must resume with
+    // fetchAfter, strictly after the highest global offset delivered (4) —
+    // seeding from the last element would re-deliver global 4, and the old
+    // per-topic skip count is a request the server now refuses outright.
+    var initial = [_]ever.client.Event{
+        .{ .offset = 2, .timestamp = 0, .key = null, .value = "a1" },
+        .{ .offset = 4, .timestamp = 0, .key = null, .value = "a2" },
+        .{ .offset = 3, .timestamp = 0, .key = null, .value = "b1" },
+    };
+    var late = [_]ever.client.Event{
+        .{ .offset = 7, .timestamp = 0, .key = null, .value = "b2" },
+    };
+    const script = [_]ScriptedClient.Reply{
+        initial[0..],
+        late[0..],
+        error.TestDone,
+    };
+    var client = ScriptedClient{ .script = &script };
+    var sink = CountingSink{};
+    try std.testing.expectError(error.TestDone, followLoop(&client, &sink, "probe.", true, 0, null, 100));
+    try std.testing.expectEqual(@as(u64, 4), sink.count);
+
+    try std.testing.expectEqual(@as(usize, 3), client.ncalls);
+    // Initial catch-up: the offset-0 pattern fetch, unchanged.
+    try std.testing.expectEqual(ScriptedClient.Method.fetch_pattern, client.calls[0].method);
+    try std.testing.expectEqual(@as(u64, 0), client.calls[0].cursor);
+    // Follow phase: global-offset cursor, seeded from the batch maximum.
+    try std.testing.expectEqual(ScriptedClient.Method.fetch_after, client.calls[1].method);
+    try std.testing.expectEqual(@as(u64, 4), client.calls[1].cursor);
+    try std.testing.expectEqual(ScriptedClient.Method.fetch_after, client.calls[2].method);
+    try std.testing.expectEqual(@as(u64, 7), client.calls[2].cursor);
 }
