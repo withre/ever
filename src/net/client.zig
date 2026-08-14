@@ -155,21 +155,77 @@ pub const ListTimersResult = struct {
     }
 };
 
+/// Both fields of a server `error_response`, retained on the `Client` for
+/// the caller who wants the text beside the tag. `message` is owned by the
+/// client's allocator and lives until the next request (or `deinit`).
+pub const ServerErrorInfo = struct { code: u16, message: []const u8 };
+
+/// A server `error_response`, mapped tag-by-tag from the protocol's codes
+/// (400, 404, 409, 413, 500) so a caller's `switch` reads like the protocol.
+/// `error.ServerError` is the fallback: a code this client predates, or a
+/// body that did not parse (`lastError().?.code == 0` in that case).
+pub const ServerError = error{ BadRequest, NotFound, Conflict, TooLarge, Internal, ServerError };
+
 /// Unified client for publishing and subscribing to the Ever store.
+///
+/// Library contract: no method writes to stdout or stderr. A server
+/// `error_response` surfaces as a `ServerError` tag with both wire fields
+/// recoverable via `lastError()`; loss of the connection — EOF or reset
+/// while reading the reply, EPIPE/ECONNRESET while writing the request —
+/// is always the one tag `error.ConnectionClosed`.
 pub const Client = struct {
     allocator: Allocator,
     io: Io,
     stream: net.Stream,
+    /// Set when a request returns a `ServerError` tag; cleared (and freed)
+    /// at the start of the next request and in `deinit`. `code == 0` with a
+    /// fixed message when the error_response body did not parse.
+    last_error: ?ServerErrorInfo = null,
 
-    /// Parse an error_response frame body and print a useful message, then return error.
-    fn handleErrorResponse(self: *Client, body: []const u8) error{ServerError} {
+    /// The retained `{code, message}` of the server error the most recent
+    /// request ended in, or null if it did not end in one.
+    pub fn lastError(self: *const Client) ?ServerErrorInfo {
+        return self.last_error;
+    }
+
+    fn clearLastError(self: *Client) void {
+        if (self.last_error) |e| {
+            self.allocator.free(e.message);
+            self.last_error = null;
+        }
+    }
+
+    /// Write a request frame, folding the write side's names for "peer
+    /// gone" (EPIPE, ECONNRESET) into the read side's
+    /// `error.ConnectionClosed` — one condition, one tag. Doubles as the
+    /// start of a request: clears the previously retained server error.
+    fn send(self: *Client, msg_type: protocol.MessageType, body: []const u8) !void {
+        self.clearLastError();
+        protocol.writeFrame(self.fd(), msg_type, body) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => return error.ConnectionClosed,
+            else => |e| return e,
+        };
+    }
+
+    /// Parse an error_response frame body, retain `{code, message}` for
+    /// `lastError`, and map the code onto `ServerError`. Prints nothing:
+    /// the library's whole report is the error value and `lastError()`.
+    /// (On out-of-memory the retained message is empty, never absent.)
+    fn handleErrorResponse(self: *Client, body: []const u8) ServerError {
         const parsed = protocol.decodeBody(protocol.ErrorResponse, self.allocator, body) catch {
-            std.debug.print("error: server returned an error (could not parse details)\n", .{});
+            self.last_error = .{ .code = 0, .message = self.allocator.dupe(u8, "server returned an error (could not parse details)") catch "" };
             return error.ServerError;
         };
         defer parsed.deinit();
-        std.debug.print("error: {s}\n", .{parsed.value.message});
-        return error.ServerError;
+        self.last_error = .{ .code = parsed.value.code, .message = self.allocator.dupe(u8, parsed.value.message) catch "" };
+        return switch (parsed.value.code) {
+            protocol.ErrorCode.bad_request => error.BadRequest,
+            protocol.ErrorCode.not_found => error.NotFound,
+            protocol.ErrorCode.conflict => error.Conflict,
+            protocol.ErrorCode.too_large => error.TooLarge,
+            protocol.ErrorCode.internal => error.Internal,
+            else => error.ServerError,
+        };
     }
 
     /// Connect to the Ever store at the given address and port.
@@ -185,8 +241,9 @@ pub const Client = struct {
         };
     }
 
-    /// Close the connection to the store.
+    /// Close the connection to the store and free the retained error, if any.
     pub fn deinit(self: *Client) void {
+        self.clearLastError();
         self.stream.close(self.io);
     }
 
@@ -205,7 +262,7 @@ pub const Client = struct {
 
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .publish, body);
+        try self.send(.publish, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -258,7 +315,7 @@ pub const Client = struct {
     fn doFetch(self: *Client, req: protocol.FetchRequest) !FetchResult {
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .fetch, body);
+        try self.send(.fetch, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -317,7 +374,7 @@ pub const Client = struct {
         const req = protocol.TopicRequest{ .topic = name };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .create_topic, body);
+        try self.send(.create_topic, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -332,7 +389,7 @@ pub const Client = struct {
         const req = protocol.TopicRequest{ .topic = name };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .delete_topic, body);
+        try self.send(.delete_topic, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -392,7 +449,7 @@ pub const Client = struct {
     fn sendRegisterHook(self: *Client, req: protocol.RegisterHookRequest) !u64 {
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .register_hook, body);
+        try self.send(.register_hook, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -411,7 +468,7 @@ pub const Client = struct {
         const req = protocol.UnregisterHookRequest{ .id = id };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .unregister_hook, body);
+        try self.send(.unregister_hook, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -423,7 +480,7 @@ pub const Client = struct {
 
     /// List all hooks on the server.
     pub fn listHooks(self: *Client) !ListHooksResult {
-        try protocol.writeFrame(self.fd(), .list_hooks, "{}");
+        try self.send(.list_hooks, "{}");
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -484,7 +541,7 @@ pub const Client = struct {
 
     /// List all topics on the server.
     pub fn listTopics(self: *Client) ![][]const u8 {
-        try protocol.writeFrame(self.fd(), .list_topics, "{}");
+        try self.send(.list_topics, "{}");
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -534,7 +591,7 @@ pub const Client = struct {
         };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .add_timer, body);
+        try self.send(.add_timer, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -549,7 +606,7 @@ pub const Client = struct {
         const req = protocol.RemoveTimerRequest{ .name = name };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .remove_timer, body);
+        try self.send(.remove_timer, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -561,7 +618,7 @@ pub const Client = struct {
 
     /// List all timers on the server.
     pub fn listTimers(self: *Client) !ListTimersResult {
-        try protocol.writeFrame(self.fd(), .list_timers, "{}");
+        try self.send(.list_timers, "{}");
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -606,7 +663,7 @@ pub const Client = struct {
 
     /// List running hook processes.
     pub fn hookPs(self: *Client) !HookPsResult {
-        try protocol.writeFrame(self.fd(), .hook_ps, "{}");
+        try self.send(.hook_ps, "{}");
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -644,7 +701,7 @@ pub const Client = struct {
         const req = protocol.HookLogsRequest{ .hook_id = hook_id };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .hook_logs, body);
+        try self.send(.hook_logs, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -668,7 +725,7 @@ pub const Client = struct {
     /// `source = .server` and `lock_held = true` (true by construction: a
     /// server answered over the wire). Caller owns the result — call `deinit`.
     pub fn status(self: *Client) !StatusResult {
-        try protocol.writeFrame(self.fd(), .status, "{}");
+        try self.send(.status, "{}");
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;
@@ -742,7 +799,7 @@ pub const Client = struct {
         const req = protocol.TimerInfoRequest{ .name = name };
         const body = try protocol.encodeBody(self.allocator, req);
         defer self.allocator.free(body);
-        try protocol.writeFrame(self.fd(), .timer_info, body);
+        try self.send(.timer_info, body);
 
         const frame = (try protocol.readFrame(self.allocator, self.fd())) orelse
             return error.ConnectionClosed;

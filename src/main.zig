@@ -48,6 +48,19 @@ fn exitFlushed(ctx: *const cli.Context, code: u8) noreturn {
     std.process.exit(code);
 }
 
+/// Print a server error the way the CLI always has — `error: <message>` on
+/// stderr, in the words the server sent — and exit 1. The library retains
+/// the message instead of printing it (air/v0.1/client-as-library-citizen.org);
+/// the CLI prints once, here.
+fn serverError(ctx: *const cli.Context, client: *const ever.client.Client) noreturn {
+    if (client.lastError()) |e| {
+        diag(ctx, "error: {s}\n", .{e.message});
+    } else {
+        diag(ctx, "error: server returned an error\n", .{});
+    }
+    exitFlushed(ctx, 1);
+}
+
 /// Connect to the store, printing a clean error and exiting on failure.
 fn connectToStore(allocator: std.mem.Allocator, ctx: *const cli.Context, addr: []const u8, port: u16) ever.client.Client {
     return ever.client.Client.connect(allocator, ctx.io, addr, port) catch {
@@ -228,7 +241,8 @@ fn handlePub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const offset = c.publish(topic, null, data) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     diag(ctx, "Published to {s} at offset {d}\n", .{ topic, offset });
@@ -268,7 +282,8 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     if (follow) {
         var sink: StdoutSink = .{ .allocator = allocator, .ctx = ctx, .mode = mode, .topic_name = topic_name };
         followLoop(&client, &sink, topic_name, is_pattern, from_offset, after_offset, max_count) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &client),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         };
     } else {
@@ -281,7 +296,8 @@ fn handleSub(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 0,
             )
         else if (is_pattern) client.fetchPattern(topic_name, from_offset, max_count) else client.fetch(topic_name, from_offset, max_count)) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &client),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         };
         defer result.deinit();
@@ -483,7 +499,8 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         client.fetchBlocking(null, pattern, 0, 1_000_000, 0)
     else
         client.fetchBlocking(pattern, null, 0, 1_000_000, 0)) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &client),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     const next_offset: u64 = probe.events.len;
@@ -497,7 +514,8 @@ fn handleOn(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
             client.fetchBlocking(null, pattern, offset, 100, 5000)
         else
             client.fetchBlocking(pattern, null, offset, 100, 5000)) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &client),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         };
         defer result.deinit();
@@ -602,7 +620,8 @@ fn handleTopicCreate(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.createTopic(name) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     diag(ctx, "Created topic: {s}\n", .{name});
@@ -613,7 +632,8 @@ fn handleTopicList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const topics = c.listTopics() catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer {
@@ -634,7 +654,8 @@ fn handleTopicDelete(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.deleteTopic(name) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     diag(ctx, "Deleted topic: {s}\n", .{name});
@@ -701,12 +722,14 @@ fn handleHookAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     defer c.deinit();
     const id = if (create_topic)
         c.registerHookCreateTopic(pattern, cmd_str.items, cwd, once, null, name) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         }
     else
         c.registerHookFullNamedCursor(pattern, cmd_str.items, cwd, once, null, name, start_cursor) catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         };
 
@@ -736,7 +759,8 @@ fn handleHookList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listHooks() catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer result.deinit();
@@ -796,7 +820,8 @@ fn handleHookPs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookPs() catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer result.deinit();
@@ -852,7 +877,8 @@ fn resolveHookId(
     var c = connectToStore(allocator, ctx, address, port);
     defer c.deinit();
     var result = c.listHooks() catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer result.deinit();
@@ -1041,7 +1067,8 @@ fn handleHookLogs(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.hookLogs(resolved.id) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer result.deinit();
@@ -1089,7 +1116,8 @@ fn handleHookRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.removeHook(resolved.id) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
 
@@ -1181,7 +1209,8 @@ fn handleTimerAdd(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     };
 
     c.addTimer(actual_name, schedule_type, schedule_value, topic, actual_payload, if (has_in) false else persistent) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
 
@@ -1197,7 +1226,8 @@ fn handleTimerList(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     var result = c.listTimers() catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer result.deinit();
@@ -1228,7 +1258,8 @@ fn handleTimerRm(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.removeTimer(name) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     diag(ctx, "Timer '{s}' removed.\n", .{name});
@@ -1245,7 +1276,8 @@ fn handleTimerInfo(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const timer = c.timerInfo(name) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
     defer {
@@ -1348,7 +1380,8 @@ fn handleTimerNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     c.addTimer(name, schedule_type, sched_value, topic, payload, if (is_in) false else persistent) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
 
@@ -1400,7 +1433,8 @@ fn handleHookNew(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
     var c = connectToStore(allocator, ctx, addr_info.address, addr_info.port);
     defer c.deinit();
     const id = c.registerHookFull(pattern, cmd_input, cwd, once, null) catch |err| switch (err) {
-        error.ServerError => exitFlushed(ctx, 1),
+        error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+        error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
         else => return err,
     };
 
@@ -1446,7 +1480,8 @@ fn handleStatus(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
         defer c.deinit();
 
         var result = c.status() catch |err| switch (err) {
-            error.ServerError => exitFlushed(ctx, 1),
+            error.ServerError, error.BadRequest, error.NotFound, error.Conflict, error.TooLarge, error.Internal => serverError(ctx, &c),
+            error.ConnectionClosed => fatal(ctx, "error: connection to the store was lost\n", .{}),
             else => return err,
         };
         defer result.deinit();
@@ -2235,8 +2270,9 @@ test "stdout/stderr split: debug printing confined to the stderr allow-list" {
     try std.testing.expectEqual(@as(usize, 12), countDebugPrints(@embedFile("main.zig")));
     // status printers write data; they must use the threaded writer.
     try std.testing.expectEqual(@as(usize, 0), countDebugPrints(@embedFile("store/status.zig")));
-    // client.zig has no Context; its 2 sites are server-error diagnostics.
-    try std.testing.expectEqual(@as(usize, 2), countDebugPrints(@embedFile("net/client.zig")));
+    // client.zig is library API: it prints nothing, ever
+    // (air/v0.1/client-as-library-citizen.org).
+    try std.testing.expectEqual(@as(usize, 0), countDebugPrints(@embedFile("net/client.zig")));
 }
 
 // ── hook logs --json (air/v0.1/hook-logs-json.org) ─────────────────────────

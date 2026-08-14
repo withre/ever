@@ -2269,3 +2269,149 @@ test "integration: the signal path still stops the server" {
     ts.server.shutdown();
     ts.release();
 }
+
+// ── Client as a library citizen (air/v0.1/client-as-library-citizen.org) ────
+//
+// `ever.client.Client` is library API: a server error_response must reach
+// the caller as a code-mapped error tag with both wire fields recoverable
+// via `lastError()`, connection loss must always be `error.ConnectionClosed`
+// whichever syscall noticed first, and nothing is ever printed. The
+// no-printing half is enforced by main.zig's stderr allow-list test, which
+// pins client.zig at zero `std.debug.print` sites.
+
+test "integration: a server error reaches the caller with code and message intact" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    var ts = try TestServer.start(&tm);
+
+    {
+        var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", ts.port);
+        defer client.deinit();
+
+        // 404: the tag is the code, and both wire fields are retained.
+        try testing.expectError(error.NotFound, client.publish("no.such.topic", null, "x"));
+        try testing.expectEqual(@as(u16, 404), client.lastError().?.code);
+        try testing.expectEqualStrings("topic not found", client.lastError().?.message);
+
+        // A following successful request clears the retained error.
+        try client.createTopic("lib.citizen.topic");
+        try testing.expect(client.lastError() == null);
+
+        // 409 arrives as its own tag, with its own words.
+        try testing.expectError(error.Conflict, client.createTopic("lib.citizen.topic"));
+        try testing.expectEqual(@as(u16, 409), client.lastError().?.code);
+        try testing.expectEqualStrings("topic already exists", client.lastError().?.message);
+    }
+
+    ts.stop();
+}
+
+/// A bare TCP listener for the peers `TestServer` cannot play: one that
+/// hangs up without a word, and one that answers with a frame the client
+/// cannot parse.
+const RawPeer = struct {
+    server: std.Io.net.Server,
+    port: u16,
+
+    fn open() !RawPeer {
+        const ip4 = try std.Io.net.Ip4Address.parse("127.0.0.1", 0);
+        const address: std.Io.net.IpAddress = .{ .ip4 = ip4 };
+        var server = try address.listen(io, .{});
+        var sa: std.os.linux.sockaddr.in = undefined;
+        var sa_len: std.os.linux.socklen_t = @sizeOf(std.os.linux.sockaddr.in);
+        const rc = std.os.linux.getsockname(server.socket.handle, @ptrCast(&sa), &sa_len);
+        if (std.os.linux.errno(rc) != .SUCCESS) {
+            server.deinit(io);
+            return error.GetSockNameFailed;
+        }
+        return .{ .server = server, .port = std.mem.bigToNative(u16, sa.port) };
+    }
+
+    fn deinit(self: *RawPeer) void {
+        self.server.deinit(io);
+    }
+};
+
+test "integration: connection loss is one tag on the read and the write side" {
+    // The write-side half sends to a peer it already saw die; EPIPE raises
+    // SIGPIPE, which would take down the binary instead of returning the
+    // error under test.
+    const ign = std.os.linux.Sigaction{
+        .handler = .{ .handler = std.os.linux.SIG.IGN },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(.PIPE, &ign, null);
+
+    var peer = try RawPeer.open();
+    defer peer.deinit();
+
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", peer.port);
+    defer client.deinit();
+
+    // The peer accepts and hangs up without a word.
+    const conn = try peer.server.accept(io);
+    conn.close(io);
+
+    // Read side: the request lands in a kernel buffer; the reply is EOF.
+    try testing.expectError(error.ConnectionClosed, client.publish("t", null, "x"));
+
+    // Write side: the first request drew a reset, so this one dies inside
+    // write() with EPIPE — same condition, and it must wear the same name,
+    // not BrokenPipe.
+    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 50_000_000 }, null);
+    try testing.expectError(error.ConnectionClosed, client.publish("t", null, "x"));
+}
+
+/// Serves exactly one connection: swallows the request frame, answers with
+/// an error_response whose body is not JSON, then holds the socket open
+/// until the client hangs up (so the reply is never cut short by a reset).
+/// Allocation-free on purpose — `testing.allocator` is not thread-safe and
+/// this runs on its own thread.
+fn serveUnparseableError(peer: *RawPeer) void {
+    const conn = peer.server.accept(io) catch return;
+    defer conn.close(io);
+    const fd = conn.socket.handle;
+
+    // Read past the request; its header names the body length.
+    var header: [ever.protocol.HEADER_SIZE]u8 = undefined;
+    var got: usize = 0;
+    while (got < header.len) {
+        const n = std.posix.read(fd, header[got..]) catch return;
+        if (n == 0) return;
+        got += n;
+    }
+    var remaining = std.mem.readInt(u32, header[2..6], .little);
+    var buf: [512]u8 = undefined;
+    while (remaining > 0) {
+        const n = std.posix.read(fd, buf[0..@min(buf.len, remaining)]) catch return;
+        if (n == 0) return;
+        remaining -= @intCast(n);
+    }
+
+    ever.protocol.writeFrame(fd, .error_response, "not json") catch return;
+
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch return;
+        if (n == 0) return;
+    }
+}
+
+test "integration: an unparseable error_response is ServerError with code 0" {
+    var peer = try RawPeer.open();
+    defer peer.deinit();
+
+    const thread = try std.Thread.spawn(.{}, serveUnparseableError, .{&peer});
+
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", peer.port);
+
+    try testing.expectError(error.ServerError, client.publish("t", null, "x"));
+    try testing.expectEqual(@as(u16, 0), client.lastError().?.code);
+    try testing.expectEqualStrings("server returned an error (could not parse details)", client.lastError().?.message);
+
+    client.deinit(); // hangs up: the peer's final read returns 0
+    thread.join();
+}
