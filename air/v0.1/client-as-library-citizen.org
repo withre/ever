@@ -178,3 +178,20 @@ and the twenty-four =error.ServerError => exitFlushed(ctx, 1)= arms become =erro
 
 * History
 - 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask, on its owner's decision D49 after its round-10 blind review (B3) found the attached window's stock =Client= printing to stderr under raw mode and flattening the code three of its documents branch on; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=: ~src/net/client.zig:164-173~ and its fifteen call sites, ~src/protocol/message.zig:136-139~ / ~:389-419~ / ~:446-463~, ~src/main.zig:45-56~ and the twenty-four =error.ServerError= arms, ~src/bench.zig:279,340,348~; =air/v0.1/stdout-stderr-split.org= and =client-library.org= at the same commit for Ever's own prior words on these two prints and on the API's intended idiom.
+
+* Follow-on: =Server= has the same defect
+
+Landed for =Client=; =Server= still has it. =server.zig= carries one =std.debug.print= — =shutdown()= reporting
+connections that did not drain — and =ever.net.Server= is library API, exported through =root.zig= exactly as
+=Client= is. A library that writes to a caller's stderr is the defect this document is about, and fixing it in
+one export and not the other is half a fix.
+
+It surfaced the way such things do: an external build of an unrelated commit produced the line in its test output
+and the builder asked whether it was noise rather than deciding. It is not noise and it is not a failure either —
+=integration.zig='s "stop returns within the drain bound with an idle client" attaches an idle client on purpose,
+and an idle connection cannot be read out from under its handler, so the drain necessarily expires. The
+diagnostic is correct; printing it from a library is not.
+
+The shape is the same as the fix above: the condition is real and worth reporting, so return or record it rather
+than printing it, and let the CLI decide whether a human sees it.
+

@@ -101,3 +101,22 @@ Reverie's build does not name =Server= (D5b — its own dispatch over =ever.prot
 
 * History
 - 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=; the error text, the patch and the passing run are Reverie's T1 (=spikes/ever-t1/README.org=, x86_64-linux, Zig =0.17.0-dev.1282+c0f9b51d8=); =param_types= confirmed present in =lib/std/lang.zig= of both =dev.857= and =dev.1282= from their Nix store paths; the =dev.607= 404 observed by T1 and re-derived the same day by a second Reverie worker.
+
+- 2026-08-13: Implemented as =8a86581142c2= and *externally verified at a toolchain this project cannot fetch.*
+  Here, at the pinned =0.17.0-dev.607=: 147/147 green in Debug, ReleaseSafe and ReleaseFast — the =if= branch.
+  By Reverie at =0.17.0-dev.1441+d5181a9c9=, on a =git archive= scratch copy: =zig build= exit 0, binary linked
+  and =--version= runs, =zig build test= exit 0 — the =else= branch — and the *parent commit fails on the same
+  toolchain with the same one error*, so the fix is what changes the outcome rather than the toolchain being
+  lenient. Neither party could run the other's half; between them both branches are exercised.
+
+  The commit message says the =param_types= branch was verified by inspection, which was true when written and
+  now understates it. *Deliberately not amended*: the hash is cited externally, and rewriting it to improve a
+  sentence would repeat the exact failure that cost this project a downstream citation set earlier. The stronger
+  claim lives here instead.
+
+  One thing settled along the way, against the advice offered with the ask: a *direct* field access to a missing
+  field in the untaken arm of a comptime-known =if= is fine — Zig eliminates the branch before analysis reaches
+  the field, so =FnInfo.params[1].type.?= needs no =@field= wrapper. The doubt came from this repository's own
+  =build.zig=, whose comptime detection already names =run.addPassthruArgs= and =b.args= in arms that do not
+  exist on the other toolchain and compiles on both.
+
