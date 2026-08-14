@@ -1,5 +1,5 @@
 #+title: One Reflection Line Keeps Ever From Compiling on Any Obtainable 0.17-dev
-#+state: ready
+#+state: complete
 #+FILETAGS: :core:orchestrator:testing:
 
 * Summary
@@ -119,4 +119,4 @@ Reverie's build does not name =Server= (D5b — its own dispatch over =ever.prot
   the field, so =FnInfo.params[1].type.?= needs no =@field= wrapper. The doubt came from this repository's own
   =build.zig=, whose comptime detection already names =run.addPassthruArgs= and =b.args= in arms that do not
   exist on the other toolchain and compiles on both.
-
+- 2026-08-13: Marked complete. Landed as =8a86581=, on origin, and verified at both ends by parties that could each run only one half — see the entry above for the dev.1441 result and the failing parent.

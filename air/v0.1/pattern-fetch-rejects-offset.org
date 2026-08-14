@@ -1,5 +1,5 @@
 #+title: A Pattern Fetch With a Topic-Local Offset Should Be Refused, Not Mis-Paged
-#+state: ready
+#+state: complete
 #+FILETAGS: :protocol:subscriber:cli:bug:
 
 * Summary
@@ -127,3 +127,4 @@ Nothing on Reverie's side either way; its folds never send =offset= with a patte
 - 2026-08-09 (later): One separable CLI line added under /Proposal/ on Reverie's round-10 blind review B4 — =--follow= stops honouring =--max= (default 100) once following — after that review found Reverie's documented operator line "follows indefinitely" false at =3991190c611e=; =handleSub= re-read at that commit. Worker =reverie-serve10=.
 - 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=. The per-topic semantics were first noted by Reverie's ever-fit-assessment (2026-08-07, "=--from 1= drops one event from /each/ topic", measured); the =sub --follow= consequence was reasoned from =main.zig= at this commit.
 - 2026-08-10: The =sub --follow= consequence reproduced with an older installed binary against a private store, transcript above — corroboration by an independent path, not a run of this commit.
+- 2026-08-13: Marked complete across three commits, all on origin. =7f65e4c6= refuses a nonzero topic-local offset on a pattern fetch at the server; =9d2a0b29= makes the CLI resume pattern follows by global offset and guards =--from > 0=; =6c4e74b4= documents the rule on =FetchRequest.offset= and in SKILL.md. Split that way because the three halves sat in files owned by different concurrent agents — the server half landed first and the other two were sequenced rather than dropped.

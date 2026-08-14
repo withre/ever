@@ -1,5 +1,5 @@
 #+title: sub --follow Should Follow Until Killed, as SKILL.md Already Promises
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:subscriber:bug:
 
 * Summary
@@ -51,3 +51,4 @@ Reverie's documents carry the =--max 4294967295= workaround meanwhile and would 
 
 * History
 - 2026-08-13: Split out of =pattern-fetch-rejects-offset.org= (where it was added 2026-08-09 on Reverie's round-10 blind review, B4) per [[file:../../../../reviews/upstream-ever-review.org][reviews/upstream-ever-review.org]] C4, and strengthened by the same review: ~SKILL.md:167~ read at =3991190c611e= and quoted above — the contradiction with the code is what turns this from ergonomics into a broken documented guarantee, the "visible half of a two-part guarantee" shape Ever's =implementation-guide.org= names at =6552ad3cc6c0=. =handleSub= re-read at =3991190c611e=. Worker =reverie-upfix=.
+- 2026-08-13: Marked complete. Landed as =aaed8d18=, on origin. =sub --follow= now runs until interrupted, with =--max= bounding only the initial batch, which is what SKILL.md:167 already promised. Negative-controlled: the test fails against the unfixed tree.

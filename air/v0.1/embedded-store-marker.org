@@ -1,5 +1,5 @@
 #+title: Expose ever.lock's Acquisition as a Library Call, and Keep the CLI Honouring It
-#+state: ready
+#+state: complete
 #+FILETAGS: :store:orchestrator:cli:bug:
 
 * Summary
@@ -110,3 +110,4 @@ Reverie takes the lock directly — =createFile("ever.lock", …)= + =flock(LOCK
 * History
 - 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e=. The failure sequence is Ever's own (=multi-process-access.org=), quoted; the "Piece 3 does not close it" argument is Reverie's (ever-fit-assessment row F, 2026-08-07); the fd-inheritance caution is from Reverie's =flock= experiments (multi-instance-and-fork T5a–c, 2026-08-04), run on Linux against the real primitive.
 - 2026-08-09: Shrunk and retitled after Reverie's round-9 review (blind B3) and its owner's D38 — proposed, pending his coordination with Ever: "It sounds like the Reverie to take ever.lock is one good solution, but I'm open to suggestions". The ask was ~ever start Must Refuse a Directory an Embedded Opener Holds~ with two shapes, (a) library =flock= under a flag and (b) a marker file; re-reading =startServer= at =3991190c611e= showed an embedder holding =ever.lock= itself is refused today (=flock= is symmetric), so (b) is withdrawn, the Interim becomes Reverie's direct =flock=, and what remains is (a) restated as its real value — an API in place of an imitated private convention — with a Motivation section on why the copy works and why it is not an interface, =Log.init= taking the lock /before/ =recover=, and one interlock test added. Worker =reverie-serve9=; nothing here has been seen by Ever.
+- 2026-08-13: Marked complete. Landed as =42ac1a3a=, on origin. The =ever.lock= flock moved out of =main.zig='s =startServer= and into =Log.init= behind =Config.exclusive=, so an embedder gets the guard by asking for it rather than by re-implementing eleven lines. Externally built at =0.17.0-dev.1441= as part of =faee4f4b=; the exclusive-path tests pass on both toolchains.

@@ -1,5 +1,5 @@
 #+title: Read Publish Payload from Stdin
-#+state: ready
+#+state: complete
 #+FILETAGS: :cli:publisher:
 
 * Summary
@@ -137,3 +137,4 @@ The argv form's own empty case (=ever pub t ''=) has the same invisibility probl
 * History
 - 2026-08-05: Drafted and promoted to ready. Requested by reverie with evidence from production use (quoting hazards, ARG_MAX, no piping) — see the Motivation section.
 - 2026-08-05: Amended before implementation completed. Empty stdin now errors instead of publishing an empty payload. Raised by reverie on the theory that an empty value is a deletion tombstone; re-derived at this tip, that specific mechanism does not apply (a tombstone needs the reserved key, and =ever pub= sends a null key), but the underlying concern is correct and the real defect is worse — empty-valued events are filtered from every read path, so the publish succeeds and is then invisible to all consumers. Also recorded the argv form as the deliberate escape hatch for the trailing-newline asymmetry.
+- 2026-08-13: Marked complete. Landed as =97f38abd=, on origin. =ever pub= takes its payload from stdin when DATA is absent or =-=; TTY refusal, one-trailing-newline strip on the stdin path only, empty-payload refusal evaluated *after* the strip, and an oversize error that reports the real size. Verified behaviourally against a live store across all eight cases in Testing, not only by the unit tests.

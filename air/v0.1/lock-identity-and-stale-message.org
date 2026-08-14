@@ -1,5 +1,5 @@
 #+title: The Held-Lock Message Should Name the Holder, Not Tell You to Delete the Lock
-#+state: ready
+#+state: complete
 #+FILETAGS: :orchestrator:cli:store:bug:
 
 * Summary
@@ -100,3 +100,4 @@ Nothing changes in Reverie's /code/. But one thing should be said plainly, becau
 * History
 - 2026-08-13: Two corrections on review ([[file:../../../../reviews/upstream-ever-review.org][reviews/upstream-ever-review.org]] C3, C5). The =/proc/locks= =describeLockHolder= moved out of the Proposal into an explicitly optional section — the reduced form (an =fstat=, a =stat=, a better sentence) is the ask, offered before being asked to shrink it. And /Interim, and if declined/ stops saying "nothing changes on Reverie's side": Reverie's own =ever-zig-library= concludes that D38 makes /more/ users meet the sentence this document exists to remove, which strengthens the ask and costs Ever nothing extra — the fix is unchanged. Worker =reverie-upfix=.
 - 2026-08-09: Drafted in withre/reverie (=upstream/ever/=) as Reverie's statement of the ask; not yet reviewed by Ever. Source read at ever =origin/main= =3991190c611e= (the message is at ~src/main.zig:1525~; Reverie's 2026-08-04 document cites it at ~:1026~ against an older base — same text). The lock table is Reverie's measurement (multi-instance-and-fork T2/T4/T5/T6, 2026-08-04, Linux); the =O_CLOEXEC= observation was of a running =ever start= that day. The =describeLockHolder= route via =/proc/locks= is proposed, not prototyped.
+- 2026-08-13: Marked complete. Landed as =faee4f4b=, on origin. The lock now checks identity — fstat the held fd, stat the path, refuse on inode mismatch — and the message names =fuser= as the way to find the holder instead of advising deletion. This closes the oldest thread of the session: the previous message told a user to =rm ever.lock=, and following it under a live holder was reproduced here as two stores writing one directory. Noted honestly in the code that =Io.File.Stat= does not expose the device at this std revision, so the inode alone catches every same-filesystem swap.

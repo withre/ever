@@ -1,5 +1,5 @@
 #+title: =Client= as a Library Citizen: No Printing, and Errors That Keep the Server's Code
-#+state: ready
+#+state: complete
 #+FILETAGS: :client:protocol:embedder:
 
 * Summary
@@ -194,4 +194,4 @@ diagnostic is correct; printing it from a library is not.
 
 The shape is the same as the fix above: the condition is real and worth reporting, so return or record it rather
 than printing it, and let the CLI decide whether a human sees it.
-
+- 2026-08-13: Marked complete. Landed as =ae65cab7=, on origin. =client.zig= now carries zero =std.debug.print=; server errors are mapped tag-by-tag from the protocol codes with =error.ServerError= as the fallback for an unknown code or an unparseable body, and =lastError()= returns ={code, message}=. The CLI prints, once, in =main.zig=. Asked for by Reverie and found independently here by an implementation agent that could not assert a rejection through the client API — two routes to one defect.
