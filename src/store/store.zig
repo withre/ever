@@ -99,10 +99,39 @@ const Segment = struct {
     }
 };
 
+/// Name of the advisory lock file `Config.exclusive` acquires in the data
+/// directory. `ever status` probes it (status.zig `checkLockHeld`) and the
+/// CLI's data-dir listing special-cases it.
+pub const lock_file_name = "ever.lock";
+
 pub const Config = struct {
     max_segment_size: u64 = 64 * 1024 * 1024,
     sync_on_append: bool = true,
+    /// Take `ever.lock` (flock LOCK_EX|LOCK_NB) in `Log.init`, before any
+    /// segment is read, and hold it for the Log's lifetime. `ever start`
+    /// sets this; an embedder that is the sole writer of its directory
+    /// should too. Init fails with error.StoreLocked if another opener
+    /// holds it. The lock belongs to the open file description: it is
+    /// released when the Log is deinited or the process dies, and it is
+    /// inherited by a child that is forked without exec — createFile opens
+    /// O_CLOEXEC, so exec'd children (hooks) are safe.
+    exclusive: bool = false,
 };
+
+/// The store's exclusion primitive, in one place so the CLI and an embedder
+/// cannot drift apart: create-or-open `ever.lock` and take a non-blocking
+/// exclusive flock on it. The lock is held until the returned file is
+/// closed. (air/v0.1/embedded-store-marker.org)
+fn acquireLockFile(io: Io, dir: Dir) !File {
+    const lock_file = dir.createFile(io, lock_file_name, .{ .read = true, .truncate = false }) catch
+        return error.LockFileUnavailable;
+    errdefer lock_file.close(io);
+    const LOCK_EX = 2;
+    const LOCK_NB = 4;
+    if (std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB) != 0)
+        return error.StoreLocked;
+    return lock_file;
+}
 
 /// Shared append-only log. Thread-safe for appends.
 pub const Log = struct {
@@ -115,6 +144,9 @@ pub const Log = struct {
     /// Blocking, not spinning. See the note on `TopicManager.mutex` and
     /// air/v0.1/store-blocking-locks.org.
     mutex: std.Io.Mutex = .init,
+    /// The flock on `ever.lock`, held when `config.exclusive` is set;
+    /// closing it (deinit) releases the lock.
+    lock_file: ?File = null,
 
     pub fn init(allocator: Allocator, io: Io, dir: Dir, config: Config) !Log {
         var log = Log{
@@ -124,6 +156,10 @@ pub const Log = struct {
             .config = config,
             .mutex = .init,
         };
+        // Exclusion comes first: a refused opener must never have read
+        // segment state it cannot trust.
+        if (config.exclusive) log.lock_file = try acquireLockFile(io, dir);
+        errdefer if (log.lock_file) |lf| lf.close(io);
         try log.recover();
         return log;
     }
@@ -131,6 +167,7 @@ pub const Log = struct {
     pub fn deinit(self: *Log) void {
         for (self.segments.items) |*seg| seg.deinit(self.allocator, self.io);
         self.segments.deinit(self.allocator);
+        if (self.lock_file) |lf| lf.close(self.io);
     }
 
     /// Append an event. Thread-safe. Returns the global offset.
@@ -459,4 +496,55 @@ test "Log read non-existent offset returns null" {
     var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .max_segment_size = 4096, .sync_on_append = false });
     defer log.deinit();
     try std.testing.expectEqual(@as(?Event, null), try log.read(std.testing.allocator, 0));
+}
+
+// ── Config.exclusive (air/v0.1/embedded-store-marker.org) ───────────────────
+//
+// flock attaches to the open file description, so two opens in one process
+// contend exactly as two processes do — these tests need no subprocess.
+
+test "Log exclusive: a second exclusive opener is refused until the first releases" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true });
+    try std.testing.expectError(error.StoreLocked, Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true }));
+    log.deinit();
+
+    // deinit closed the lock file, which released the flock: takable again.
+    var log2 = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true });
+    log2.deinit();
+}
+
+test "Log without exclusive: two openers still succeed" {
+    // Default false keeps every existing library caller's behaviour — and
+    // keeps the unsafe two-opener case reachable for the future shared mode
+    // (multi-process-access.org).
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var a = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer a.deinit();
+    var b = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer b.deinit();
+}
+
+test "Log exclusive: interlocks with a hand-rolled ever.lock holder" {
+    // The interim an embedder runs today: flock `ever.lock` by name, no
+    // Config field. This test fails the day the convention moves (filename,
+    // primitive, or flag) — which is the point of having it in Ever's tree
+    // rather than only in an embedder's.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const holder = try tmp.dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false });
+    defer holder.close(io);
+    const LOCK_EX = 2;
+    const LOCK_NB = 4;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.flock(holder.handle, LOCK_EX | LOCK_NB));
+
+    try std.testing.expectError(error.StoreLocked, Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true }));
 }

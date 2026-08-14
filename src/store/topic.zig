@@ -68,6 +68,10 @@ fn validatePublishInput(key: ?[]const u8, value: []const u8) TopicError!void {
 pub const Config = struct {
     max_segment_size: u64 = 64 * 1024 * 1024,
     sync_on_append: bool = true,
+    /// Forwarded to `store.Config.exclusive`: take and hold `ever.lock` for
+    /// the store's lifetime, so no second opener — CLI or embedder — can
+    /// share the directory. See store.zig for the full contract.
+    exclusive: bool = false,
 };
 
 /// Information about a topic for listing purposes.
@@ -163,6 +167,7 @@ pub const TopicManager = struct {
         const log = try Log.init(allocator, io, dir, .{
             .max_segment_size = config.max_segment_size,
             .sync_on_append = config.sync_on_append,
+            .exclusive = config.exclusive,
         });
 
         var manager = TopicManager{

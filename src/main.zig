@@ -1612,18 +1612,15 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
         std.process.fatal("cannot open data directory '{s}'.", .{actual_data_dir});
     defer dir.close(io);
 
-    const lock_file = dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false }) catch
-        std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir});
-    defer lock_file.close(io);
-
-    const LOCK_EX = 2;
-    const LOCK_NB = 4;
-    const lock_result = std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB);
-    if (lock_result != 0) {
-        std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir});
-    }
-
-    var topic_manager = try ever.topic.TopicManager.init(allocator, io, dir, .{});
+    // The store's exclusion (the flock on ever.lock) lives in the library
+    // — Log.init under Config.exclusive — so an embedder gets the same
+    // interlock by setting one field instead of imitating a private
+    // convention of this file. (air/v0.1/embedded-store-marker.org)
+    var topic_manager = ever.topic.TopicManager.init(allocator, io, dir, .{ .exclusive = true }) catch |err| switch (err) {
+        error.StoreLocked => std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir}),
+        error.LockFileUnavailable => std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir}),
+        else => return err,
+    };
     defer topic_manager.deinit();
 
     var hook_table = try ever.hooks.HookTable.init(allocator, actual_data_dir);

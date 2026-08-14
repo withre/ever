@@ -872,3 +872,28 @@ test "getStatus end-to-end with real data" {
     // Verify lock is not held (no server running)
     try std.testing.expectEqual(false, status.lock_held);
 }
+
+test "lock_held: an exclusive library opener reads as held" {
+    // `ever status --data-dir` against a directory an embedder holds must
+    // report it held (air/v0.1/embedded-store-marker.org): checkLockHeld's
+    // probe fails against the library's flock exactly as against the CLI's.
+    const alloc = std.testing.allocator;
+    const test_io = std.testing.io;
+    const TopicManager = @import("topic.zig").TopicManager;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(alloc, test_io, tmp.dir, .{ .sync_on_append = false, .exclusive = true });
+    {
+        var held = try getStatusFromDirWithPath(alloc, test_io, tmp.dir, ".");
+        defer held.deinit(alloc);
+        try std.testing.expectEqual(true, held.lock_held);
+    }
+    tm.deinit();
+
+    // Released with the store: the probe acquires again.
+    var released = try getStatusFromDirWithPath(alloc, test_io, tmp.dir, ".");
+    defer released.deinit(alloc);
+    try std.testing.expectEqual(false, released.lock_held);
+}

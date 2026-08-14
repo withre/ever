@@ -1086,6 +1086,28 @@ test "integration: after_offset cursor over TCP round-trips displayed offsets" {
     }
 }
 
+// ── Exclusive opener (air/v0.1/embedded-store-marker.org) ───────────────────
+
+test "integration: exclusive TopicManager refuses a second opener" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true });
+    defer tm.deinit();
+    try tm.createTopic("excl.topic");
+    _ = try tm.publish("excl.topic", null, "e1");
+
+    // A second exclusive opener is refused — before it has read any
+    // segment state it cannot trust.
+    try testing.expectError(error.StoreLocked, TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true }));
+
+    // A non-exclusive opener still succeeds: default false keeps today's
+    // library behaviour reachable (multi-process-access.org's future
+    // shared mode), and keeps the exclusion something you ask for.
+    var tm2 = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    tm2.deinit();
+}
+
 // ── Pattern fetch refuses topic-local offsets ───────────────────────────────
 //
 // (air/v0.1/pattern-fetch-rejects-offset.org) `FetchRequest.offset` is a
