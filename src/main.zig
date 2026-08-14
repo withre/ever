@@ -1617,7 +1617,16 @@ fn startServer(allocator: std.mem.Allocator, io: Io, ctx: *const cli.Context, en
     // interlock by setting one field instead of imitating a private
     // convention of this file. (air/v0.1/embedded-store-marker.org)
     var topic_manager = ever.topic.TopicManager.init(allocator, io, dir, .{ .exclusive = true }) catch |err| switch (err) {
-        error.StoreLocked => std.process.fatal("another Ever store is already running on '{s}'. Remove ever.lock if stale.", .{actual_data_dir}),
+        // An advisory flock is released by the kernel when its last holder
+        // dies, so a held lock is a live process essentially always. The
+        // one thing this message must never do is suggest deleting
+        // ever.lock: under a live holder that starts a second store on the
+        // same data. (air/v0.1/lock-identity-and-stale-message.org)
+        error.StoreLocked => std.process.fatal("data directory '{s}' is held by a live process. An flock is released automatically when its holder exits, " ++
+            "so this is not a stale file: stop that process, or use `ever status --data-dir {s}` / `fuser {s}/ever.lock` to find it. " ++
+            "Do not delete ever.lock \u{2014} that starts a second store on the same data.", .{ actual_data_dir, actual_data_dir, actual_data_dir }),
+        error.LockFileVanished => std.process.fatal("ever.lock vanished after locking '{s}'; another process may hold the previous lock file. Refusing to start.", .{actual_data_dir}),
+        error.LockFileReplaced => std.process.fatal("ever.lock in '{s}' was replaced after locking; another process may hold the previous one. Refusing to start.", .{actual_data_dir}),
         error.LockFileUnavailable => std.process.fatal("cannot create lockfile in '{s}'.", .{actual_data_dir}),
         else => return err,
     };

@@ -130,7 +130,29 @@ fn acquireLockFile(io: Io, dir: Dir) !File {
     const LOCK_NB = 4;
     if (std.os.linux.flock(lock_file.handle, LOCK_EX | LOCK_NB) != 0)
         return error.StoreLocked;
+    try verifyLockFileIdentity(io, dir, lock_file);
     return lock_file;
+}
+
+/// After a successful flock, confirm the file we hold is still the file at
+/// the path. An flock is released by the kernel when its last holder dies,
+/// so a held lock is a live process essentially always — but anything that
+/// replaces `ever.lock` between a live holder's open and ours (a user
+/// following old "remove if stale" advice, a cleanup script, a restore from
+/// backup) leaves the holder locking an unlinked inode while the path names
+/// a fresh one, and both openers then pass every check they have and write
+/// one directory. fstat and stat agree on the inode iff nobody swapped the
+/// file in between; refusing on mismatch turns swap-then-start from silent
+/// corruption into an error, for two syscalls at init.
+/// (air/v0.1/lock-identity-and-stale-message.org)
+pub fn verifyLockFileIdentity(io: Io, dir: Dir, lock_file: File) !void {
+    const fd_st = try lock_file.stat(io);
+    const path_st = dir.statFile(io, lock_file_name, .{}) catch
+        return error.LockFileVanished;
+    // `Io.File.Stat` does not expose the device at this std revision; the
+    // inode alone still catches every same-filesystem swap.
+    if (fd_st.inode != path_st.inode)
+        return error.LockFileReplaced;
 }
 
 /// Shared append-only log. Thread-safe for appends.
@@ -547,4 +569,47 @@ test "Log exclusive: interlocks with a hand-rolled ever.lock holder" {
     try std.testing.expectEqual(@as(usize, 0), std.os.linux.flock(holder.handle, LOCK_EX | LOCK_NB));
 
     try std.testing.expectError(error.StoreLocked, Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true }));
+}
+
+test "verifyLockFileIdentity: detects a lock file swapped under a live holder" {
+    // The deterministic form of reverie's T4: hold the fd, unlink and
+    // recreate the path from outside, run the check on the stale fd. The
+    // old inode stays alive while our fd holds it, so the recreated file
+    // cannot reuse its number.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const held = try tmp.dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false });
+    defer held.close(io);
+    const LOCK_EX = 2;
+    const LOCK_NB = 4;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.flock(held.handle, LOCK_EX | LOCK_NB));
+
+    // Intact: fd and path name the same inode.
+    try verifyLockFileIdentity(io, tmp.dir, held);
+
+    // Deleted: the path no longer resolves.
+    try tmp.dir.deleteFile(io, "ever.lock");
+    try std.testing.expectError(error.LockFileVanished, verifyLockFileIdentity(io, tmp.dir, held));
+
+    // Recreated: the path resolves to a different inode than the one we
+    // locked — the two-stores-on-one-directory state, caught.
+    const replacement = try tmp.dir.createFile(io, "ever.lock", .{ .read = true, .truncate = false });
+    defer replacement.close(io);
+    try std.testing.expectError(error.LockFileReplaced, verifyLockFileIdentity(io, tmp.dir, held));
+}
+
+test "Log exclusive: the identity check does not false-positive on a healthy init" {
+    // The swap itself can only be injected between flock and check, which
+    // has no test hook; the deterministic detection test above runs the
+    // check on a stale fd directly. What the composed path must guarantee
+    // is the other direction: an ordinary exclusive init passes its own
+    // wired-in identity check.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false, .exclusive = true });
+    log.deinit();
 }
