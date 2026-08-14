@@ -207,3 +207,15 @@ Promoted to its own document: see =air/v0.1/executor-attached-signal.org= (state
 
 * History
 - 2026-08-05: Drafted. Direction set by the owner: loosen or make the locking configurable, allow multiple readers and writers where the topology is clear, and let library and CLI entrypoints differ. Answers the "why not persist the index" question in the Motivation. Kept as draft because the refresh trigger and the =ever.lock= semantics are unresolved; the three pieces are separable and Piece 1 is well-defined enough to implement first.
+- 2026-08-13: Substantially revised through review with a consumer, still =draft= and still unowned. Four changes worth naming, because the document a reader meets now argues differently from the one first drafted.
+
+  *Piece 3 was wrong as written.* It proposed a per-process config field. That cannot work: the two parties never negotiate, =ever start= takes the flock and the library takes none, so a flag held by the party that does not lock cannot influence the one that does. Shared mode is a property of the *directory*, and an exclusive-mode start must refuse.
+
+  *Layer 3 is not the same problem as layers 1 and 2.* It was filed as a third staleness case, which implied refresh would fix it. It is a *lost update* over a whole-document rewrite, and =updateCursor= calls =saveLocked= on every cursor advance from a table loaded once at init — so the erasure is what the system does when it is working correctly, not a race a shorter window narrows. The remedy is an ownership rule, and =HookTable.init= is the operation that claims it.
+
+  *The refresh spans two layers, not one*, and the =TopicManager= half carries tombstone detection — so a =Log=-only refresh picks up another process's records while never noticing one of them deleted a topic.
+
+  *Piece 2's cost argument is conditional and now names what will invalidate it*: it holds only while =sync_on_append= is a per-append fsync, and =log-group-commit.org= is already =ready= and measured.
+
+  Also recorded: the one named external consumer has withdrawn, which removes demand and not motivation — the hooks-on-an-embedded-store failure is Ever's own and unchanged by who else wanted it fixed.
+
