@@ -2222,10 +2222,13 @@ test "integration: stop returns within the drain bound with an idle client" {
 
     // An idle connection cannot be read out from under its handler, so this
     // waits out the 5s drain by design. The assertion is that `shutdown()`
-    // *returns*, not that it returns fast. The suite therefore prints
-    // "Shutdown: 1 connections did not drain within 5s." here on success;
-    // that line is this test working, not a failure.
+    // *returns*, not that it returns fast.
     try testing.expect(elapsed_ms < 8000);
+
+    // The expired drain is a real condition, and the library's whole report
+    // of it is this value — recorded, never printed, because `Server` is
+    // library API (air/v0.1/client-as-library-citizen.org, "Follow-on").
+    try testing.expectEqual(@as(u32, 1), ts.server.undrainedConnections());
 
     // Close the client before the server is freed: its handler thread writes
     // to `active_connections` until its socket goes away, and closing alone
@@ -2235,6 +2238,9 @@ test "integration: stop returns within the drain bound with an idle client" {
     client.deinit();
     ts.thread.join();
     ts.server.shutdown();
+    // Each shutdown records its own drain result: this one, with the client
+    // gone, drains clean and overwrites the 1 above.
+    try testing.expectEqual(@as(u32, 0), ts.server.undrainedConnections());
     ts.release();
 }
 
@@ -2263,7 +2269,7 @@ test "integration: the signal path still stops the server" {
     // The CLI's stop sequence: the handler returns the accept loop, `run()`
     // exits, and only then does main call `shutdown()` to drain. Moving the
     // self-connect into `shutdown()` must not have cost the handler its own
-    // route out — it cannot call `shutdown()`, which sleeps and prints.
+    // route out — it cannot call `shutdown()`, which sleeps while draining.
     try std.posix.raise(.TERM);
     ts.thread.join();
     ts.server.shutdown();

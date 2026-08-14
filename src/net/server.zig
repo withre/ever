@@ -63,6 +63,9 @@ pub const Server = struct {
     /// running loop is a use-after-free rather than a cancellation.
     accept_loop_active: std.atomic.Value(bool),
     active_connections: std.atomic.Value(u32),
+    /// Connections still open when the most recent `shutdown()` stopped
+    /// waiting — see `undrainedConnections()`.
+    undrained_connections: std.atomic.Value(u32),
     /// Milliseconds since epoch at `init` — used to compute status uptime.
     start_time: i64,
 
@@ -82,6 +85,7 @@ pub const Server = struct {
             .shutdown_requested = std.atomic.Value(bool).init(false),
             .accept_loop_active = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(u32).init(0),
+            .undrained_connections = std.atomic.Value(u32).init(0),
             .start_time = getMilliTimestamp(),
         };
     }
@@ -238,6 +242,8 @@ pub const Server = struct {
 
     /// Signal the server to stop accepting connections, close the listener,
     /// and wait for in-flight connections to drain (up to 5 seconds).
+    /// Connections that outlast the bound are counted, not printed —
+    /// `undrainedConnections()` reports them.
     ///
     /// Safe to call from any thread, and the accept loop is guaranteed to
     /// return — so the caller may join the thread running `run()`.
@@ -273,10 +279,21 @@ pub const Server = struct {
             _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 100_000_000 }, null); // 100ms
             waited_ms += 100;
         }
-        const remaining = self.active_connections.load(.acquire);
-        if (remaining > 0) {
-            std.debug.print("Shutdown: {d} connections did not drain within 5s.\n", .{remaining});
-        }
+        // Record, don't print: an idle connection cannot be read out from
+        // under its handler, so an expired drain is a real condition worth
+        // reporting — but `Server` is library API, and whether a human sees
+        // it is the caller's decision, not this file's.
+        // (air/v0.1/client-as-library-citizen.org, "Follow-on".)
+        self.undrained_connections.store(self.active_connections.load(.acquire), .release);
+    }
+
+    /// The number of connections the most recent `shutdown()` left open when
+    /// its 5s drain bound expired — 0 after a clean drain, and before any
+    /// shutdown. Recorded rather than printed: `Server` is exported through
+    /// root.zig exactly as `Client` is, so the condition reaches the embedder
+    /// as a value and the CLI decides whether a human sees it.
+    pub fn undrainedConnections(self: *const Server) u32 {
+        return self.undrained_connections.load(.acquire);
     }
 
     fn handleConnection(self: *Server, stream: net.Stream) void {
@@ -1022,8 +1039,8 @@ fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
         // connect()+close() are async-signal-safe. The accept loop will
         // see shutdown_requested and break out cleanly. The handler no
         // longer owns that mechanism — it shares `shutdown()`'s — but it
-        // still cannot call `shutdown()` itself, which sleeps and prints
-        // while draining.
+        // still cannot call `shutdown()` itself, which sleeps while
+        // draining.
         s.unblockAccept();
     }
 }
@@ -1050,6 +1067,16 @@ fn sendError(allocator: Allocator, fd: std.posix.fd_t, code: u16, message: []con
     const body = try protocol.encodeBody(allocator, protocol.ErrorResponse{ .code = code, .message = message });
     defer allocator.free(body);
     try protocol.writeFrame(fd, .error_response, body);
+}
+
+test "library citizenship: server.zig never writes to a standard stream" {
+    // `ever.net.Server` is exported through root.zig exactly as `Client` is;
+    // a library that prints to a caller's stderr is the defect
+    // air/v0.1/client-as-library-citizen.org exists to remove ("Follow-on:
+    // Server has the same defect"). The needle is split so this test does
+    // not count itself.
+    const needle = "std.debug" ++ ".print";
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, @embedFile("server.zig"), needle));
 }
 
 test "Server init and deinit" {
