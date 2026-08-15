@@ -4,7 +4,11 @@
 //! Each event record includes its topic name. Topics are a logical
 //! concept backed by an in-memory index, not separate files.
 //!
-//! Thread-safe: a mutex serializes all writes.
+//! Thread-safe: a mutex serializes all writes. With `sync_on_append` the
+//! fsync is NOT performed under that mutex: appenders that arrive while a
+//! sync is in flight queue their records and share the next sync (group
+//! commit, air/v0.1/log-group-commit.org). Every record is still durable
+//! before its offset is returned.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -166,6 +170,34 @@ pub const Log = struct {
     /// Blocking, not spinning. See the note on `TopicManager.mutex` and
     /// air/v0.1/store-blocking-locks.org.
     mutex: std.Io.Mutex = .init,
+    /// Group commit state (air/v0.1/log-group-commit.org), all guarded by
+    /// `mutex`. `synced_watermark` counts in global offsets: every record
+    /// with `offset < synced_watermark` has been covered by a completed
+    /// fsync issued after its write. Monotonic — the one correctness rule
+    /// of the design is that an appender compares its own end-offset
+    /// (`offset + 1`) against this watermark, never against "some sync
+    /// finished", because a sync that started before the record was
+    /// written proves nothing about it. Only meaningful when
+    /// `config.sync_on_append` is set.
+    synced_watermark: u64 = 0,
+    /// True while a leader appender is fsyncing outside the mutex. At most
+    /// one sync is in flight at a time; appenders that find this set park
+    /// on `sync_cond` and re-check the watermark when woken.
+    sync_leader_active: bool = false,
+    sync_cond: std.Io.Condition = .init,
+    /// Test-only: fsyncs issued by `append` (leader or rotation), mutated
+    /// under `mutex`, read after joining the threads that appended. Lets a
+    /// test assert "one fsync covered more than one append" without timing
+    /// anything.
+    test_sync_count: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Test-only: artificial delay (ns) before each leader fsync, widening
+    /// the window in which followers queue so batches form deterministically.
+    test_sync_delay_ns: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Test-only: incremented when a leader elects itself while a
+    /// non-active segment still holds unsynced records. The rotation-time
+    /// sync exists to make this impossible — a leader in that state would
+    /// fsync the wrong file and then claim those records durable.
+    test_stale_leader_count: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     /// The flock on `ever.lock`, held when `config.exclusive` is set;
     /// closing it (deinit) releases the lock.
     lock_file: ?File = null,
@@ -183,6 +215,10 @@ pub const Log = struct {
         if (config.exclusive) log.lock_file = try acquireLockFile(io, dir);
         errdefer if (log.lock_file) |lf| lf.close(io);
         try log.recover();
+        // Recovery trusts what it reads off disk, so the durability
+        // watermark starts past it: the first append must not think it
+        // owes a sync for records it never wrote.
+        log.synced_watermark = log.next_offset;
         return log;
     }
 
@@ -193,10 +229,84 @@ pub const Log = struct {
     }
 
     /// Append an event. Thread-safe. Returns the global offset.
+    ///
+    /// With `sync_on_append`, the record is durable before the offset is
+    /// returned, but the mutex is not held across the fsync that makes it
+    /// so. The first appender to need a sync becomes the *leader* and
+    /// fsyncs outside the lock; appenders that arrive meanwhile write their
+    /// records under the lock and wait, and the next sync covers them all
+    /// at once (group commit, air/v0.1/log-group-commit.org). An appender
+    /// that arrives alone syncs immediately — nobody ever waits for a
+    /// batch to form.
     pub fn append(self: *Log, topic: []const u8, key: ?[]const u8, value: []const u8) !u64 {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
 
+        const offset = self.appendLocked(topic, key, value) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+
+        if (!self.config.sync_on_append) {
+            self.mutex.unlock(self.io);
+            return offset;
+        }
+
+        const my_end = offset + 1;
+        while (self.synced_watermark < my_end) {
+            if (self.sync_leader_active) {
+                // A sync is in flight, but it may have started before our
+                // record was written, so its completion proves nothing
+                // about us: park and re-check the watermark. Condition
+                // wakeups are a re-check loop, never a delivery.
+                self.sync_cond.waitUncancelable(self.io, &self.mutex);
+                continue;
+            }
+            // Become the leader for everything written so far. `target` is
+            // captured under the mutex after all those writes completed,
+            // so the fsync below is ordered after them and covers them.
+            // The file handle is copied out because the segment list may
+            // grow (rotation) while the mutex is released; rotation keeps
+            // unsynced records confined to the active segment, so this one
+            // file is always the right one to sync.
+            self.sync_leader_active = true;
+            const target = self.next_offset;
+            const file = self.activeSegment().file;
+            if (builtin.is_test) {
+                self.test_sync_count += 1;
+                if (self.synced_watermark < self.activeSegment().base_offset)
+                    self.test_stale_leader_count += 1;
+            }
+            self.mutex.unlock(self.io);
+            self.testSyncDelay();
+            // A failed sync is discarded exactly as it was when it ran
+            // under the mutex; reporting it belongs to
+            // air/v0.1/sync-failure-reporting.org — noting that group
+            // commit raises the stakes, since one failure now covers every
+            // record in (watermark, target], not one caller's.
+            file.sync(self.io) catch {};
+            self.mutex.lockUncancelable(self.io);
+            self.sync_leader_active = false;
+            if (target > self.synced_watermark) self.synced_watermark = target;
+            self.mutex.unlock(self.io);
+            // Wake followers whether or not the watermark moved: some may
+            // be waiting only for the leader slot so one of them can take
+            // over. Outside the lock, like TopicManager's append_cond —
+            // the Condition's epoch keeps an about-to-park waiter from
+            // sleeping through it.
+            self.sync_cond.broadcast(self.io);
+            // `target >= my_end` always: it was captured after our own
+            // write, so the sync we just did covers us.
+            return offset;
+        }
+        self.mutex.unlock(self.io);
+        return offset;
+    }
+
+    /// The write half of `append`: encode and write the record, index it,
+    /// advance `next_offset`. Caller holds `mutex`. Does not sync — with
+    /// `sync_on_append` that happens in `append`'s group-commit phase,
+    /// outside the lock.
+    fn appendLocked(self: *Log, topic: []const u8, key: ?[]const u8, value: []const u8) !u64 {
         const offset = self.next_offset;
         const event = Event{
             .offset = offset,
@@ -210,6 +320,22 @@ pub const Log = struct {
         if (self.segments.items.len == 0 or
             self.activeSegment().size + rec_size > self.config.max_segment_size)
         {
+            // Group commit's file invariant: records above
+            // `synced_watermark` live only in the active segment, so a
+            // sync leader has exactly one file to fsync. Rotating with
+            // unsynced records in the outgoing segment would break that —
+            // a later leader would sync the new file and then claim
+            // records sitting unsynced in the old one — so sync it before
+            // switching. Under the mutex, but rotation happens once per
+            // `max_segment_size` bytes, not once per append.
+            if (self.config.sync_on_append and self.segments.items.len != 0 and
+                self.synced_watermark < self.next_offset)
+            {
+                if (builtin.is_test) self.test_sync_count += 1;
+                self.activeSegment().file.sync(self.io) catch {};
+                self.synced_watermark = self.next_offset;
+                self.sync_cond.broadcast(self.io);
+            }
             try self.createSegment(offset);
         }
 
@@ -231,8 +357,6 @@ pub const Log = struct {
             return err;
         };
 
-        if (self.config.sync_on_append) seg.file.sync(self.io) catch {};
-
         seg.size += rec_size;
         self.next_offset = offset + 1;
         return offset;
@@ -247,6 +371,19 @@ pub const Log = struct {
 
     inline fn countRead(n: usize) void {
         if (builtin.is_test) test_read_count += n;
+    }
+
+    /// Test-only slow-device simulation for the leader fsync. A no-op in
+    /// production builds and when `test_sync_delay_ns` is zero.
+    inline fn testSyncDelay(self: *const Log) void {
+        if (builtin.is_test) {
+            if (self.test_sync_delay_ns != 0) {
+                _ = std.os.linux.nanosleep(&.{
+                    .sec = @intCast(self.test_sync_delay_ns / 1_000_000_000),
+                    .nsec = @intCast(self.test_sync_delay_ns % 1_000_000_000),
+                }, null);
+            }
+        }
     }
 
     /// Read a single event by global offset. Returns null if not found.
