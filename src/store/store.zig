@@ -4,11 +4,15 @@
 //! Each event record includes its topic name. Topics are a logical
 //! concept backed by an in-memory index, not separate files.
 //!
-//! Thread-safe: a mutex serializes all writes. With `sync_on_append` the
-//! fsync is NOT performed under that mutex: appenders that arrive while a
-//! sync is in flight queue their records and share the next sync (group
-//! commit, air/v0.1/log-group-commit.org). Every record is still durable
-//! before its offset is returned.
+//! Thread-safe: a mutex serializes all writes, and readers snapshot the
+//! index state they need under that same mutex before touching the disk
+//! (air/v0.1/log-read-append-serialization.org) — so reads and appends
+//! interleave at snapshot granularity, and neither ever observes the
+//! other's in-flight mutation. With `sync_on_append` the fsync is NOT
+//! performed under the mutex: appenders that arrive while a sync is in
+//! flight queue their records and share the next sync (group commit,
+//! air/v0.1/log-group-commit.org). Every record is still durable before
+//! its offset is returned.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -159,7 +163,7 @@ pub fn verifyLockFileIdentity(io: Io, dir: Dir, lock_file: File) !void {
         return error.LockFileReplaced;
 }
 
-/// Shared append-only log. Thread-safe for appends.
+/// Shared append-only log. Thread-safe for appends and reads.
 pub const Log = struct {
     allocator: Allocator,
     io: Io,
@@ -203,6 +207,17 @@ pub const Log = struct {
     /// sync exists to make this impossible — a leader in that state would
     /// fsync the wrong file and then claim those records durable.
     test_stale_leader_count: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Test-only: while set, `readBatch` parks between taking its
+    /// positions snapshot (under `mutex`) and reading the file (outside
+    /// it), so a test can prove a writer gets through *while* a read is in
+    /// flight instead of asserting on wall-clock latency
+    /// (air/v0.1/log-read-append-serialization.org).
+    test_read_hold: if (builtin.is_test) std.atomic.Value(bool) else void =
+        if (builtin.is_test) .init(false) else {},
+    /// Test-only: true while a reader is parked on `test_read_hold` — the
+    /// signal that the read is inside its disk phase and holds no lock.
+    test_read_parked: if (builtin.is_test) std.atomic.Value(bool) else void =
+        if (builtin.is_test) .init(false) else {},
     /// The flock on `ever.lock`, held when `config.exclusive` is set;
     /// closing it (deinit) releases the lock.
     lock_file: ?File = null,
@@ -395,49 +410,94 @@ pub const Log = struct {
         }
     }
 
-    /// Read a single event by global offset. Returns null if not found.
-    /// NOT thread-safe on its own — caller must serialize with appends
-    /// (e.g., via TopicManager's mutex).
-    pub fn read(self: *Log, allocator: Allocator, offset: u64) !?Event {
-        countRead(1);
-        if (offset >= self.next_offset) return null;
-        const seg = self.findSegmentForOffset(offset) orelse return null;
-        const local_idx = offset - seg.base_offset;
-        if (local_idx >= seg.positions.items.len) return null;
-        return try self.readEventAt(allocator, seg, seg.positions.items[@intCast(local_idx)]);
+    /// Test-only gate between a read's snapshot and its disk phase; see
+    /// `test_read_hold`. A no-op in production builds.
+    inline fn testReadHold(self: *Log) void {
+        if (builtin.is_test) {
+            if (self.test_read_hold.load(.acquire)) {
+                self.test_read_parked.store(true, .release);
+                while (self.test_read_hold.load(.acquire))
+                    _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+                self.test_read_parked.store(false, .release);
+            }
+        }
     }
 
-    /// Read a batch of events by global offset range.
-    /// NOT thread-safe on its own — caller must serialize with appends
-    /// (e.g., via TopicManager's mutex).
+    /// Where a record lives: which file, and at what byte position. What a
+    /// reader snapshots under `mutex` so the disk I/O can happen outside
+    /// it. Both fields stay valid after the lock is released: segment files
+    /// are only closed in `deinit`, positions never move once written, and
+    /// appends only ever extend — a snapshot is a prefix of the log, safe
+    /// by construction (air/v0.1/log-read-append-serialization.org).
+    const RecordRef = struct { file: File, pos: u64 };
+
+    /// Read a single event by global offset. Returns null if not found.
+    /// Thread-safe: the segment lookup is done under `mutex`, the disk read
+    /// outside it.
+    pub fn read(self: *Log, allocator: Allocator, offset: u64) !?Event {
+        const maybe_ref: ?RecordRef = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            countRead(1);
+            if (offset >= self.next_offset) break :blk null;
+            const seg = self.findSegmentForOffset(offset) orelse break :blk null;
+            const local_idx = offset - seg.base_offset;
+            if (local_idx >= seg.positions.items.len) break :blk null;
+            break :blk .{ .file = seg.file, .pos = seg.positions.items[@intCast(local_idx)] };
+        };
+        const ref = maybe_ref orelse return null;
+        return try self.readEventAt(allocator, ref);
+    }
+
+    /// Read a batch of events by global offset range. Thread-safe: the
+    /// positions to read are snapshotted under `mutex`, then the files are
+    /// read outside it, so appenders wait for a bounded copy rather than
+    /// for the scan's disk I/O. One call sees a consistent prefix of the
+    /// log: records appended after the snapshot are the next call's to
+    /// find.
     pub fn readBatch(self: *Log, allocator: Allocator, start_offset: u64, max_count: u32) ![]Event {
+        var refs: std.ArrayList(RecordRef) = .empty;
+        defer refs.deinit(allocator);
+
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var offset = start_offset;
+            var remaining: u32 = max_count;
+            while (remaining > 0 and offset < self.next_offset) {
+                const seg = self.findSegmentForOffset(offset) orelse break;
+                const local_start = offset - seg.base_offset;
+                const available = seg.eventCount() - local_start;
+                const to_read: u64 = @min(available, remaining);
+
+                countRead(@intCast(to_read));
+                try refs.ensureUnusedCapacity(allocator, @intCast(to_read));
+                for (0..to_read) |i| refs.appendAssumeCapacity(.{
+                    .file = seg.file,
+                    .pos = seg.positions.items[@intCast(local_start + i)],
+                });
+                offset += to_read;
+                remaining -= @intCast(to_read);
+            }
+        }
+
+        self.testReadHold();
+
         var events: std.ArrayList(Event) = .empty;
         errdefer {
             for (events.items) |evt| freeEvent(allocator, evt);
             events.deinit(allocator);
         }
-
-        var offset = start_offset;
-        var remaining: u32 = max_count;
-        while (remaining > 0 and offset < self.next_offset) {
-            const seg = self.findSegmentForOffset(offset) orelse break;
-            const local_start = offset - seg.base_offset;
-            const available = seg.eventCount() - local_start;
-            const to_read: u64 = @min(available, remaining);
-
-            countRead(@intCast(to_read));
-            for (0..to_read) |i| {
-                const event = try self.readEventAt(allocator, seg, seg.positions.items[@intCast(local_start + i)]);
-                errdefer freeEvent(allocator, event);
-                try events.append(allocator, event);
-            }
-            offset += to_read;
-            remaining -= @intCast(to_read);
-        }
+        try events.ensureTotalCapacity(allocator, refs.items.len);
+        for (refs.items) |ref| events.appendAssumeCapacity(try self.readEventAt(allocator, ref));
         return events.toOwnedSlice(allocator);
     }
 
-    pub fn nextOffset(self: *const Log) u64 {
+    /// Thread-safe. The head only grows, so the returned value is a valid
+    /// (possibly stale) lower bound of the log's next offset.
+    pub fn nextOffset(self: *Log) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.next_offset;
     }
 
@@ -463,9 +523,16 @@ pub const Log = struct {
         return &self.segments.items[lo - 1];
     }
 
-    fn readEventAt(self: *Log, allocator: Allocator, seg: *const Segment, file_pos: u64) !Event {
+    /// Read one record off disk from a snapshotted `RecordRef`. Called
+    /// WITHOUT `mutex` held: concurrent appends write disjoint byte ranges
+    /// (positional I/O on the same handle is safe), and the record at a
+    /// snapshotted position was fully written before the snapshot was
+    /// taken — appendLocked completes the write under the mutex before the
+    /// position becomes visible.
+    fn readEventAt(self: *Log, allocator: Allocator, ref: RecordRef) !Event {
+        const file_pos = ref.pos;
         var header_buf: [Event.header_size]u8 = undefined;
-        const hdr_read = seg.file.readPositionalAll(self.io, &header_buf, file_pos) catch return error.CorruptRecord;
+        const hdr_read = ref.file.readPositionalAll(self.io, &header_buf, file_pos) catch return error.CorruptRecord;
         if (hdr_read < Event.header_size) return error.CorruptRecord;
 
         const payload_size = Event.recordSizeFromHeader(&header_buf) - Event.header_size;
@@ -473,7 +540,7 @@ pub const Log = struct {
         errdefer allocator.free(payload);
 
         if (payload_size > 0) {
-            const n = seg.file.readPositionalAll(self.io, payload, file_pos + Event.header_size) catch {
+            const n = ref.file.readPositionalAll(self.io, payload, file_pos + Event.header_size) catch {
                 allocator.free(payload);
                 return error.CorruptRecord;
             };
@@ -921,6 +988,70 @@ test "Log group commit: rotation mid-batch keeps the guarantee" {
     try std.testing.expectEqual(@as(u64, 0), log.test_stale_leader_count);
 
     // And the records all landed, across every segment.
+    const events = try log.readBatch(std.testing.allocator, 0, total);
+    defer { for (events) |e| freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, total), events.len);
+}
+
+// ── Read/append serialization (air/v0.1/log-read-append-serialization.org) ──
+
+const RaceAppender = struct {
+    log: *Log,
+    count: usize,
+    done: std.atomic.Value(bool) = .init(false),
+    ok: bool = false,
+
+    fn run(self: *RaceAppender) void {
+        defer self.done.store(true, .release);
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            _ = self.log.append("race.topic", null, "payload") catch return;
+        }
+        self.ok = true;
+    }
+};
+
+test "Log readBatch and read are safe against concurrent appends" {
+    // The defect this guards (air/v0.1/log-read-append-serialization.org):
+    // readBatch indexed seg.positions.items with no lock against append's
+    // reallocation of that array — a segfault in Debug, ReleaseSafe and
+    // ReleaseFast. Both read paths now walk the index only under Log.mutex
+    // and touch the disk outside it. This hammers the pair and asserts
+    // every batch is a clean, contiguous prefix of the log — pre-fix it
+    // crashes or returns error.CorruptRecord within seconds.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // Segments small enough to rotate under the reader, so the growing
+    // segment *list* (not just the positions array) is exercised too.
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .max_segment_size = 64 * 1024, .sync_on_append = false });
+    defer log.deinit();
+
+    const total = 20_000;
+    var appender = RaceAppender{ .log = &log, .count = total };
+    const t = try std.Thread.spawn(.{}, RaceAppender.run, .{&appender});
+
+    var start: u64 = 0;
+    while (!appender.done.load(.acquire)) {
+        const events = try log.readBatch(std.testing.allocator, start, 64);
+        defer { for (events) |e| freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+        for (events, 0..) |e, i| {
+            try std.testing.expectEqual(start + i, e.offset);
+            try std.testing.expectEqualStrings("race.topic", e.topic);
+            try std.testing.expectEqualStrings("payload", e.value);
+        }
+        // The single-record path takes the same snapshot; keep it hot too.
+        if (try log.read(std.testing.allocator, start)) |e| {
+            defer freeEvent(std.testing.allocator, e);
+            try std.testing.expectEqual(start, e.offset);
+        }
+        start = if (events.len == 0) 0 else (start + events.len) % total;
+    }
+    t.join();
+    try std.testing.expect(appender.ok);
+    try std.testing.expectEqual(@as(u64, total), log.nextOffset());
+
+    // The settled log reads back whole.
     const events = try log.readBatch(std.testing.allocator, 0, total);
     defer { for (events) |e| freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
     try std.testing.expectEqual(@as(usize, total), events.len);

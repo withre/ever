@@ -1867,15 +1867,13 @@ test "unit: the blocking-fetch rescan loop is O(new events) across wakes" {
     // examined — a server that rescans from the request's after_offset
     // pays the whole range again on every wake.
     //
-    // Deliberately NOT end-to-end: the faithful shape — a second thread
-    // publishing against a parked fetch — trips the pre-existing
-    // readBatch/append race (publish appends under the Log mutex only,
-    // scans read under the manager mutex), which errored the fetch and
-    // failed the suite about once in fifty runs for a reason unrelated to
-    // the property under test. That race is log-read-append-serialization.org's
-    // to fix; the end-to-end version of this test returns when that lands.
-    // The wire half of the watermark is covered by the quiet-subscriber
-    // and round-trip tests above, which never publish during a scan.
+    // Deliberately single-threaded, so the read-count assertion below is
+    // exact: the faithful shape — a second thread publishing against a
+    // parked fetch — used to trip the readBatch/append race, and now that
+    // log-read-append-serialization.org fixed it, that shape lives as its
+    // own end-to-end test ("a pattern subscriber never misses or doubles
+    // a match", below). This one keeps the O(new events) cost claim, which
+    // only a quiet log can state exactly.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1919,6 +1917,237 @@ test "unit: the blocking-fetch rescan loop is O(new events) across wakes" {
     try testing.expectEqual(g_match, found.events[0].offset);
     try testing.expectEqual(g_match + 1, found.watermark);
     try testing.expect(ever.store.Log.test_read_count <= 8);
+}
+
+// ── Log read/append serialization (air/v0.1/log-read-append-serialization.org) ──
+//
+// The defect: fetchPatternByOffset held TopicManager.mutex while readBatch
+// indexed seg.positions.items, and Log.append — under a *different* lock —
+// reallocated that array: a segfault in all three optimisation modes, and a
+// write stall for the length of every scan. The fix moves the serialization
+// into the Log (positions snapshotted under Log.mutex, disk I/O outside it)
+// and drops the manager lock from the scan paths. These tests are the
+// spec's negative controls: on the pre-fix tree the first two crash or
+// error within seconds (observed: SIGABRT on the first or second run).
+
+const RacePublisher = struct {
+    tm: *TopicManager,
+    count: usize,
+    done: std.atomic.Value(bool) = .init(false),
+    ok: bool = false,
+
+    fn run(self: *RacePublisher) void {
+        defer self.done.store(true, .release);
+        var n: usize = 0;
+        while (n < self.count) : (n += 1) {
+            _ = self.tm.publish("noise.stream", null, "x") catch return;
+        }
+        self.ok = true;
+    }
+};
+
+test "unit: pattern rescans against a live publisher tear nothing" {
+    // The blocking-fetch traffic shape that reproduced the race at 7
+    // failures in 40 runs plus one hang: a quiet pattern subscriber
+    // rescanning from its carried watermark while a publisher appends.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("noise.stream");
+    try tm.createTopic("quiet.stream");
+
+    var publisher = RacePublisher{ .tm = &tm, .count = 30_000 };
+    const t = try std.Thread.spawn(.{}, RacePublisher.run, .{&publisher});
+
+    var watermark: u64 = 0;
+    while (!publisher.done.load(.acquire)) {
+        const scan = try tm.fetchPatternByOffset(allocator, "quiet.", watermark, 16);
+        defer freeEvents(scan.events);
+        // Nothing ever publishes to quiet.*: a delivered event here is a
+        // torn read that happened to decode.
+        try testing.expectEqual(@as(usize, 0), scan.events.len);
+        try testing.expect(scan.watermark >= watermark);
+        watermark = scan.watermark;
+    }
+    t.join();
+    try testing.expect(publisher.ok);
+
+    // The settled log holds every publish, each examined exactly once by a
+    // resumed scan.
+    try testing.expectEqual(@as(u64, 30_000), try tm.countPatternByOffset(allocator, "noise.", 0, 40_000));
+}
+
+test "unit: full-log pattern scans against a live publisher tear nothing" {
+    // The other reproducing shape: scans that restart from offset 0 hold
+    // their view across the publisher's whole history, so every append
+    // lands under an active read.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("noise.stream");
+    try tm.createTopic("quiet.stream");
+    var i: usize = 0;
+    while (i < 512) : (i += 1) _ = try tm.publish("noise.stream", null, "seed");
+
+    var publisher = RacePublisher{ .tm = &tm, .count = 20_000 };
+    const t = try std.Thread.spawn(.{}, RacePublisher.run, .{&publisher});
+
+    while (!publisher.done.load(.acquire)) {
+        const scan = try tm.fetchPatternByOffset(allocator, "quiet.", 0, 16);
+        defer freeEvents(scan.events);
+        try testing.expectEqual(@as(usize, 0), scan.events.len);
+    }
+    t.join();
+    try testing.expect(publisher.ok);
+    try testing.expectEqual(@as(u64, 20_512), try tm.countPatternByOffset(allocator, "noise.", 0, 30_000));
+}
+
+test "unit: a publish lands, and is indexed, while a pattern scan is mid-read" {
+    // The no-write-outage half of the spec, asserted without a stopwatch:
+    // park a pattern scan inside its disk phase (Log.test_read_hold) — the
+    // stretch the old design spent holding the manager mutex — and require
+    // a publish to complete, return, and be visible in the topic index
+    // while the scan is still in flight. Under the pre-fix locking this is
+    // a deadlock: the scan held the manager mutex for its whole duration
+    // and publish phase 1 needs it. Measured pre-fix cost for scale: 480 ms
+    // median publish latency behind one quiet subscriber on a 40k log.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("noise.stream");
+    try tm.createTopic("quiet.stream");
+    var i: usize = 0;
+    while (i < 600) : (i += 1) _ = try tm.publish("noise.stream", null, "seed");
+    const head_before = tm.log.nextOffset();
+
+    tm.log.test_read_hold.store(true, .release);
+
+    const Scanner = struct {
+        tm: *TopicManager,
+        delivered: usize = 0,
+        watermark: u64 = 0,
+        ok: bool = false,
+
+        fn run(self: *@This()) void {
+            const scan = self.tm.fetchPatternByOffset(allocator, "quiet.", 0, 10) catch return;
+            self.delivered = scan.events.len;
+            self.watermark = scan.watermark;
+            freeEvents(scan.events);
+            self.ok = true;
+        }
+    };
+    var scanner = Scanner{ .tm = &tm };
+    const t = try std.Thread.spawn(.{}, Scanner.run, .{&scanner});
+
+    // Wait until the scan is parked in its disk phase, holding no lock.
+    while (!tm.log.test_read_parked.load(.acquire))
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+
+    // The write goes through while the read is in flight…
+    const off = try tm.publish("noise.stream", null, "during-scan");
+    try testing.expectEqual(head_before, off);
+    // …and the offset the publisher received is indexed by the time it can
+    // act on it: an exact-topic view sees the event immediately (the goal
+    // the spec states for the index half).
+    try testing.expectEqual(@as(u64, 601), tm.topicEventCount("noise.stream").?);
+
+    tm.log.test_read_hold.store(false, .release);
+    t.join();
+
+    try testing.expect(scanner.ok);
+    try testing.expectEqual(@as(usize, 0), scanner.delivered);
+    // The scan's window was captured at entry: the mid-scan publish did
+    // not stretch it.
+    try testing.expectEqual(head_before, scanner.watermark);
+}
+
+/// A blocking pattern subscriber over TCP, resuming from the watermark
+/// across wakes — the traffic that reproduced the race from a normal client
+/// operation. Collects every `quiet.*` value it is delivered, in order.
+const PatternSubscriber = struct {
+    port: u16,
+    after: u64,
+    want: usize,
+    got: usize = 0,
+    in_order: bool = true,
+    ok: bool = false,
+
+    fn run(self: *PatternSubscriber) void {
+        var client = ever.client.Client.connect(allocator, io, "127.0.0.1", self.port) catch return;
+        defer client.deinit();
+        // Bounded: worst case ~400 wakes × 250 ms ≈ 100 s before the test
+        // fails by assertion rather than hanging.
+        var wakes: usize = 0;
+        while (self.got < self.want and wakes < 400) : (wakes += 1) {
+            var result = client.fetchAfter(null, "quiet.", self.after, 100, 250) catch return;
+            defer result.deinit();
+            for (result.events) |evt| {
+                // Values are "m1", "m2", … in publish order; a miss, a
+                // double, or a reorder all break the sequence.
+                var buf: [16]u8 = undefined;
+                const expected = std.fmt.bufPrint(&buf, "m{d}", .{self.got + 1}) catch return;
+                if (!std.mem.eql(u8, evt.value, expected)) self.in_order = false;
+                self.got += 1;
+                self.after = @max(self.after, evt.offset);
+            }
+            if (result.scan_watermark) |wm| {
+                if (wm > 0) self.after = @max(self.after, wm - 1);
+            }
+        }
+        self.ok = self.got == self.want and self.in_order;
+    }
+};
+
+test "integration: a pattern subscriber never misses or doubles a match published during its scans" {
+    // The faithful end-to-end across-wakes test fetch-watermark.org had to
+    // give up: a parked pattern subscriber whose wakes rescan WHILE the
+    // publisher is running. Its earlier form hit the readBatch/append race
+    // 7 times in 40 runs (plus one hang) and was rewritten to serialise
+    // publishes against scans; with the store fixed, the honest version
+    // returns. Exactly-once delivery in order is the property; surviving
+    // ~1,600 publishes during live scans is the regression.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("quiet.stream");
+    try tm.createTopic("noise.stream");
+    const m0 = try tm.publish("quiet.stream", null, "m0");
+
+    var ts = try TestServer.start(&tm);
+    defer ts.stop();
+
+    const n_match = 25;
+    var sub = PatternSubscriber{ .port = ts.port, .after = m0, .want = n_match };
+    const t = try std.Thread.spawn(.{}, PatternSubscriber.run, .{&sub});
+
+    // ~1,625 publishes against whatever scans the subscriber's wakes are
+    // running: a match, then a burst of foreign noise, with a short gap so
+    // the subscriber's block window genuinely parks between bursts.
+    var k: usize = 1;
+    while (k <= n_match) : (k += 1) {
+        var buf: [16]u8 = undefined;
+        _ = try tm.publish("quiet.stream", null, try std.fmt.bufPrint(&buf, "m{d}", .{k}));
+        var j: usize = 0;
+        while (j < 64) : (j += 1) _ = try tm.publish("noise.stream", null, "x");
+        if (k % 5 == 0) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+
+    t.join();
+    try testing.expectEqual(@as(usize, n_match), sub.got);
+    try testing.expect(sub.in_order);
+    try testing.expect(sub.ok);
 }
 
 // ── Store locks park, they do not spin (air/v0.1/store-blocking-locks.org) ──

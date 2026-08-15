@@ -101,6 +101,13 @@ const TopicIndex = struct {
     /// so hook cursors can be set to "tip" (== non_marker_count) to skip all
     /// currently-visible events.
     non_marker_count: u64 = 0,
+    /// Publishes that reserved their phase-3 index slot (see
+    /// `TopicManager.publish`) but have not yet consumed it. Guarded by the
+    /// manager mutex. Invariant whenever that lock is held:
+    /// `offsets.capacity >= offsets.items.len + pending_publishes` — which
+    /// is what makes phase 3's `appendAssumeCapacity` sound, and why every
+    /// other writer to `offsets` (`deleteTopic`) must reserve past it too.
+    pending_publishes: u64 = 0,
 
     fn deinit(self: *TopicIndex, allocator: Allocator) void {
         self.offsets.deinit(allocator);
@@ -110,6 +117,12 @@ const TopicIndex = struct {
     /// Record that the entry just appended to `offsets` is a marker.
     fn noteMarker(self: *TopicIndex, allocator: Allocator) !void {
         try self.marker_positions.append(allocator, @intCast(self.offsets.items.len - 1));
+    }
+
+    /// As `noteMarker`, for callers that reserved `marker_positions`
+    /// capacity *before* a durable log append made failure unreportable.
+    fn noteMarkerAssumeCapacity(self: *TopicIndex) void {
+        self.marker_positions.appendAssumeCapacity(@intCast(self.offsets.items.len - 1));
     }
 
     /// Index into `offsets` of the `skip`-th non-marker event.
@@ -141,11 +154,14 @@ pub const TopicManager = struct {
     topics: StringArrayHashMap(TopicIndex),
     deleted_topics: std.StringHashMap(void),
     /// Blocking, not spinning: a thread that loses this lock parks on a futex
-    /// instead of burning a core. That matters because `fetchPatternByOffset`
-    /// holds it across a whole log scan, so the waiter is a publisher and the
-    /// wait can be long. Non-reentrant, as before -- the `*Locked` entry-point
-    /// variants still exist for exactly that reason, and violating the
-    /// discipline now deadlocks quietly rather than spinning visibly.
+    /// instead of burning a core. Guards the topic index (`topics`,
+    /// `deleted_topics`) and the publication epoch — never the log itself,
+    /// which serializes its own readers and appenders under `Log.mutex`
+    /// (air/v0.1/log-read-append-serialization.org). Critical sections are
+    /// short; pattern scans read the log without taking this lock at all.
+    /// Non-reentrant, as before -- the `*Locked` entry-point variants still
+    /// exist for exactly that reason, and violating the discipline deadlocks
+    /// quietly rather than spinning visibly.
     /// See air/v0.1/store-blocking-locks.org.
     mutex: std.Io.Mutex = .init,
     /// Publication epoch: bumped under `mutex` on every event appended
@@ -279,14 +295,23 @@ pub const TopicManager = struct {
 
         if (self.test_fail_marker_append) return error.InjectedMarkerAppendFailure;
 
-        // Write a marker event so rebuildIndex discovers this topic on restart
-        const offset = try self.log.append(name, null, "");
+        // Everything fallible happens *before* the marker is durably in the
+        // log: a creation this function reports as failed must not produce a
+        // topic that reappears at the next restart via rebuildIndex
+        // (air/v0.1/log-read-append-serialization.org).
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
         var idx: TopicIndex = .{};
-        try idx.offsets.append(self.allocator, offset);
-        try idx.noteMarker(self.allocator);
-        try self.topics.put(self.allocator, owned, idx);
+        errdefer idx.deinit(self.allocator);
+        try idx.offsets.ensureTotalCapacity(self.allocator, 1);
+        try idx.marker_positions.ensureTotalCapacity(self.allocator, 1);
+        try self.topics.ensureUnusedCapacity(self.allocator, 1);
+
+        // Write a marker event so rebuildIndex discovers this topic on restart
+        const offset = try self.log.append(name, null, "");
+        idx.offsets.appendAssumeCapacity(offset);
+        idx.noteMarkerAssumeCapacity();
+        self.topics.putAssumeCapacity(owned, idx);
     }
 
     /// Soft-delete a topic. The topic stays in the index but is marked as
@@ -298,15 +323,24 @@ pub const TopicManager = struct {
         if (!self.topics.contains(name)) return TopicError.NotFound;
         if (self.deleted_topics.contains(name)) return TopicError.NotFound;
 
-        // Write a tombstone marker to the log so rebuildIndex picks it up.
+        // Reserve everything the index update needs *before* the tombstone
+        // is durably appended, so nothing can fail between the log write and
+        // the in-memory state that mirrors it. The offsets reservation
+        // counts in-flight publishes: their phase-3 slots (see `publish`)
+        // must survive this append too.
         const idx = self.topics.getPtr(name).?;
+        try idx.offsets.ensureTotalCapacity(self.allocator, idx.offsets.items.len + idx.pending_publishes + 1);
+        try idx.marker_positions.ensureUnusedCapacity(self.allocator, 1);
+        const owned_key = self.topics.getKey(name).?;
+        try self.deleted_topics.ensureUnusedCapacity(1);
+
+        // Write a tombstone marker to the log so rebuildIndex picks it up.
         const offset = try self.log.append(name, deletion_marker_key, "");
-        try idx.offsets.append(self.allocator, offset);
-        try idx.noteMarker(self.allocator);
+        idx.offsets.appendAssumeCapacity(offset);
+        idx.noteMarkerAssumeCapacity();
 
         // Mark as deleted (key points to the owned string inside `topics`).
-        const owned_key = self.topics.getKey(name).?;
-        try self.deleted_topics.put(owned_key, {});
+        self.deleted_topics.putAssumeCapacity(owned_key, {});
     }
 
     /// Check if a topic exists (including soft-deleted topics).
@@ -373,22 +407,48 @@ pub const TopicManager = struct {
     pub fn publish(self: *TopicManager, topic_name: []const u8, key: ?[]const u8, value: []const u8) !u64 {
         // Phase 0: reject inputs reserved for the store itself. Lock-free.
         try validatePublishInput(key, value);
-        // Phase 1: validate under lock
+        // Phase 1: validate under lock, and reserve the index slot this
+        // publish will need. The reservation is what makes phase 3
+        // infallible: once the record is durably in the log, the index
+        // update cannot be refused for lack of memory, so a caller is never
+        // told "failed" about an event that reappears at the next restart
+        // (air/v0.1/log-read-append-serialization.org).
         {
             self.lock();
             defer self.unlock();
             if (self.deleted_topics.contains(topic_name)) return TopicError.TopicDeleted;
-            if (!self.topics.contains(topic_name)) return TopicError.NotFound;
+            const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
+            // Capacity for every in-flight publish at once: concurrent
+            // publishers each reserve their own slot, so the TopicIndex
+            // capacity invariant holds however phases interleave.
+            try idx.offsets.ensureTotalCapacity(self.allocator, idx.offsets.items.len + idx.pending_publishes + 1);
+            idx.pending_publishes += 1;
         }
-        // Phase 2: disk I/O without lock (log has its own mutex)
-        const offset = try self.log.append(topic_name, key, value);
-        // Phase 3: update index under lock
+        // Phase 2: disk I/O without the manager lock — the log has its own
+        // mutex, and group commit (air/v0.1/log-group-commit.org) needs
+        // concurrent appenders to reach it.
+        const offset = self.log.append(topic_name, key, value) catch |err| {
+            self.lock();
+            defer self.unlock();
+            // Nothing was indexed; only the reservation accounting unwinds.
+            // Capacity never shrinks, so the invariant still holds.
+            self.topics.getPtr(topic_name).?.pending_publishes -= 1;
+            return err;
+        };
+        // Phase 3: update index under lock. Infallible by construction —
+        // phase 1 reserved the slot — because failing here would disown a
+        // durable record.
         {
             self.lock();
             defer self.unlock();
-            const idx = self.topics.getPtr(topic_name) orelse return TopicError.NotFound;
-            try idx.offsets.append(self.allocator, offset);
-            if (value.len != 0) idx.non_marker_count += 1 else try idx.noteMarker(self.allocator);
+            // Topics are never removed from the map (deletion is a soft
+            // mark), so the name phase 1 resolved still resolves.
+            const idx = self.topics.getPtr(topic_name).?;
+            idx.offsets.appendAssumeCapacity(offset);
+            idx.pending_publishes -= 1;
+            // Phase 0 rejected empty values, so this event is never a
+            // marker: no noteMarker branch, and non_marker_count is exact.
+            idx.non_marker_count += 1;
             // Same critical section as the index update, so a reader that
             // observes the epoch also observes the event.
             self.append_epoch += 1;
@@ -573,23 +633,30 @@ pub const TopicManager = struct {
         start_offset: u64,
         max_count: u32,
     ) !PatternScan {
-        // We read from the log directly. Hold the manager mutex while reading
-        // so log appends and readBatch don't race; readBatch itself is not
-        // thread-safe against concurrent appends.
-        self.lock();
-        defer self.unlock();
-
+        // No lock: this path reads the log directly, and the log serializes
+        // its own readers against appenders — readBatch snapshots the
+        // positions it needs under Log.mutex and does its disk I/O outside
+        // it (air/v0.1/log-read-append-serialization.org). Holding the
+        // manager mutex here would protect nothing the log doesn't already
+        // protect, and would stall every publisher's phase 1/3 for the
+        // length of the scan.
         var events: std.ArrayList(Event) = .empty;
         errdefer { for (events.items) |e| store.freeEvent(allocator, e); events.deinit(allocator); }
 
         var cursor = start_offset;
+        // Captured once: the scan examines [start_offset, next) as it stood
+        // at entry. Events appended during the scan are the next call's to
+        // find — the same per-call semantics the lock used to impose.
         const next = self.log.nextOffset();
         while (events.items.len < max_count and cursor < next) {
             // Read in chunks to bound memory; readBatch returns up to chunk size.
             // The `+ 16` slack lets us read a few extra entries to absorb
             // marker/tombstone skips so the buffer can still reach `max_count`
-            // deliverable events without an extra round-trip.
-            const chunk: u32 = @intCast(@min(@as(u64, max_count) - events.items.len + 16, 256));
+            // deliverable events without an extra round-trip. Capped at
+            // `next - cursor` so a batch never returns records appended
+            // after this scan began.
+            const room: u64 = @min(@as(u64, max_count) - events.items.len + 16, 256);
+            const chunk: u32 = @intCast(@min(room, next - cursor));
             const batch = try self.log.readBatch(allocator, cursor, chunk);
             defer allocator.free(batch);
             if (batch.len == 0) break;
@@ -641,16 +708,14 @@ pub const TopicManager = struct {
         start_offset: u64,
         cap: u32,
     ) !u64 {
-        // Same locking rationale as fetchPatternByOffset: readBatch is not
-        // thread-safe against concurrent appends.
-        self.lock();
-        defer self.unlock();
-
+        // No lock, for the same reason as fetchPatternByOffset: the log
+        // serializes its own readers against appenders, and the manager
+        // mutex protects none of what this reads.
         var count: u64 = 0;
         var cursor = start_offset;
         const next = self.log.nextOffset();
         while (count < cap and cursor < next) {
-            const batch = try self.log.readBatch(allocator, cursor, 256);
+            const batch = try self.log.readBatch(allocator, cursor, @intCast(@min(256, next - cursor)));
             defer allocator.free(batch);
             if (batch.len == 0) break;
             for (batch) |evt| {
