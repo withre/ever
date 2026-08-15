@@ -800,7 +800,7 @@ test "integration: B1 wildcard hook delivers events on low-count and new topics"
     // (c) Sanity: an event on a high-count topic still fires.
     _ = try tm.publish("agent.busy", null, "b4-after");
 
-    const events = try tm.fetchPatternByOffset(allocator, "agent.", tip, 100);
+    const events = (try tm.fetchPatternByOffset(allocator, "agent.", tip, 100)).events;
     defer freeEvents(events);
 
     var saw_q2 = false;

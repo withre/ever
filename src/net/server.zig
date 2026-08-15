@@ -381,11 +381,12 @@ pub const Server = struct {
             // `after_offset` is set it takes precedence over `offset`
             // (global-offset cursor vs. topic-local skip count).
             const events = if (req.pattern) |pattern|
-                (if (req.after_offset) |after|
-                    self.topic_manager.fetchPatternByOffset(self.allocator, pattern, after +| 1, req.max_count)
-                else
-                    self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count)) catch
-                    return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed")
+                (if (req.after_offset) |after| blk: {
+                    const scan = self.topic_manager.fetchPatternByOffset(self.allocator, pattern, after +| 1, req.max_count) catch
+                        return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed");
+                    break :blk scan.events;
+                } else self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
+                    return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"))
             else if (req.topic) |topic_name|
                 (if (req.after_offset) |after|
                     self.topic_manager.fetchAfterOffset(self.allocator, topic_name, after, req.max_count)

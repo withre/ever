@@ -539,6 +539,23 @@ pub const TopicManager = struct {
         return null;
     }
 
+    /// Result of `fetchPatternByOffset`: what was delivered, and how far the
+    /// scan examined. The watermark is the value the function always computed
+    /// as its local cursor and used to discard — returned so callers can
+    /// resume without re-testing the examined range. Consumed by the fetch
+    /// protocol (air/v0.1/fetch-watermark.org); the same return-value change
+    /// hook-scan-cursor-and-lag.org P1 specifies for the hook daemon.
+    pub const PatternScan = struct {
+        events: []Event,
+        /// Global log offset the scan examined up to, exclusive: every offset
+        /// below it has been tested against the pattern and either delivered
+        /// or ruled out. It may pass offsets that were examined and ruled
+        /// out, and may never pass a match that was not delivered — when the
+        /// buffer fills, it stops before the first undelivered match rather
+        /// than at the head.
+        watermark: u64,
+    };
+
     /// Fetch events matching `pattern`, starting at a global log offset.
     /// Used by the hook daemon for wildcard/prefix hooks, where the cursor
     /// is interpreted as the next global log offset to consider (rather than
@@ -555,7 +572,7 @@ pub const TopicManager = struct {
         pattern: []const u8,
         start_offset: u64,
         max_count: u32,
-    ) ![]Event {
+    ) !PatternScan {
         // We read from the log directly. Hold the manager mutex while reading
         // so log appends and readBatch don't race; readBatch itself is not
         // thread-safe against concurrent appends.
@@ -605,7 +622,7 @@ pub const TopicManager = struct {
                 try events.append(allocator, evt);
             }
         }
-        return events.toOwnedSlice(allocator);
+        return .{ .events = try events.toOwnedSlice(allocator), .watermark = cursor };
     }
 
     /// Count events matching `pattern` from a global log offset — the
@@ -912,11 +929,104 @@ test "TopicManager fetchPatternByOffset serves the after_offset pattern path" {
     const g3 = try tm.publish("agent.a", null, "a2");
 
     // Server maps `after_offset` → start_offset = after_offset + 1.
-    const events = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", g2 + 1, 10);
+    const scan = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", g2 + 1, 10);
+    const events = scan.events;
     defer { for (events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("a2", events[0].value);
     try std.testing.expectEqual(g3, events[0].offset);
+    // Everything below the tip was examined; the watermark says so.
+    try std.testing.expectEqual(tm.log.nextOffset(), scan.watermark);
+}
+
+test "TopicManager fetchPatternByOffset: empty scan reports how far it looked" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("noise.stream");
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+
+    // Nothing matches, so nothing is delivered — but the whole range was
+    // examined and ruled out, and the watermark must say so.
+    const scan = try tm.fetchPatternByOffset(std.testing.allocator, "quiet.", 0, 10);
+    defer std.testing.allocator.free(scan.events);
+    try std.testing.expectEqual(@as(usize, 0), scan.events.len);
+    try std.testing.expectEqual(tm.log.nextOffset(), scan.watermark);
+
+    // Resuming from the watermark examines nothing — that is what it is for.
+    store.Log.test_read_count = 0;
+    const rescan = try tm.fetchPatternByOffset(std.testing.allocator, "quiet.", scan.watermark, 10);
+    defer std.testing.allocator.free(rescan.events);
+    try std.testing.expectEqual(@as(usize, 0), rescan.events.len);
+    try std.testing.expectEqual(scan.watermark, rescan.watermark);
+    try std.testing.expect(store.Log.test_read_count == 0);
+}
+
+test "TopicManager fetchPatternByOffset: watermark never passes an undelivered match" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // Five matches with a non-match wedged between the third and the fourth,
+    // so the ruled-out/undelivered distinction is exercised at the boundary:
+    // the watermark may pass the non-match, must stop before match four.
+    try tm.createTopic("agent.a");
+    try tm.createTopic("other.x");
+    _ = try tm.publish("agent.a", null, "m1");
+    _ = try tm.publish("agent.a", null, "m2");
+    _ = try tm.publish("agent.a", null, "m3");
+    _ = try tm.publish("other.x", null, "n1");
+    const g4 = try tm.publish("agent.a", null, "m4");
+    _ = try tm.publish("agent.a", null, "m5");
+
+    const scan = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", 0, 3);
+    defer { for (scan.events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(scan.events); }
+    try std.testing.expectEqual(@as(usize, 3), scan.events.len);
+    try std.testing.expectEqualStrings("m3", scan.events[2].value);
+    // Exclusive bound: at most g4, i.e. m4 itself was NOT examined-and-passed.
+    try std.testing.expect(scan.watermark <= g4);
+    // And no lower than delivery already proves examined.
+    try std.testing.expect(scan.watermark >= scan.events[2].offset + 1);
+
+    // Resuming from the watermark redelivers m4 first — nothing was skipped.
+    const resumed = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", scan.watermark, 10);
+    defer { for (resumed.events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(resumed.events); }
+    try std.testing.expectEqual(@as(usize, 2), resumed.events.len);
+    try std.testing.expectEqualStrings("m4", resumed.events[0].value);
+    try std.testing.expectEqual(g4, resumed.events[0].offset);
+}
+
+test "TopicManager fetchPatternByOffset: watermark passes a ruled-out tail behind delivered matches" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // Matches early, then a long tail that is examined and ruled out. The
+    // wrong implementation this catches: clamping the watermark to the last
+    // delivered offset whenever anything was delivered. That is safe, passes
+    // the no-skip test above, and quietly restores the growing rescan in
+    // exactly this mixed case. (air/v0.1/fetch-watermark.org)
+    try tm.createTopic("agent.a");
+    try tm.createTopic("noise.stream");
+    _ = try tm.publish("agent.a", null, "m1");
+    const g2 = try tm.publish("agent.a", null, "m2");
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+
+    const scan = try tm.fetchPatternByOffset(std.testing.allocator, "agent.", 0, 10);
+    defer { for (scan.events) |e| store.freeEvent(std.testing.allocator, e); std.testing.allocator.free(scan.events); }
+    try std.testing.expectEqual(@as(usize, 2), scan.events.len);
+    // Strictly past the last delivered match: the ruled-out tail counts.
+    try std.testing.expect(scan.watermark > g2 + 1);
+    try std.testing.expectEqual(tm.log.nextOffset(), scan.watermark);
 }
 
 test "TopicManager countPatternByOffset counts from cursor, excludes markers" {

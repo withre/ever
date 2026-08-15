@@ -991,8 +991,11 @@ pub const HookDaemon = struct {
         // `TopicManager.tipForPatternLocked`):
         //   - exact topic   → topic-local skip count, advance by batch index
         //   - prefix/wildcard → global log offset, advance to event.offset + 1
+        // The scan's watermark is deliberately unused here: adopting it for
+        // the hook cursor is hook-scan-cursor-and-lag.org P1's change, not
+        // this call site's.
         const events = if (is_pattern)
-            try self.topic_manager.fetchPatternByOffset(self.allocator, pattern, hook.cursor, 100)
+            (try self.topic_manager.fetchPatternByOffset(self.allocator, pattern, hook.cursor, 100)).events
         else
             try self.topic_manager.fetch(self.allocator, pattern, hook.cursor, 100);
         defer {
