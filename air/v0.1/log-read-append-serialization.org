@@ -125,3 +125,9 @@ Option B closes the race and leaves the scope problem; A closes both; C closes t
 
   The =fetch-watermark= test was rewritten to serialise its publishes against its scans, so it no longer provokes the race. *That is a workaround in the test, not a fix in the store*, and it was the correct call there only because =src/store/store.zig= belonged to a concurrent agent. The race is unchanged and unfixed.
 
+- 2026-08-15: *Failure mode identified, and the existing suite is surviving by luck.* The agent that hit this race characterised what it actually produces: a publish concurrent with a scan tears a read, which surfaces as =error.CorruptRecord= and *the whole fetch replies 500*. So this is not only a memory-safety hazard — on the ordinary client path it is a visible server error returned to a client that did nothing wrong, under load any pattern subscriber can generate.
+
+  The observation that matters most for anyone reading a green suite: *any end-to-end test that publishes while a fetch may be scanning is running this race.* The existing blocking-fetch tests pass because they publish single events into microsecond windows, not because they are safe. Reproduced at 7/40 with one hang using ~1600 publishes against a continuously rescanning blocking fetch — the difference is volume, not kind.
+
+  Consequence for sequencing: this now blocks a faithful end-to-end test of =fetch-watermark.org=, whose across-wakes behaviour cannot be exercised without exactly the publish-during-scan pattern that trips it. That test was rewritten to avoid the race rather than to demonstrate the feature end to end, and the honest version returns when this lands.
+

@@ -282,3 +282,10 @@ Behaviours that cost an implementer real time and are not discoverable by readin
 
 - *=ever pub= fails on a topic that does not exist.* Create every topic an agent will publish to when you spawn it — =status= and =done= are not enough if the prompt also asks for =report=.
 
+*** Repeat-run verification, and one invariant not to "simplify"
+
+- *=zig build test= caches run results per binary.* After editing one file, only that binary re-runs and the summary reports its count alone — e.g. =27/27= — while the other two are silently cached and contribute nothing. For flake hunting this is fatal: a loop of twenty "runs" can be nineteen cache hits. Run the three test binaries directly out of the cache dir, or use a fresh =--cache-dir= per iteration, and treat a run as passing only when *n equals m*, never merely because a line saying "tests passed" appeared.
+- *=Log.test_read_count= increments before the read, not after.* =countRead= precedes the =readEventAt= loop in =readBatch=, so "the counter reached N" does not mean "the reads finished". To establish that a scan has completed, also acquire the manager mutex, which =fetchPatternByOffset= holds end to end.
+- *A wake means look-again, not here-is-your-event.* =handleFetch= re-baselines its epoch from =waitForAppend=, and spurious wakeups cause full rescans — which matters to any test counting reads per wake.
+- *Do not make the buffer-full break stop the cursor unconditionally.* In =fetchPatternByOffset=, a non-match encountered after the buffer fills still advances the cursor; only an *undelivered match* stops it. That asymmetry looks like an oversight and is the invariant: the watermark may pass offsets examined and ruled out, and may never pass a match that was not delivered. "Simplifying" it reintroduces the growing rescan while keeping every existing test green.
+
