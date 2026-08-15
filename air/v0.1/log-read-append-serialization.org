@@ -1,5 +1,5 @@
 #+title: Which Lock Protects the Log, and For How Long
-#+state: ready
+#+state: complete
 #+FILETAGS: :store:core:protocol:bug:
 
 * Summary
@@ -134,4 +134,14 @@ Option B closes the race and leaves the scope problem; A closes both; C closes t
 - 2026-08-15: *One unattributed suite failure, recorded rather than explained away.* Verifying =log-group-commit.org= before integration produced a single full-suite failure in 51 runs on that branch, against 0 in 20 on =main=. It did not reproduce in 25 further runs, and =store.zig= — the only file that change touched — was clean over 60 standalone runs, so the failure was in a test the change never modified.
 
   The likeliest cause is this race. =main='s 0-in-20 does not contradict that: at a ~2% rate, twenty runs are silent about two thirds of the time. Both changes were integrated on that reasoning, which is a judgement and not a measurement — written down so that if the suite goes red once in fifty later, the next person finds this rather than a clean bill of health.
+
+- 2026-08-15: Marked complete. =Log.read=/=readBatch= now snapshot the positions they need under =Log.mutex= and do their disk I/O outside it — appends only extend, so a snapshot is a prefix, safe by construction. The pattern-scan paths drop =TopicManager.mutex= entirely, since it protected nothing the log does not now protect and holding it *was* the write outage. Publish phase 3 is infallible: the index slot is reserved in phase 1, so a caller can no longer be told "failed" about a durably-appended event that reappears at the next restart.
+
+  The spec's option C was rejected on evidence that did not exist when the spec was written: phases 2+3 under one lock would hold the manager mutex across the group-commit fsync wait and serialize appenders, undoing =log-group-commit.org=, which landed earlier the same day. Worth recording as a pattern — a spec's menu of options is written against the tree of its own moment, and the tree moves.
+
+  Verified: 12 consecutive full-suite runs at 178/178, and a negative control — the four new tests against the pre-fix implementation hang 5 of 5, so they detect what they were written for. ThreadSanitizer clean. Building that control took three attempts, two of which could not have failed: the tests do not compile against the old tree (they need a new test gate), and =-Dtest-filter= does not exist in this =build.zig=, so a filtered run reported four passes that were configure errors. The second nearly went into the record as "the tests pass on the old tree".
+
+  The end-to-end across-wakes subscriber test that =fetch-watermark.org= had to rewrite to avoid this race is restored here.
+
+- 2026-08-15: The single unattributed suite failure recorded above — one in 51 runs while verifying group commit — is most likely this defect, and should now be gone. Not claimed as fixed: it was never reproduced on demand, so there is nothing to re-run that would prove it. If the suite goes red once in fifty from here, this entry is wrong and the search should start fresh rather than resume here.
 
