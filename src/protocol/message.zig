@@ -121,6 +121,11 @@ pub const FetchResponse = struct {
     /// aggregate several topics). Powers the client-side "start beyond
     /// end of topic" warning.
     topic_events: ?u64 = null,
+    /// Global log offset the server scanned up to, exclusive: every offset
+    /// below this has been tested against the request and either delivered
+    /// or ruled out. A client may resume from here without re-testing.
+    /// Null when the request did not scan (exact-topic reads walk an index).
+    scan_watermark: ?u64 = null,
 };
 
 pub const TopicRequest = struct {
@@ -514,7 +519,7 @@ test "body encode and decode FetchResponse" {
         .{ .offset = 1, .timestamp = 1001, .key = "k1", .value = "v1" },
     };
 
-    const resp = FetchResponse{ .events = &events };
+    const resp = FetchResponse{ .events = &events, .scan_watermark = 42 };
 
     const body = try encodeBody(std.testing.allocator, resp);
     defer std.testing.allocator.free(body);
@@ -525,6 +530,34 @@ test "body encode and decode FetchResponse" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.events.len);
     try std.testing.expectEqualStrings("v0", parsed.value.events[0].value);
     try std.testing.expectEqualStrings("k1", parsed.value.events[1].key.?);
+    try std.testing.expectEqual(@as(?u64, 42), parsed.value.scan_watermark);
+}
+
+test "scan_watermark is additive: old client, new server and the reverse" {
+    // New server → old client: a response carrying the field decodes in a
+    // client that does not know it. The stand-in for the shipped client is
+    // FetchResponse as it was before the field existed, run through the same
+    // decode path (`ignore_unknown_fields` is what makes this hold).
+    const OldFetchResponse = struct {
+        events: []const EventData,
+        topic_events: ?u64 = null,
+    };
+    const new_body = try encodeBody(std.testing.allocator, FetchResponse{
+        .events = &.{},
+        .scan_watermark = 7,
+    });
+    defer std.testing.allocator.free(new_body);
+    const old_view = try decodeBody(OldFetchResponse, std.testing.allocator, new_body);
+    defer old_view.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old_view.value.events.len);
+
+    // Old server → new client: a response without the field decodes with
+    // `null`, which is exactly "behave as today".
+    const old_body = try encodeBody(std.testing.allocator, OldFetchResponse{ .events = &.{} });
+    defer std.testing.allocator.free(old_body);
+    const new_view = try decodeBody(FetchResponse, std.testing.allocator, old_body);
+    defer new_view.deinit();
+    try std.testing.expectEqual(@as(?u64, null), new_view.value.scan_watermark);
 }
 
 test "body encode and decode StatusResponse round-trip" {
