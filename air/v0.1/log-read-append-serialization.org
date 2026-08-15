@@ -118,3 +118,10 @@ Option B closes the race and leaves the scope problem; A closes both; C closes t
 * History
 - 2026-08-09: Drafted. Filed under the name =hook-scan-cursor-and-lag.org= has cited three times since 2026-08-03 for F4 ("Status: scheduled, not merely recorded"), so those pointers now resolve. Raised by a reviewer working on Reverie as an index-lag problem; the index lag is real (27% of 200,000 locked samples) and is the lesser half. The reader and the writer take different locks, and the read path segfaults — reproduced in Debug, ReleaseSafe and ReleaseFast, and confirmed under ThreadSanitizer, which is the observation F4 asked for and had not had.
 - 2026-08-09: State: draft → ready.
+
+- 2026-08-15: *Reproduction rate observed, from an unrelated task.* While implementing =fetch-watermark.org=, an agent's end-to-end test — a quiet pattern subscriber parked across publishes — hit this race hard enough to fail *7 times in 40 runs, plus one hang*. The test was not trying to exercise it; a blocking pattern fetch that rescans on each wake simply drives concurrent =readBatch=/=append= at a rate ordinary use does not.
+
+  That matters for prioritisation in two ways. It is the first *measured* frequency this document has had rather than an argument from the code, and 7/40 with a hang is not a rare-corner rate. And it means the defect is now reachable from a normal client operation rather than only from a contrived one — the fetch path added by =fetch-watermark.org= makes parked pattern subscribers rescan more often, which is exactly the traffic that provokes it.
+
+  The =fetch-watermark= test was rewritten to serialise its publishes against its scans, so it no longer provokes the race. *That is a workaround in the test, not a fix in the store*, and it was the correct call there only because =src/store/store.zig= belonged to a concurrent agent. The race is unchanged and unfixed.
+
