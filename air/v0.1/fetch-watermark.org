@@ -1,5 +1,5 @@
 #+title: A Fetch Should Say How Far It Looked
-#+state: ready
+#+state: complete
 #+FILETAGS: :protocol:subscriber:store:performance:
 
 * Summary
@@ -131,3 +131,6 @@ The test plan below calls the no-skip assertion "the assertion that catches the 
   *Controls, all verified to fail without their fix:* the quiet-subscriber control failed on the base tree exactly as predicted (second fetch read ~2,000 records against a bound of 32); the no-skip test fails against a cursor that passes an undelivered match on a full buffer; the ruled-out-tail test fails against clamping to the last delivered offset (which, as this document warned, passes the no-skip test); the across-wakes test fails against a server that reports the watermark but rescans from the request start on every wake (which passes the other three); the CLI test fails against delivery-only cursor advancement. Costs are asserted as read counters, not wall-clock.
 
   *One reconciliation the implementer should know about:* the Testing bullet "feeds the watermark back as =after_offset=" is off by one against the pinned exclusive definition — =after_offset= is strictly-after, so feeding the watermark itself would skip the offset at the watermark, which in the buffer-full case is an undelivered match. The resume rule elsewhere in this document is the normative one; the CLI passes =watermark - 1= as =after_offset=, and the round-trip test pins the unit exactly: after a quiet scan, the very next publish lands *at* the watermark and resuming after =watermark - 1= returns it first.
+- 2026-08-15: Marked complete. =fetchPatternByOffset= returns its watermark, =FetchResponse= carries =scan_watermark=, a blocking fetch advances it across wakes rather than rescanning from the same point, and =sub --follow= / =wait= resume by =max(last_event_offset + 1, scan_watermark)=. The control the spec named — a quiet subscriber is O(new) — failed on the prior tree at ~2000 reads against a bound of 32 and passes now.
+
+  Two things settled during implementation. A spec-internal off-by-one: the Testing bullet said the watermark feeds back as =after_offset=, but the pinned definition is exclusive, so the resume rule is applied as a start offset (=after_offset = watermark - 1=) and a round-trip test pins the unit. And the across-wakes test was rewritten twice — first to serialise its publishes, finally to drive rescans with =wakeAllWaiters= and no appends at all — because publishing while a scan runs trips the =log-read-append-serialization.org= race. The end-to-end version that publishes concurrently returns when that lands.

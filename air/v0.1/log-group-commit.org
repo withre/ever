@@ -1,5 +1,5 @@
 #+title: One fsync Should Cover More Than One Append
-#+state: ready
+#+state: complete
 #+FILETAGS: :store:core:performance:
 
 * Summary
@@ -104,3 +104,8 @@ Group commit is old and well-understood — it is how PostgreSQL's WAL, SQLite's
 * History
 - 2026-08-09: Drafted. Assigned to Ever by the owner — "Publisher and fsync discussion needs to be taken look at, single global lock doesn't sound good" — after the durability measurement showed the 2,400/sec ceiling was real and store-wide. Both tables measured on a store built from this tree; the concurrency one is what makes the global-lock claim concrete, and the batch one is what prices the fix.
 - 2026-08-09: State: draft → ready.
+- 2026-08-15: Marked complete. =Log.append= no longer holds =Log.mutex= across its =fsync=: a leader syncs outside the lock and appenders queued behind it share that sync, tracked by a monotonic =synced_watermark= against which each caller waits on =offset + 1= — never on "some sync finished", which would let a sync that started before a record was written appear to cover it.
+
+  Durability was not traded away, which was the constraint: the change moves *who waits* on the fsync, not how often data reaches disk. The batching claim is asserted deterministically by holding a leader inside its sync until followers have queued, rather than by an injected delay that makes it merely likely; the free-running stress test asserts only what survives any schedule.
+
+  Noted rather than fixed: a failed leader sync is still discarded, and now covers a batch rather than one record. That is =sync-failure-reporting.org=, whose priority this raises.

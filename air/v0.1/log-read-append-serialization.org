@@ -131,3 +131,7 @@ Option B closes the race and leaves the scope problem; A closes both; C closes t
 
   Consequence for sequencing: this now blocks a faithful end-to-end test of =fetch-watermark.org=, whose across-wakes behaviour cannot be exercised without exactly the publish-during-scan pattern that trips it. That test was rewritten to avoid the race rather than to demonstrate the feature end to end, and the honest version returns when this lands.
 
+- 2026-08-15: *One unattributed suite failure, recorded rather than explained away.* Verifying =log-group-commit.org= before integration produced a single full-suite failure in 51 runs on that branch, against 0 in 20 on =main=. It did not reproduce in 25 further runs, and =store.zig= — the only file that change touched — was clean over 60 standalone runs, so the failure was in a test the change never modified.
+
+  The likeliest cause is this race. =main='s 0-in-20 does not contradict that: at a ~2% rate, twenty runs are silent about two thirds of the time. Both changes were integrated on that reasoning, which is a judgement and not a measurement — written down so that if the suite goes red once in fifty later, the next person finds this rather than a clean bill of health.
+
