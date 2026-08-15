@@ -375,15 +375,33 @@ pub const Server = struct {
         const deadline_ms = monotonicMillis() + @as(i64, block_ms);
         var epoch = self.topic_manager.appendEpoch();
 
+        // The pattern+after_offset path scans the log; every other path walks
+        // an index, where a scan watermark has no meaning. This variable is a
+        // blocking fetch's own cursor across its wakes: an empty scan has
+        // ruled its whole range out, so the next wake resumes where it
+        // stopped instead of re-walking a range that grows with the log —
+        // O(new events) per wake, not O(log). The alternative — replying
+        // early with an empty batch and a moved watermark — was considered
+        // and rejected: it changes what block_ms means. The final watermark
+        // is reported whenever the reply happens, on a match or at block_ms.
+        // (air/v0.1/fetch-watermark.org)
+        var pattern_scan_start: ?u64 = if (req.pattern != null and req.after_offset != null)
+            req.after_offset.? +| 1
+        else
+            null;
+        var scan_watermark: ?u64 = null;
+
         while (true) {
             if (builtin.is_test) _ = test_fetch_attempts.fetchAdd(1, .monotonic);
             // Resolve events — either by pattern or single topic. When
             // `after_offset` is set it takes precedence over `offset`
             // (global-offset cursor vs. topic-local skip count).
             const events = if (req.pattern) |pattern|
-                (if (req.after_offset) |after| blk: {
-                    const scan = self.topic_manager.fetchPatternByOffset(self.allocator, pattern, after +| 1, req.max_count) catch
+                (if (pattern_scan_start) |scan_start| blk: {
+                    const scan = self.topic_manager.fetchPatternByOffset(self.allocator, pattern, scan_start, req.max_count) catch
                         return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed");
+                    scan_watermark = scan.watermark;
+                    pattern_scan_start = scan.watermark;
                     break :blk scan.events;
                 } else self.topic_manager.fetchPattern(self.allocator, pattern, req.offset, req.max_count) catch
                     return sendError(self.allocator, fd, protocol.ErrorCode.internal, "fetch failed"))
@@ -426,7 +444,11 @@ pub const Server = struct {
                 else
                     null;
 
-                const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{ .events = event_data, .topic_events = topic_events });
+                const resp_body = try protocol.encodeBody(self.allocator, protocol.FetchResponse{
+                    .events = event_data,
+                    .topic_events = topic_events,
+                    .scan_watermark = scan_watermark,
+                });
                 defer self.allocator.free(resp_body);
                 try protocol.writeFrame(fd, .fetch_ok, resp_body);
                 return;

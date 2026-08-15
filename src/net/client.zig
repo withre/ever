@@ -15,6 +15,13 @@ pub const FetchResult = struct {
     /// Total non-marker events in the topic — present for exact-topic
     /// fetches, `null` for pattern fetches. See `FetchResponse.topic_events`.
     topic_events: ?u64 = null,
+    /// Global log offset the server scanned up to, exclusive — present for
+    /// pattern-after-offset fetches, `null` when the request did not scan
+    /// (and from an older server, which is exactly "behave as today").
+    /// Resume strictly after `max(last delivered offset, scan_watermark - 1)`
+    /// so a quiet pattern advances past examined ranges without deliveries.
+    /// See `FetchResponse.scan_watermark`.
+    scan_watermark: ?u64 = null,
     allocator: Allocator,
 
     pub fn deinit(self: *FetchResult) void {
@@ -365,6 +372,7 @@ pub const Client = struct {
         return .{
             .events = events,
             .topic_events = parsed.value.topic_events,
+            .scan_watermark = parsed.value.scan_watermark,
             .allocator = self.allocator,
         };
     }

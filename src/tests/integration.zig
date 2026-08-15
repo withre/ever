@@ -1766,6 +1766,174 @@ test "integration: fetch at the tail does not re-read the topic" {
     try testing.expect(ever.store.Log.test_read_count >= n);
 }
 
+// ── A fetch says how far it looked (air/v0.1/fetch-watermark.org) ──────────
+
+test "integration: quiet pattern subscriber is O(new events), not O(log)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    // A quiet topic the subscriber cares about, and a busy foreign one.
+    try tm.createTopic("quiet.stream");
+    try tm.createTopic("noise.stream");
+    const last_match = try tm.publish("quiet.stream", null, "m0");
+    const n: u64 = 2000;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+
+    var ts = try TestServer.start(&tm);
+    defer ts.stop();
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", ts.port);
+    defer client.deinit();
+
+    // The subscriber's steady state: it delivered m0 long ago and resumes
+    // strictly after it. This scan examines all the noise, delivers nothing.
+    var after: u64 = last_match;
+    {
+        var result = try client.fetchAfter(null, "quiet.", after, 100, 0);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 0), result.events.len);
+        // The resume rule: strictly after max(last delivered, watermark - 1).
+        // Before the watermark existed the cursor could only advance by
+        // delivery, so with nothing delivered the next scan was O(log).
+        for (result.events) |evt| after = @max(after, evt.offset);
+        if (result.scan_watermark) |wm| {
+            if (wm > 0) after = @max(after, wm - 1);
+        }
+    }
+
+    // The second fetch must not re-walk the range the first one ruled out.
+    ever.store.Log.test_read_count = 0;
+    {
+        var result = try client.fetchAfter(null, "quiet.", after, 100, 0);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 0), result.events.len);
+    }
+    try testing.expect(ever.store.Log.test_read_count <= 32);
+}
+
+test "integration: the watermark is a global exclusive offset a fetch can resume from" {
+    // The unit round-trip offset-coherence.org wanted: the watermark is in
+    // the same space as after_offset and exclusive, so the very next event
+    // published lands exactly AT it, and resuming strictly after wm - 1
+    // yields exactly the events past the examined range — no gap, no rewind.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("quiet.stream");
+    try tm.createTopic("noise.stream");
+    const last_match = try tm.publish("quiet.stream", null, "m0");
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+
+    var ts = try TestServer.start(&tm);
+    defer ts.stop();
+    var client = try ever.client.Client.connect(allocator, io, "127.0.0.1", ts.port);
+    defer client.deinit();
+
+    const wm = blk: {
+        var result = try client.fetchAfter(null, "quiet.", last_match, 100, 0);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 0), result.events.len);
+        break :blk result.scan_watermark.?;
+    };
+
+    // Exclusive upper bound of the examined range == the next offset the log
+    // will assign. Two fresh matches land at wm and (being adjacent) wm + 1.
+    const g_new = try tm.publish("quiet.stream", null, "m1");
+    try testing.expectEqual(wm, g_new);
+    const g_new2 = try tm.publish("quiet.stream", null, "m2");
+
+    var result = try client.fetchAfter(null, "quiet.", wm - 1, 100, 0);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.events.len);
+    try testing.expectEqual(g_new, result.events[0].offset);
+    try testing.expectEqual(g_new2, result.events[1].offset);
+    try testing.expectEqualStrings("m1", result.events[0].value);
+}
+
+/// A blocking pattern fetch on its own thread, capturing what the reply
+/// carried. The fetchAfter sibling of `BlockedFetcher` below, for the
+/// watermark tests — which need the pattern+after_offset path and the
+/// response's scan_watermark, not just an event count.
+const BlockedPatternFetcher = struct {
+    port: u16,
+    pattern: []const u8,
+    after: u64,
+    block_ms: u32,
+    event_count: std.atomic.Value(u64) = .init(0),
+    watermark: std.atomic.Value(u64) = .init(0),
+    sent: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BlockedPatternFetcher) void {
+        var client = ever.client.Client.connect(allocator, io, "127.0.0.1", self.port) catch return;
+        defer client.deinit();
+        self.sent.store(true, .release);
+        var res = client.fetchAfter(null, self.pattern, self.after, 10, self.block_ms) catch return;
+        defer res.deinit();
+        self.event_count.store(res.events.len, .release);
+        if (res.scan_watermark) |wm| self.watermark.store(wm, .release);
+    }
+};
+
+test "integration: a parked fetch advances its watermark across wakes" {
+    // The decision the spec makes explicitly: keep parking, and advance a
+    // server-side watermark on each wake. Every foreign publish wakes the
+    // parked fetch and its rescan must start where the previous one stopped
+    // — otherwise the server pays O(log) per wake for the whole block
+    // window even though the client eventually gets the right watermark.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tm = try TopicManager.init(allocator, io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+
+    try tm.createTopic("quiet.stream");
+    try tm.createTopic("noise.stream");
+    const last_match = try tm.publish("quiet.stream", null, "m0");
+
+    var ts = try TestServer.start(&tm);
+    defer ts.stop();
+
+    ever.net.test_fetch_attempts.store(0, .monotonic);
+    ever.store.Log.test_read_count = 0;
+
+    var f = BlockedPatternFetcher{ .port = ts.port, .pattern = "quiet.", .after = last_match, .block_ms = 30_000 };
+    const ft = try std.Thread.spawn(.{}, BlockedPatternFetcher.run, .{&f});
+
+    // Waves of foreign publishes, each gated on the fetch having looked
+    // again (the attempt counter ticks at the top of every rescan), so wave
+    // k's rescan provably happened while k × 200 noise events were behind
+    // the cursor. A rescan-from-request-start implementation reads at least
+    // 200+400+…+1600 = 7,200 records across the waves; one that carries its
+    // cursor reads each record once — about 1,600.
+    const waves: u64 = 8;
+    const per_wave: u64 = 200;
+    var wave: u64 = 0;
+    while (wave < waves) : (wave += 1) {
+        while (ever.net.test_fetch_attempts.load(.monotonic) < wave + 1) {
+            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+        }
+        var i: u64 = 0;
+        while (i < per_wave) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+    }
+
+    // A match ends the block window deterministically — no timeout to wait
+    // out — and the reply must carry the watermark the wakes accumulated.
+    const g_match = try tm.publish("quiet.stream", null, "m1");
+    ft.join();
+
+    try testing.expectEqual(@as(u64, 1), f.event_count.load(.acquire));
+    try testing.expectEqual(g_match + 1, f.watermark.load(.acquire));
+    // The server-side half of the fix: the whole window cost O(new events).
+    try testing.expect(ever.store.Log.test_read_count <= 4_000);
+}
+
 // ── Store locks park, they do not spin (air/v0.1/store-blocking-locks.org) ──
 //
 // Correctness is unchanged by the spinlock -> Io.Mutex conversion, so the
