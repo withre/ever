@@ -1881,12 +1881,44 @@ const BlockedPatternFetcher = struct {
     }
 };
 
+/// Wait, bounded, until `cond` observes true. The bound exists so a broken
+/// tree fails this test with a nameable error instead of hanging the suite.
+fn waitBounded(comptime cond: anytype, args: anytype) !void {
+    var waited_ms: u32 = 0;
+    while (waited_ms < 10_000) : (waited_ms += 1) {
+        if (@call(.auto, cond, args)) return;
+        _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+    }
+    return error.SubscriberStalled;
+}
+
+fn readCountAtLeast(target: usize) bool {
+    return @atomicLoad(usize, &ever.store.Log.test_read_count, .monotonic) >= target;
+}
+
+fn attemptsAtLeast(target: u64) bool {
+    return ever.net.test_fetch_attempts.load(.monotonic) >= target;
+}
+
 test "integration: a parked fetch advances its watermark across wakes" {
     // The decision the spec makes explicitly: keep parking, and advance a
     // server-side watermark on each wake. Every foreign publish wakes the
     // parked fetch and its rescan must start where the previous one stopped
     // — otherwise the server pays O(log) per wake for the whole block
     // window even though the client eventually gets the right watermark.
+    //
+    // Coordination is by condition, not by time, and it is deliberately
+    // tighter than the other blocking-fetch tests need to be: publishing
+    // *during* a pattern scan trips the pre-existing readBatch/append race
+    // (log-read-append-serialization.org — a Non-Goal of the watermark
+    // work), which errors the fetch and fails this test for the wrong
+    // reason. So each round publishes exactly one event and then proves the
+    // rescan is over before the next publish: first the read counter covers
+    // the new record (the scan examined it), then appendEpoch() — which
+    // needs the manager mutex the scan holds end-to-end — returns, so the
+    // scan has finished its reads entirely. Only then may the next append
+    // land. Wakes themselves are not timed: a publish's epoch bump makes
+    // the rescan inevitable, however late it runs.
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1901,26 +1933,29 @@ test "integration: a parked fetch advances its watermark across wakes" {
     defer ts.stop();
 
     ever.net.test_fetch_attempts.store(0, .monotonic);
-    ever.store.Log.test_read_count = 0;
+    @atomicStore(usize, &ever.store.Log.test_read_count, 0, .monotonic);
 
     var f = BlockedPatternFetcher{ .port = ts.port, .pattern = "quiet.", .after = last_match, .block_ms = 30_000 };
     const ft = try std.Thread.spawn(.{}, BlockedPatternFetcher.run, .{&f});
 
-    // Waves of foreign publishes, each gated on the fetch having looked
-    // again (the attempt counter ticks at the top of every rescan), so wave
-    // k's rescan provably happened while k × 200 noise events were behind
-    // the cursor. A rescan-from-request-start implementation reads at least
-    // 200+400+…+1600 = 7,200 records across the waves; one that carries its
-    // cursor reads each record once — about 1,600.
-    const waves: u64 = 8;
-    const per_wave: u64 = 200;
-    var wave: u64 = 0;
-    while (wave < waves) : (wave += 1) {
-        while (ever.net.test_fetch_attempts.load(.monotonic) < wave + 1) {
-            _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
-        }
-        var i: u64 = 0;
-        while (i < per_wave) : (i += 1) _ = try tm.publish("noise.stream", null, "x");
+    // The request has arrived and looked once — from here on, every scan is
+    // a wake of the parked fetch, which is the path under test. The initial
+    // scan's range is empty (nothing follows m0 yet), so it reads nothing
+    // and the first publish cannot race it.
+    try waitBounded(attemptsAtLeast, .{@as(u64, 1)});
+
+    // One foreign publish per round. A rescan-from-request-start
+    // implementation reads all k earlier records again on round k — at
+    // least 1+2+…+120 = 7,260 reads in total; one that carries its cursor
+    // across wakes reads each record once — about 120.
+    const rounds: u64 = 120;
+    var round: u64 = 0;
+    while (round < rounds) : (round += 1) {
+        _ = try tm.publish("noise.stream", null, "x");
+        // The rescan this publish forces has examined the new record…
+        try waitBounded(readCountAtLeast, .{@as(usize, @intCast(round + 1))});
+        // …and has released the manager mutex, i.e. finished reading.
+        _ = tm.appendEpoch();
     }
 
     // A match ends the block window deterministically — no timeout to wait
@@ -1931,7 +1966,7 @@ test "integration: a parked fetch advances its watermark across wakes" {
     try testing.expectEqual(@as(u64, 1), f.event_count.load(.acquire));
     try testing.expectEqual(g_match + 1, f.watermark.load(.acquire));
     // The server-side half of the fix: the whole window cost O(new events).
-    try testing.expect(ever.store.Log.test_read_count <= 4_000);
+    try testing.expect(@atomicLoad(usize, &ever.store.Log.test_read_count, .monotonic) <= 1_000);
 }
 
 // ── Store locks park, they do not spin (air/v0.1/store-blocking-locks.org) ──
