@@ -390,6 +390,18 @@ fn followLoop(client: anytype, sink: anytype, topic_name: []const u8, is_pattern
                 offset += result.events.len;
             }
         }
+        // The resume rule: strictly after max(last delivered, watermark - 1).
+        // The watermark is the exclusive bound of what the server examined,
+        // so it advances the cursor across ranges that were scanned and
+        // ruled out — the case delivery-based advancement cannot move past,
+        // which made a quiet pattern's every wake O(log). Null (exact-topic
+        // reads, old servers) leaves the cursor exactly as before.
+        // (air/v0.1/fetch-watermark.org)
+        if (after_cursor != null) {
+            if (result.scan_watermark) |wm| {
+                if (wm > 0) after_cursor = @max(after_cursor.?, wm - 1);
+            }
+        }
         did_initial = true;
     }
 }
@@ -504,6 +516,15 @@ fn handleWait(allocator: std.mem.Allocator, ctx: *cli.Context) !void {
                 after_cursor = maxGlobalOffset(result.events);
             } else {
                 offset += result.events.len;
+            }
+        }
+        // Same resume rule as followLoop: an empty reply's watermark moves
+        // the cursor past examined-and-ruled-out ranges, so a quiet pattern
+        // does not re-walk them every block interval.
+        // (air/v0.1/fetch-watermark.org)
+        if (after_cursor != null) {
+            if (result.scan_watermark) |wm| {
+                if (wm > 0) after_cursor = @max(after_cursor.?, wm - 1);
             }
         }
         elapsed_ms += block_ms;
@@ -2616,12 +2637,17 @@ const ScriptedClient = struct {
     const Call = struct { method: Method, cursor: u64, blocking: bool, max_count: u32, block_ms: u32 };
 
     script: []const Reply,
+    /// Per-reply scan watermarks, consumed in lockstep with `script`; a
+    /// script shorter than needed yields null, which is what an exact-topic
+    /// fetch or an old server sends anyway.
+    watermarks: []const ?u64 = &.{},
     next: usize = 0,
     calls: [16]Call = undefined,
     ncalls: usize = 0,
 
     const Result = struct {
         events: []const ever.client.Event,
+        scan_watermark: ?u64 = null,
         fn deinit(_: *Result) void {}
     };
 
@@ -2630,8 +2656,9 @@ const ScriptedClient = struct {
         self.ncalls += 1;
         if (self.next >= self.script.len) return error.ScriptExhausted;
         const r = self.script[self.next];
+        const wm: ?u64 = if (self.next < self.watermarks.len) self.watermarks[self.next] else null;
         self.next += 1;
-        return .{ .events = try r };
+        return .{ .events = try r, .scan_watermark = wm };
     }
 
     fn fetch(self: *ScriptedClient, topic: []const u8, offset: u64, max_count: u32) anyerror!Result {
@@ -2756,4 +2783,37 @@ test "sub --follow on a pattern: resumes by after_offset, not a per-topic skip" 
     try std.testing.expectEqual(@as(u64, 4), client.calls[1].cursor);
     try std.testing.expectEqual(ScriptedClient.Method.fetch_after, client.calls[2].method);
     try std.testing.expectEqual(@as(u64, 7), client.calls[2].cursor);
+}
+
+// ── sub --follow advances a quiet pattern by the scan watermark ──────────
+// (air/v0.1/fetch-watermark.org, CLI half)
+
+test "sub --follow on a quiet pattern: empty replies advance by the watermark" {
+    // One match ever, then silence while foreign topics churn. The empty
+    // follow-phase reply carries scan_watermark = 900: everything below 900
+    // was examined and ruled out. The next fetch must resume strictly after
+    // max(last delivered, 900 - 1) = 899 — not after 5, which re-walks the
+    // whole examined range on every wake, growing with the log.
+    var initial = [_]ever.client.Event{
+        .{ .offset = 5, .timestamp = 0, .key = null, .value = "m0" },
+    };
+    const empty = [_]ever.client.Event{};
+    const script = [_]ScriptedClient.Reply{
+        initial[0..],
+        empty[0..],
+        error.TestDone,
+    };
+    const watermarks = [_]?u64{ null, 900, null };
+    var client = ScriptedClient{ .script = &script, .watermarks = &watermarks };
+    var sink = CountingSink{};
+    try std.testing.expectError(error.TestDone, followLoop(&client, &sink, "quiet.", true, 0, null, 100));
+    try std.testing.expectEqual(@as(u64, 1), sink.count);
+
+    try std.testing.expectEqual(@as(usize, 3), client.ncalls);
+    // Follow phase begins from the delivered match, as before…
+    try std.testing.expectEqual(ScriptedClient.Method.fetch_after, client.calls[1].method);
+    try std.testing.expectEqual(@as(u64, 5), client.calls[1].cursor);
+    // …and the empty reply's watermark, not a delivery, moves the cursor.
+    try std.testing.expectEqual(ScriptedClient.Method.fetch_after, client.calls[2].method);
+    try std.testing.expectEqual(@as(u64, 899), client.calls[2].cursor);
 }
