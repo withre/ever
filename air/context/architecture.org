@@ -138,6 +138,8 @@ Fetch supports =block_ms= for blocking long-poll (server delays response until e
 
 ** Durability: what fsync costs, measured
 
+*Stale as of =log-group-commit.org= landing.* The numbers below were measured when =Log.append= held =Log.mutex= across its =fsync=, which is no longer true: the sync now happens outside the mutex and one sync covers every appender queued behind the leader. The ceiling this section states — ~2,350 appends/sec regardless of publisher count — is the *pre-change* figure and is the thing that change exists to remove. Re-measure on real hardware and rewrite this section; the durability *guarantee* is unchanged, only its cost.
+
 =Log.append= calls =file.sync()= per record when =sync_on_append= is set, and it is set: =ever start= constructs the store with =.{}=, the default is =true=, and *there is no CLI flag, environment variable or config file that changes it* — the only places in the tree that set it false are tests. A decision to run without sync cannot currently be enacted.
 
 Measured on this hardware (ZFS, both the dataset the live store uses and =/tmp=, 5,000-20,000 appends each way, repeated):

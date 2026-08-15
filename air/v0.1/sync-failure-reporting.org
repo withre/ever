@@ -101,3 +101,6 @@ A negative control is available and should be used: on today's tree the injected
 * History
 - 2026-08-09: Drafted. Found while measuring what =fsync= costs for the durability decision. Raised in weight by that decision going the other way: the owner is keeping durability, so a silent degradation now falsifies a promise the store makes rather than one it never made. Filed separately from =log-group-commit.org= because it is independently implementable, much smaller, and should not wait on a large design — and because group commit turns one mis-reported caller into a whole batch of them, so it needs this first.
 - 2026-08-09: State: draft → ready.
+
+- 2026-08-15: *Priority raised by =log-group-commit.org= landing.* That change moves the =fsync= out from under =Log.mutex= and shares one sync across every appender queued behind it. The discarded error is unchanged — =catch {}= on the leader's sync, exactly as before — but its *blast radius is now a batch rather than a record*. A single silently-failed sync used to mean one append was reported durable without reaching disk; it can now mean every append in the batch was. The implementing agent flagged this rather than quietly widening it, and preserved the existing discard with a comment pointing here rather than inventing a local fix. Same severity class, more records per occurrence.
+
