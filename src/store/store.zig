@@ -737,6 +737,129 @@ test "verifyLockFileIdentity: detects a lock file swapped under a live holder" {
     try std.testing.expectError(error.LockFileReplaced, verifyLockFileIdentity(io, tmp.dir, held));
 }
 
+// ── Group commit (air/v0.1/log-group-commit.org) ────────────────────────
+//
+// The spec's acceptance is the concurrency table moving — total throughput
+// rising with publisher count — but a wall-clock assertion in a unit test
+// measures the scheduler, not the design. The design's observable is the
+// sync count: with the mutex held across each fsync, N appends issue
+// exactly N fsyncs no matter how they overlap; with group commit,
+// overlapping appends share them. So these tests assert on
+// `test_sync_count` (the batching) and on `synced_watermark` ordering (the
+// guarantee), both deterministic, with `test_sync_delay_ns` standing in
+// for the slow device that makes batches form.
+
+/// Appends `count` records and checks, after each returned offset, that a
+/// sync had covered it by the time `append` returned. The watermark is
+/// monotonic, so sampling it after the return can only over-approximate:
+/// if this check fails, the ordering rule was definitely violated.
+const GroupCommitWorker = struct {
+    log: *Log,
+    topic: []const u8,
+    count: usize,
+    ok: bool = false,
+
+    fn run(self: *GroupCommitWorker) void {
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const off = self.log.append(self.topic, null, "v") catch return;
+            self.log.mutex.lockUncancelable(self.log.io);
+            const wm = self.log.synced_watermark;
+            self.log.mutex.unlock(self.log.io);
+            if (wm < off + 1) return;
+        }
+        self.ok = true;
+    }
+};
+
+test "Log group commit: concurrent appenders share fsyncs, durably" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = true });
+    defer log.deinit();
+    // Make each sync visibly slow, so appenders pile up behind the leader
+    // — the queue a batch forms from under real concurrency.
+    log.test_sync_delay_ns = 2 * 1_000_000;
+
+    const n_threads = 8;
+    const per_thread = 10;
+    const total = n_threads * per_thread;
+
+    var workers: [n_threads]GroupCommitWorker = undefined;
+    for (&workers) |*w| w.* = .{ .log = &log, .topic = "gc.share", .count = per_thread };
+    var threads: [n_threads]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, GroupCommitWorker.run, .{&workers[i]});
+    for (&threads) |*t| t.join();
+
+    // Every append returned only after a sync covered it.
+    for (&workers) |*w| try std.testing.expect(w.ok);
+    try std.testing.expectEqual(@as(u64, total), log.nextOffset());
+    try std.testing.expect(log.synced_watermark >= total);
+
+    // The point of the design: at least one fsync covered more than one
+    // append. The pre-group-commit tree — fsync under the mutex, once per
+    // append — issues exactly `total` and fails this line; that tree is
+    // this assertion's negative control.
+    try std.testing.expect(log.test_sync_count < total);
+    try std.testing.expectEqual(@as(u64, 0), log.test_stale_leader_count);
+}
+
+test "Log group commit: a lone appender syncs immediately, once per append" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = true });
+    defer log.deinit();
+
+    for (0..5) |i| {
+        const off = try log.append("gc.solo", null, "v");
+        try std.testing.expectEqual(@as(u64, i), off);
+        try std.testing.expect(log.synced_watermark >= off + 1);
+    }
+    // Exactly one fsync per append: with nobody queued there is nothing to
+    // batch and nothing may be deferred. Fewer would mean a sync was
+    // skipped — the durability trade this design explicitly is not — and
+    // this count is also what catches a variant that waits for a batch to
+    // form before syncing.
+    try std.testing.expectEqual(@as(u64, 5), log.test_sync_count);
+}
+
+test "Log group commit: rotation mid-batch keeps the guarantee" {
+    // Tiny segments force rotations while leaders are mid-fsync. The
+    // rotation-time sync keeps unsynced records confined to the active
+    // segment; without it, a leader elected across the boundary fsyncs the
+    // new file and then advances the watermark over records sitting
+    // unsynced in the old one — which `test_stale_leader_count` records.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .max_segment_size = 128, .sync_on_append = true });
+    defer log.deinit();
+    log.test_sync_delay_ns = 1 * 1_000_000;
+
+    const n_threads = 4;
+    const per_thread = 8;
+    const total = n_threads * per_thread;
+
+    var workers: [n_threads]GroupCommitWorker = undefined;
+    for (&workers) |*w| w.* = .{ .log = &log, .topic = "gc.rot", .count = per_thread };
+    var threads: [n_threads]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, GroupCommitWorker.run, .{&workers[i]});
+    for (&threads) |*t| t.join();
+
+    for (&workers) |*w| try std.testing.expect(w.ok);
+    try std.testing.expect(log.segments.items.len >= 2);
+    try std.testing.expectEqual(@as(u64, total), log.nextOffset());
+    try std.testing.expect(log.synced_watermark >= total);
+    try std.testing.expectEqual(@as(u64, 0), log.test_stale_leader_count);
+
+    // And the records all landed, across every segment.
+    const events = try log.readBatch(std.testing.allocator, 0, total);
+    defer { for (events) |e| freeEvent(std.testing.allocator, e); std.testing.allocator.free(events); }
+    try std.testing.expectEqual(@as(usize, total), events.len);
+}
+
 test "Log exclusive: the identity check does not false-positive on a healthy init" {
     // The swap itself can only be injected between flock and check, which
     // has no test hook; the deterministic detection test above runs the
