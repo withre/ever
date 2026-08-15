@@ -270,3 +270,15 @@ Behaviours that cost an implementer real time and are not discoverable by readin
 - *Empty-valued events are internal markers* and are filtered from every read path. This was documented before it was ever filed as a defect: see the doc comment on =TopicIndex.non_marker_count=, which names user publishes with empty values as a historical quirk. Reading that comment is faster than rediscovering the behaviour.
 - *Input guards are not retroactive.* =publish= now rejects reserved keys and empty values, but events already on disk are unchanged and =rebuildIndex= still reads them exactly as before. Guards stop new writes; they do not clean up or reinterpret old ones, and no migration exists.
 
+*** Faster loops and concurrency testing
+
+- *=src/store/store.zig= is self-contained* — it imports only =std= and =builtin=, so =zig test src/store/store.zig= runs just its own tests in about two seconds. That is the fast loop for store-only work and, especially, for negative-control mutations where you rebuild repeatedly. It runs *none* of the other two binaries, so a green result there proves nothing about the rest; finish on the full suite.
+- *The warm-cache trap has a second form.* Committing byte-identical content — a =cp= round-trip, a revert-and-reapply — leaves =zig build test= reporting =cached= with no pass counts, even though you have changed nothing since the last real run and are expecting fresh numbers. Remove the =--cache-dir= to force them. This is the same hazard as silence-means-pass, wearing a different face: you asked for counts and got none, and nothing said so.
+- *Test-only instrumentation costs nothing in production.* A field typed =if (builtin.is_test) T else void= compiles to zero size, which makes counters like =Log.test_sync_count= viable for asserting things that are otherwise only observable by timing. Mutate such a counter *only while holding the mutex that guards the path it counts* — otherwise thread joins are your sole ordering and the value you read is a guess.
+- *=std.Io.Condition.waitUncancelable= works from plain =std.Thread.spawn= threads* under =std.testing.io=. Verified in anger by the group-commit waiter rather than assumed from the type signature.
+- *Injected delays make concurrency tests likely, not deterministic.* Holding a leader inside its critical section (2 ms × 8 threads × 10 appends keeps a sharing test under ~100 ms) makes batch formation near-certain and is worth doing — but on a loaded machine a thread can still miss the window. Assert the *loose* property that survives any schedule ("some sharing happened", "every record is durable"), never a tight bound or an equality on a count that scheduling determines. If a claim genuinely needs determinism, use a barrier on the observed queue depth rather than a sleep: a delay hopes the followers arrived, a barrier waits until they have.
+
+*** Publishing from an agent
+
+- *=ever pub= fails on a topic that does not exist.* Create every topic an agent will publish to when you spawn it — =status= and =done= are not enough if the prompt also asks for =report=.
+
