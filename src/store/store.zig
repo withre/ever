@@ -193,6 +193,11 @@ pub const Log = struct {
     /// Test-only: artificial delay (ns) before each leader fsync, widening
     /// the window in which followers queue so batches form deterministically.
     test_sync_delay_ns: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    /// Test-only: while set, a leader parks just before its fsync (mutex
+    /// already released), so a test can decide exactly how many followers
+    /// queue behind one sync instead of leaving that to the scheduler.
+    test_sync_hold: if (builtin.is_test) std.atomic.Value(bool) else void =
+        if (builtin.is_test) .init(false) else {},
     /// Test-only: incremented when a leader elects itself while a
     /// non-active segment still holds unsynced records. The rotation-time
     /// sync exists to make this impossible — a leader in that state would
@@ -373,8 +378,10 @@ pub const Log = struct {
         if (builtin.is_test) test_read_count += n;
     }
 
-    /// Test-only slow-device simulation for the leader fsync. A no-op in
-    /// production builds and when `test_sync_delay_ns` is zero.
+    /// Test-only slow-device simulation for the leader fsync: a fixed
+    /// delay, plus a gate (`test_sync_hold`) a test can hold shut to keep
+    /// a leader parked in its sync until a known number of followers have
+    /// queued. A no-op in production builds.
     inline fn testSyncDelay(self: *const Log) void {
         if (builtin.is_test) {
             if (self.test_sync_delay_ns != 0) {
@@ -383,6 +390,8 @@ pub const Log = struct {
                     .nsec = @intCast(self.test_sync_delay_ns % 1_000_000_000),
                 }, null);
             }
+            while (self.test_sync_hold.load(.acquire))
+                _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
         }
     }
 
@@ -744,10 +753,14 @@ test "verifyLockFileIdentity: detects a lock file swapped under a live holder" {
 // measures the scheduler, not the design. The design's observable is the
 // sync count: with the mutex held across each fsync, N appends issue
 // exactly N fsyncs no matter how they overlap; with group commit,
-// overlapping appends share them. So these tests assert on
-// `test_sync_count` (the batching) and on `synced_watermark` ordering (the
-// guarantee), both deterministic, with `test_sync_delay_ns` standing in
-// for the slow device that makes batches form.
+// overlapping appends share them. But how many appends overlap is itself
+// a scheduling outcome — a loaded machine can run the threads one after
+// another, and one fsync per append is then correct behaviour — so the
+// batching equality is only asserted where the schedule is pinned: a lone
+// appender, and a leader held inside its sync until the followers have
+// queued (`test_sync_hold`). The free-running stress asserts only what
+// every schedule must satisfy: `synced_watermark` ordering (the
+// guarantee), and never more fsyncs than appends.
 
 /// Appends `count` records and checks, after each returned offset, that a
 /// sync had covered it by the time `append` returned. The watermark is
@@ -797,12 +810,65 @@ test "Log group commit: concurrent appenders share fsyncs, durably" {
     try std.testing.expectEqual(@as(u64, total), log.nextOffset());
     try std.testing.expect(log.synced_watermark >= total);
 
-    // The point of the design: at least one fsync covered more than one
-    // append. The pre-group-commit tree — fsync under the mutex, once per
-    // append — issues exactly `total` and fails this line; that tree is
-    // this assertion's negative control.
-    try std.testing.expect(log.test_sync_count < total);
+    // NOT `< total`: how many appenders share a sync is the scheduler's
+    // choice, and threads that happen to run serially correctly issue one
+    // fsync each — asserting sharing here was seen flaking (~1/14 runs)
+    // on a loaded machine. Batching is asserted deterministically in the
+    // held-leader test below; this stress keeps the claims every schedule
+    // must satisfy: durability above, "never worse than one per append"
+    // here.
+    try std.testing.expect(log.test_sync_count <= total);
     try std.testing.expectEqual(@as(u64, 0), log.test_stale_leader_count);
+}
+
+test "Log group commit: followers queued behind a held leader share one fsync" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var log = try Log.init(std.testing.allocator, io, tmp.dir, .{ .sync_on_append = true });
+    defer log.deinit();
+
+    const n_followers = 4;
+
+    // Hold the first leader inside its fsync, queue followers until every
+    // one has written, then let go. Exactly two fsyncs can result: the
+    // held leader's, whose target was captured before any follower
+    // arrived, and one from whichever follower takes over, covering all
+    // the rest at once. No schedule can produce a third — this is the
+    // deterministic form of the batching claim the free-running stress
+    // above must not make.
+    log.test_sync_hold.store(true, .release);
+
+    var leader = GroupCommitWorker{ .log = &log, .topic = "gc.held", .count = 1 };
+    const leader_thread = try std.Thread.spawn(.{}, GroupCommitWorker.run, .{&leader});
+    while (blk: {
+        log.mutex.lockUncancelable(log.io);
+        defer log.mutex.unlock(log.io);
+        break :blk !log.sync_leader_active;
+    }) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+
+    var followers: [n_followers]GroupCommitWorker = undefined;
+    for (&followers) |*w| w.* = .{ .log = &log, .topic = "gc.held", .count = 1 };
+    var threads: [n_followers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, GroupCommitWorker.run, .{&followers[i]});
+    while (blk: {
+        log.mutex.lockUncancelable(log.io);
+        defer log.mutex.unlock(log.io);
+        break :blk log.next_offset < 1 + n_followers;
+    }) _ = std.os.linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+
+    log.test_sync_hold.store(false, .release);
+    leader_thread.join();
+    for (&threads) |*t| t.join();
+
+    try std.testing.expect(leader.ok);
+    for (&followers) |*w| try std.testing.expect(w.ok);
+    try std.testing.expect(log.synced_watermark >= 1 + n_followers);
+    // One for the held leader, one shared by all four followers. The
+    // pre-group-commit shape issues five — and cannot even reach this
+    // point, since holding its leader under the mutex starves the
+    // followers.
+    try std.testing.expectEqual(@as(u64, 2), log.test_sync_count);
 }
 
 test "Log group commit: a lone appender syncs immediately, once per append" {
