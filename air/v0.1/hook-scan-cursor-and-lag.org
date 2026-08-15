@@ -739,6 +739,8 @@ Inline supersession in the completed documents lands with this change:
 
 * History
 
+- 2026-08-15: P1's return-value change has landed, via [[./fetch-watermark.org]] (commit =01587c08=): =fetchPatternByOffset= now returns =PatternScan{ events: []Event, watermark: u64 }=, with the invariant this document states — the watermark may pass offsets examined and ruled out, never a match that was not delivered — pinned by tests on both sides. Where this document says "the =scan_end= out-parameter", read the struct return: same value, same semantics, adopt it rather than re-plumbing. The daemon call site in =hooks.zig= discards =.watermark= deliberately; consuming it for hook cursors (P2 onward) is still this document's work.
+
 - 2026-08-03: Draft created (=speccursor= worker) from the round-4 triage note, against base =txpyxrnmskyo= / =142d5e66cea9= ("Migrate CLI to zig-cli-kit"). =zig build= and =zig build test= confirmed green on the base before any investigation.
 
   *Re-verified from source*: the no-match early return at =hooks.zig:864=; the discarded scan watermark in =topic.zig=; two =pread= per event in =store.zig:245=; the spin lock at =topic.zig:92=; =updateCursor= saving the whole table per call.

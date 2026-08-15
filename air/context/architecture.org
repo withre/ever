@@ -196,6 +196,14 @@ A wake means "look again", never "here is your event": the first version broadca
 
 Shutdown must call =wakeAllWaiters=. Parking is the one property that replacing a poll with a wait takes away — a poller noticed the shutdown flag within its tick — so it has to be given back explicitly or every subscriber waits out its full =block_ms=.
 
+*** A fetch says how far it looked
+
+A pattern fetch with =after_offset= scans the log, and its =fetch_ok= carries =scan_watermark=: the global log offset the server examined up to, exclusive — every offset below it was tested and either delivered or ruled out. The watermark may pass offsets that were examined and ruled out, and may never pass a match that was not delivered (on a full buffer it stops before the first undelivered match).
+
+*The resume rule:* a subscriber continues from =max(last_event_offset + 1, scan_watermark)= — in =after_offset= terms, strictly after =max(last delivered offset, scan_watermark - 1)=. When events arrive the two agree; when none do, the watermark still advances the cursor past the examined range, so a quiet pattern costs O(new events) per fetch instead of re-walking a range that grows with the log. =sub --follow= and =wait= implement exactly this rule; =null= (exact-topic reads, which walk an index, and older servers) means "advance by delivery only", as before.
+
+During a blocking fetch the server holds its own cursor across wakes: each empty scan rules its range out and the next wake resumes where it stopped, with the final watermark reported whenever the reply happens — on a match or at =block_ms=. (air/v0.1/fetch-watermark.org)
+
 ** Concurrency Model
 
 - TCP server: thread-per-connection (detached). This is why no event loop is needed for notification: the thread that would sleep can wait on anything it likes.
