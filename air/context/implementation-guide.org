@@ -122,8 +122,15 @@
 # Run all tests
 zig build test
 
-# Run tests with specific filter
-zig build test -- --test-filter "segment"
+# There is NO test filter through the build system: build.zig wires no
+# -Dtest-filter option, and `zig build test -- --test-filter ...` passes the
+# args to the *run* step, not the test binaries — depending on invocation it
+# either errors at configure time or silently filters nothing, and a
+# configure error is easy to misread as a pass. To isolate tests, use
+# standalone-file test runs (they compile alone because store.zig/topic.zig
+# import only std):
+zig test src/store/store.zig --test-filter "segment"
+# or run the compiled test binaries directly out of the cache dir.
 
 # Run tests in debug mode (default)
 zig build test -Doptimize=Debug
@@ -229,7 +236,7 @@ zig build test -Doptimize=ReleaseSafe
 - *reuse_address=false is essential*: With =true=, multiple stores bind to the same port and clients get randomly routed. Set =false= so the OS rejects duplicate binds.
 - *Field propagation discipline*: Adding a field to a data struct (Hook, Timer, etc.) requires coordinated updates across 12+ locations: struct definition, JSON serialization struct, legacy struct, add/addFull method, load method, saveLocked, deepCopy helper, free/freeCopy helper, protocol message struct, server handler, client struct+methods, CLI handler. Missing any one causes silent data loss or distant compile errors.
 - *Signal handler safety*: Only async-signal-safe operations in signal handlers. To unblock a blocking =accept()= call, use a dummy self-connection (socket+connect+close) — raw syscalls are signal-safe. Never call =deinit()= or manipulate complex structs in a signal handler.
-- *Mutex scope for I/O*: Copy index data under the lock, release it, then do disk I/O without the lock. =Log.append= has its own mutex, so =TopicManager= doesn't need to hold its mutex during writes. =fetchPatternByOffset= is the exception and knows it — =readBatch= is not safe against concurrent appends — so it holds the manager lock across a whole scan. That is why the manager lock must block rather than spin: its waiter is a publisher and the wait is as long as the scan.
+- *Mutex scope for I/O*: Copy index data under the lock, release it, then do disk I/O without the lock. =Log.append= has its own mutex, so =TopicManager= doesn't need to hold its mutex during writes. Since =v0.1/log-read-append-serialization.org= the =Log= applies the same pattern to itself: =read=/=readBatch= snapshot the positions they need under =Log.mutex= and read the file outside it, so they are thread-safe against appends and the pattern-scan paths (=fetchPatternByOffset=, =countPatternByOffset=) take *no* manager lock at all. (An earlier version of this entry described =fetchPatternByOffset= holding the manager lock across a whole scan as a deliberate exception — that lock never excluded the appender, which was the segfault that spec fixed.)
 - *A skip count is not an array index.* Topic offsets index *records*; the topic-local cursor counts *non-marker events*. Translating one to the other by counting markers while reading is both O(topic) and easy to get wrong — it shipped wrong, returning events the caller had asked to skip. Keep the marker positions in the index and translate arithmetically, and keep skipping markers in the read loop anyway so a stale translation degrades to slow rather than to incorrect.
 
 *** Review Artifacts
@@ -285,7 +292,7 @@ Behaviours that cost an implementer real time and are not discoverable by readin
 *** Repeat-run verification, and one invariant not to "simplify"
 
 - *=zig build test= caches run results per binary.* After editing one file, only that binary re-runs and the summary reports its count alone — e.g. =27/27= — while the other two are silently cached and contribute nothing. For flake hunting this is fatal: a loop of twenty "runs" can be nineteen cache hits. Run the three test binaries directly out of the cache dir, or use a fresh =--cache-dir= per iteration, and treat a run as passing only when *n equals m*, never merely because a line saying "tests passed" appeared.
-- *=Log.test_read_count= increments before the read, not after.* =countRead= precedes the =readEventAt= loop in =readBatch=, so "the counter reached N" does not mean "the reads finished". To establish that a scan has completed, also acquire the manager mutex, which =fetchPatternByOffset= holds end to end.
+- *=Log.test_read_count= increments before the read, not after.* =countRead= runs inside =readBatch='s locked snapshot phase, before any disk read, so "the counter reached N" does not mean "the reads finished" — and since =v0.1/log-read-append-serialization.org= a scan holds *no* lock during its disk phase, so acquiring the manager mutex proves nothing about it either. To order a test around an in-flight read deterministically, use the =Log.test_read_hold= / =test_read_parked= gate, which parks a reader between its snapshot and its disk I/O.
 - *A wake means look-again, not here-is-your-event.* =handleFetch= re-baselines its epoch from =waitForAppend=, and spurious wakeups cause full rescans — which matters to any test counting reads per wake.
 - *Do not make the buffer-full break stop the cursor unconditionally.* In =fetchPatternByOffset=, a non-match encountered after the buffer fills still advances the cursor; only an *undelivered match* stops it. That asymmetry looks like an oversight and is the invariant: the watermark may pass offsets examined and ruled out, and may never pass a match that was not delivered. "Simplifying" it reintroduces the growing rescan while keeping every existing test green.
 
