@@ -83,3 +83,52 @@ A combined publisher + subscriber that consumes events from one topic, applies a
 
 ** Current Focus
 Use =airctl status --state work-in-progress,ready= to see current priorities and available work.
+
+** Downstream Consumers
+
+Ever is embedded by other projects. They pin a revision rather than tracking main, so any claim
+about "current behaviour" — theirs or ours — must be checked against the revision actually
+held, not against main. A defect reported from a pinned tree may already be fixed; a workaround
+built there may already be unnecessary.
+
+*** Announcing changes
+
+Anything landing in Ever that changes behaviour a consumer depends on gets published to topic
+=ever.landed= at the time it happens: what changed, the commit, one line on the consequence. Do not
+ask permission and do not gate their work on it; the failure this addresses is *discovery*, not
+authority. Include what has already been verified so they do not repeat it, and what has not, so
+they know what is still open.
+
+*** Publishing is not delivering
+
+Which channel is used decides whether anyone acts, and choosing wrong looks like success from the
+sending side:
+
+- =ever.landed= is an announcement channel. A consumer hooking it typically routes it as a *meta*
+  message — read, but it does not start a turn. An idle recipient sees it whenever something else
+  wakes them. Right for "this changed"; wrong for "should we do X".
+- Topics shaped =*.done= / =*.failed=, and payloads saying =blocked= / =failed= / =needs-input=,
+  arrive as a turn.
+- Direct =pi-crosstalk send --kind user= is the channel for anything that needs an answer. =--from=
+  must be namespaced (=@ever:landed=); a bare handle is rejected as an unknown sender.
+
+A message on an unhooked topic, or one that arrives without waking anyone, is indistinguishable from
+no message at all.
+
+*** Evaluating proposals from a consumer
+
+Recorded in =architecture.org= and repeated because it is easy to skip: check the claim against
+current =main= first, since they pin. Then check what the argument rests on — a performance
+argument built on someone else's unfixed defect points at whichever design lacks that defect, not at
+the better design. Only then judge it against the scope rule.
+
+When declining, say what would change the answer. When accepting, say what you did not verify.
+
+*** External verification is worth asking for
+
+Our toolchain is pinned to a Zig dev build whose tarball 404s, so we cannot easily test against
+another. A consumer building at a *different* toolchain is therefore the only external check
+available, and the standing arrangement is mutual: build, read, and measure against each other's
+trees and report verbatim, failures included — especially unpredicted ones. Ask for it on any
+change where a single compiler is worth little, which means anything concurrent. Say explicitly what
+you have already covered, so their run tests something yours did not.
