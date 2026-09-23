@@ -100,6 +100,15 @@ pub const HookTable = struct {
     next_id: u64,
     data_dir: []const u8,
     mutex: std.atomic.Mutex,
+    /// Set by `updateCursor`, cleared by `flushCursors`. Batches a tick's
+    /// cursor advances into one hooks.json write instead of one per hook.
+    cursors_dirty: bool = false,
+    /// Test-only: hooks.json writes performed. The acceptance criterion for
+    /// `air/v0.1/hook-scan-cursor-and-lag.org` P3 is a write *count*, and
+    /// mtime cannot express it — two writes in one millisecond are
+    /// indistinguishable.
+    test_save_count: if (@import("builtin").is_test) u64 else void =
+        if (@import("builtin").is_test) 0 else {},
 
     pub fn init(allocator: Allocator, data_dir: []const u8) !HookTable {
         var table = HookTable{
@@ -268,16 +277,38 @@ pub const HookTable = struct {
     }
 
     /// Update a hook's cursor. Called by the daemon after processing events.
+    ///
+    /// **Does not save.** A scan watermark advances a pattern hook's cursor on
+    /// *every* tick, matched or not, so saving here would rewrite the whole
+    /// table once per hook per tick — 78 hooks at 2 Hz is 156 full-table
+    /// rewrites a second on an idle store, which trades a CPU bug for an I/O
+    /// one (`air/v0.1/hook-scan-cursor-and-lag.org` P3). The caller sets
+    /// `cursors_dirty` and flushes once per tick via `flushCursors`.
+    ///
+    /// A non-advancing update is dropped entirely: it is both a wasted write
+    /// and a monotonicity guard, since a cursor must never move backwards.
     pub fn updateCursor(self: *HookTable, id: u64, new_cursor: u64) void {
         self.lock();
         defer self.mutex.unlock();
         for (self.hooks.items) |*hook| {
             if (hook.id == id) {
+                if (new_cursor <= hook.cursor) return;
                 hook.cursor = new_cursor;
-                self.saveLocked() catch {};
+                self.cursors_dirty = true;
                 return;
             }
         }
+    }
+
+    /// Persist cursors if any advanced since the last flush. One write per
+    /// tick regardless of how many hooks moved; a no-op when none did, which
+    /// is what keeps an idle store's hooks.json untouched.
+    pub fn flushCursors(self: *HookTable) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.cursors_dirty) return;
+        self.cursors_dirty = false;
+        self.saveLocked() catch {};
     }
 
     /// Advance a hook's cursor and record the delivery attempt in one
@@ -479,6 +510,7 @@ pub const HookTable = struct {
 
     /// Save hooks to disk atomically. Must be called with lock held.
     fn saveLocked(self: *HookTable) !void {
+        if (@import("builtin").is_test) self.test_save_count += 1;
         // Build JSON data
         const hook_jsons = try self.allocator.alloc(HookJson, self.hooks.items.len);
         defer self.allocator.free(hook_jsons);
@@ -980,6 +1012,9 @@ pub const HookDaemon = struct {
                 },
             };
         }
+        // One hooks.json write per tick at most, however many cursors moved
+        // (`air/v0.1/hook-scan-cursor-and-lag.org` P3).
+        self.hook_table.flushCursors();
     }
 
     fn processHook(self: *HookDaemon, hook: Hook) !void {
@@ -991,19 +1026,42 @@ pub const HookDaemon = struct {
         // `TopicManager.tipForPatternLocked`):
         //   - exact topic   → topic-local skip count, advance by batch index
         //   - prefix/wildcard → global log offset, advance to event.offset + 1
-        // The scan's watermark is deliberately unused here: adopting it for
-        // the hook cursor is hook-scan-cursor-and-lag.org P1's change, not
-        // this call site's.
-        const events = if (is_pattern)
-            (try self.topic_manager.fetchPatternByOffset(self.allocator, pattern, hook.cursor, 100)).events
-        else
-            try self.topic_manager.fetch(self.allocator, pattern, hook.cursor, 100);
+        //
+        // Pattern hooks also adopt the scan's watermark
+        // (`air/v0.1/hook-scan-cursor-and-lag.org` P2). Without it, a hook
+        // whose pattern matches nothing never advances, so every tick rescans
+        // cursor→head and the scan grows with the log: seven such hooks on a
+        // 143k-event store were doing ~320k read syscalls a second, forever.
+        //
+        // The watermark is only safe to persist if the dispatch loop ran to
+        // completion. It may pass offsets examined and ruled out; it never
+        // passes a match that was not delivered — but an *early exit* leaves
+        // returned events undispatched, and those are matches. Hence
+        // `dispatched_all`.
+        var watermark: u64 = hook.cursor;
+        const events = if (is_pattern) blk: {
+            const scan = try self.topic_manager.fetchPatternByOffset(self.allocator, pattern, hook.cursor, 100);
+            watermark = scan.watermark;
+            break :blk scan.events;
+        } else try self.topic_manager.fetch(self.allocator, pattern, hook.cursor, 100);
         defer {
             for (events) |e| store.freeEvent(self.allocator, e);
             self.allocator.free(events);
         }
 
-        if (events.len == 0) return;
+        if (events.len == 0) {
+            // The empty scan is the whole point: it proves every offset below
+            // the watermark holds no match, so the next tick need not look
+            // again. Exact-topic hooks have no watermark and keep their cursor.
+            if (is_pattern) self.hook_table.updateCursor(hook.id, watermark);
+            return;
+        }
+
+        var dispatched_all = false;
+        var cursor_after_dispatch = hook.cursor;
+        defer if (is_pattern and dispatched_all) {
+            self.hook_table.updateCursor(hook.id, @max(cursor_after_dispatch, watermark));
+        };
 
         for (events, 0..) |event, i| {
             var spawn_failed = false;
@@ -1023,13 +1081,17 @@ pub const HookDaemon = struct {
             else
                 hook.cursor + i + 1;
             self.hook_table.recordDelivery(hook.id, new_cursor, spawn_failed, event.offset);
+            cursor_after_dispatch = new_cursor;
 
             if (hook.once) {
                 self.hook_table.remove(hook.id) catch {};
                 logTimestampedFmt("Hook #{d} (once) auto-removed after firing.", .{hook.id});
+                // Deliberately not `dispatched_all`: the hook is gone, there is
+                // no cursor left to write.
                 return;
             }
         }
+        dispatched_all = true;
     }
 
     fn executeHookCommand(self: *HookDaemon, hook: Hook, event: store.Event) !void {
@@ -1504,8 +1566,13 @@ test "HookTable reload preserves stored cursor" {
         var table = try HookTable.init(allocator, tmp_path);
         defer table.deinit();
         id = try table.addWithCursor("t.persist", "echo", "/tmp", false, null, "persist-hook", 17);
-        // Advance cursor to simulate daemon progress.
+        // Advance cursor to simulate daemon progress. Since
+        // hook-scan-cursor-and-lag.org P3 this is two steps: `updateCursor`
+        // marks the table dirty and `flushCursors` writes, so that a tick
+        // advancing many hooks costs one hooks.json write rather than one per
+        // hook. The daemon calls the flush at the end of every tick.
         table.updateCursor(id, 25);
+        table.flushCursors();
     }
     {
         var table = try HookTable.init(allocator, tmp_path);
@@ -1528,6 +1595,59 @@ test "HookTable reload preserves stored cursor" {
     _ = std.os.linux.unlink(hooks_json_z.ptr);
     _ = std.os.linux.rmdir(tmp_z.ptr);
 }
+
+test "a cursor advance costs at most one hooks.json write per tick" {
+    // hook-scan-cursor-and-lag.org P3. Adopting the scan watermark advances a
+    // pattern hook's cursor on *every* tick, matched or not. If updateCursor
+    // saved, the daemon would rewrite the whole table once per hook per tick —
+    // on the store that prompted this, 78 hooks at 2 Hz — trading a CPU bug for
+    // an I/O one. The acceptance criterion is the write count, so that is what
+    // this asserts; a version that saves per call passes every other test here.
+    const allocator = std.testing.allocator;
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/.ever-hook-writes-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(tmp_path);
+    const tmp_z = try allocator.allocSentinel(u8, tmp_path.len, 0);
+    defer allocator.free(tmp_z);
+    @memcpy(tmp_z[0..tmp_path.len], tmp_path);
+    _ = std.os.linux.mkdir(tmp_z.ptr, 0o755);
+
+    var table = try HookTable.init(allocator, tmp_path);
+    defer table.deinit();
+
+    const a = try table.addWithCursor("a.", "echo", "/tmp", false, null, "a", 0);
+    const b = try table.addWithCursor("b.", "echo", "/tmp", false, null, "b", 0);
+    const c = try table.addWithCursor("c.", "echo", "/tmp", false, null, "c", 0);
+
+    // A tick in which three hooks advance: no write until the flush.
+    const before = table.test_save_count;
+    table.updateCursor(a, 10);
+    table.updateCursor(b, 20);
+    table.updateCursor(c, 30);
+    try std.testing.expect(table.cursors_dirty);
+    try std.testing.expectEqual(before, table.test_save_count);
+
+    table.flushCursors();
+    try std.testing.expectEqual(before + 1, table.test_save_count);
+    try std.testing.expect(!table.cursors_dirty);
+
+    // A tick in which nothing advances must not write at all — this is what
+    // keeps an idle store's hooks.json quiet.
+    const after = table.test_save_count;
+    table.updateCursor(a, 10); // equal, not greater
+    table.updateCursor(b, 5); // backwards
+    try std.testing.expect(!table.cursors_dirty);
+    table.flushCursors();
+    try std.testing.expectEqual(after, table.test_save_count);
+
+    // And the non-advancing updates were dropped, not applied.
+    const snap = try table.snapshot(allocator);
+    defer freeHookSnapshot(allocator, snap);
+    for (snap) |h| {
+        if (h.id == a) try std.testing.expectEqual(@as(u64, 10), h.cursor);
+        if (h.id == b) try std.testing.expectEqual(@as(u64, 20), h.cursor);
+    }
+}
+
 
 // ── Hook failure visibility tests (air/v0.1/hook-failure-visibility.org) ────
 
@@ -1561,6 +1681,69 @@ fn reapUntilDone(daemon: *HookDaemon) void {
         waited += 10;
     }
     daemon.reapChildren();
+}
+
+test "a pattern hook that matches nothing still advances its cursor" {
+    // hook-scan-cursor-and-lag.org P2, and the reason it was written: a
+    // prefix hook whose pattern never matches used to keep its cursor, so
+    // every tick rescanned cursor→head and the scan grew with the log. Seven
+    // such hooks on a 143k-event store were issuing ~320k read syscalls a
+    // second, permanently, and getting worse with every publish.
+    //
+    // The assertion is on the *cursor*, not on elapsed time or syscall counts:
+    // a cursor that advances is what makes the next scan short, and it is the
+    // only part that is deterministic.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var tm = try TopicManager.init(allocator, std.testing.io, tmp.dir, .{ .sync_on_append = false });
+    defer tm.deinit();
+    try tm.createTopic("other.topic");
+
+    const dir = try makeFailTestDir(allocator, "nomatch");
+    defer cleanupFailTestDir(allocator, dir);
+    var ht = try HookTable.init(allocator, dir);
+    defer ht.deinit();
+    // Prefix pattern; nothing published will ever match it.
+    const id = try ht.addWithCursor("nomatch.", "echo", "/tmp", false, null, null, 0);
+
+    var daemon = HookDaemon.init(allocator, &ht, &tm, test_envp);
+    daemon.ensureLogDir();
+
+    for (0..40) |_| _ = try tm.publish("other.topic", null, "x");
+    daemon.pollAndExecute();
+
+    const head = tm.log.nextOffset();
+    {
+        const snap = try ht.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        // Pre-fix this was 0 and stayed 0 forever, whatever the log did.
+        try std.testing.expectEqual(head, snap[0].cursor);
+        // Nothing matched, so nothing was delivered: the cursor moved by scan,
+        // not by dispatch. Both halves matter — an implementation that fired a
+        // handler on a non-match would also advance.
+        try std.testing.expectEqual(@as(u64, 0), snap[0].fired_count);
+    }
+
+    // The advance is durable, and a second tick over no new events neither
+    // rescans nor rewrites.
+    const saves = ht.test_save_count;
+    daemon.pollAndExecute();
+    try std.testing.expectEqual(saves, ht.test_save_count);
+
+    // And a later matching publish is still delivered — the cursor passed only
+    // offsets it had individually tested, so nothing was skipped.
+    try tm.createTopic("nomatch.late");
+    _ = try tm.publish("nomatch.late", null, "hit");
+    daemon.pollAndExecute();
+    reapUntilDone(&daemon);
+    {
+        const snap = try ht.snapshot(allocator);
+        defer freeHookSnapshot(allocator, snap);
+        try std.testing.expectEqual(@as(u64, 1), snap[0].fired_count);
+        try std.testing.expect(snap[0].cursor > head);
+    }
+    _ = id;
 }
 
 test "failure visibility: failing command records failure counters" {
